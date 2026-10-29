@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { fallback, http, type HttpTransport, type Transport } from 'viem'
+import { guardLookup, lookupRefusalGuard, lookupRefusalRetryableFetch } from './lookup-refusal'
 /** The deliberate default — a single stable endpoint, not the flaky `sepolia.base.org` round-robin. */
 export const PINNED_BASE_SEPOLIA_RPC = 'https://base-sepolia-rpc.publicnode.com'
 export const BASE_MAINNET_CHAIN_ID = 8453
@@ -178,11 +179,11 @@ export function throttleRetryableFetch(inner: typeof fetch = fetch): typeof fetc
   }
 }
 
-/** The Base READ transport: `http(url)` plus throttle retries. Reads only — a retried read is idempotent; the send path
- *  keeps the plain transport because the send engine owns its own resend/recovery logic. `retryDelayMs` exists for
- *  tests; production uses the default schedule. */
+/** The Base READ transport: `http(url)` plus throttle and lookup-refusal retries (lookup-refusal.ts). Reads only — a
+ *  retried read is idempotent; the send path keeps the plain transport because the send engine owns its own
+ *  resend/recovery logic. `retryDelayMs` exists for tests; production uses the default schedule. */
 export function baseReadTransport(url: string, fetchImpl?: typeof fetch, retryDelayMs = BASE_READ_RETRY_DELAY_MS): HttpTransport {
-  return http(url, { fetchFn: throttleRetryableFetch(fetchImpl), retryCount: BASE_READ_RETRY_COUNT, retryDelay: retryDelayMs })
+  return lookupRefusalGuard(http(url, { fetchFn: throttleRetryableFetch(lookupRefusalRetryableFetch(fetchImpl)), retryCount: BASE_READ_RETRY_COUNT, retryDelay: retryDelayMs }))
 }
 
 /**
@@ -193,7 +194,7 @@ export function baseReadTransport(url: string, fetchImpl?: typeof fetch, retryDe
 export function baseRpcTransport(urls: readonly string[], fetchImpl?: typeof fetch, retryDelayMs = BASE_READ_RETRY_DELAY_MS): Transport {
   if (urls.length === 0) throw new Error('baseRpcTransport requires at least one RPC URL')
   if (urls.length === 1) return baseReadTransport(urls[0], fetchImpl, retryDelayMs)
-  return fallback(urls.map((url) => baseReadTransport(url, fetchImpl, retryDelayMs)), { rank: false, shouldThrow: () => false })
+  return lookupRefusalGuard(fallback(urls.map((url) => baseReadTransport(url, fetchImpl, retryDelayMs)), { rank: false, shouldThrow: () => false }))
 }
 
 type RpcReply = { result?: unknown; error?: { code?: number; message?: string } }
@@ -328,7 +329,7 @@ export class BaseRpcFailoverPool {
     }
     return {
       ...initial,
-      request: async (args) => {
+      request: async (args) => guardLookup(args.method, async () => {
         const logRequest = args.method === 'eth_getLogs'
         const snapshot = logRequest ? this.activeLogUrls : this.active
         if (snapshot.length === 0) {
@@ -348,7 +349,7 @@ export class BaseRpcFailoverPool {
           throw new Error('Base RPC retry response came from an endpoint no longer active')
         }
         return retried.result as never
-      },
+      }),
     }
   }
 

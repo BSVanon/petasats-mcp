@@ -17,7 +17,7 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.0` is recommended.
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.1` is recommended.
 
 ```sh
 claude mcp add petasats -- npx -y petasats-mcp

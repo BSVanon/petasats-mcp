@@ -1,6 +1,6 @@
 {
   "name": "petasats-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "overrides": {
     "@bsv/sdk": "2.1.0",
     "@bsv/wallet-toolbox-client": "2.1.21"
@@ -36,7 +36,7 @@
     "atomic-swap",
     "non-custodial"
   ],
-  "mcpName": "io.github.bsvanon/petasats-mcp",
+  "mcpName": "io.github.BSVanon/petasats-mcp",
   "devDependencies": {
     "@bsv/sdk": "2.1.0",
     "@bsv/wallet-helper": "0.0.6",
