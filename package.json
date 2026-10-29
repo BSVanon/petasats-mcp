@@ -1,0 +1,65 @@
+{
+  "name": "petasats-mcp",
+  "version": "0.2.0",
+  "overrides": {
+    "@bsv/sdk": "2.1.0",
+    "@bsv/wallet-toolbox-client": "2.1.21"
+  },
+  "description": "Buy BSV with USDC on Base from your AI app. A local MCP server: keys stay on your machine; settlement is a cross-chain atomic swap.",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "bin": {
+    "petasats-mcp": "dist/petasats-mcp.mjs"
+  },
+  "files": [
+    "dist/petasats-mcp.mjs",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BSVanon/petasats-mcp.git"
+  },
+  "homepage": "https://github.com/BSVanon/petasats-mcp",
+  "bugs": {
+    "url": "https://github.com/BSVanon/petasats-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "bsv",
+    "usdc",
+    "base",
+    "atomic-swap",
+    "non-custodial"
+  ],
+  "mcpName": "io.github.bsvanon/petasats-mcp",
+  "devDependencies": {
+    "@bsv/sdk": "2.1.0",
+    "@bsv/wallet-helper": "0.0.6",
+    "@bsv/wallet-toolbox": "2.1.21",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "better-sqlite3": "12.11.1",
+    "chai": "4.5.0",
+    "esbuild": "0.28.2",
+    "knex": "3.3.0",
+    "mocha": "12.0.0",
+    "ts-node": "10.9.2",
+    "tsx": "4.23.12",
+    "typescript": "6.0.3",
+    "viem": "2.55.17",
+    "@types/node": "18.19.130",
+    "@types/mocha": "10.0.10",
+    "@types/chai": "4.3.20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test mcp/tests/*.test.ts && node --import tsx build/test.mjs",
+    "build": "node build/bundle.mjs",
+    "smoke": "node dist/petasats-mcp.mjs --smoke",
+    "verify": "node build/verify-package.mjs"
+  }
+}

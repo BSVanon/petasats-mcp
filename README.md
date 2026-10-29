@@ -1,126 +1,92 @@
 <p align="center"><img src="assets/petasats-logo.svg" alt="PetaSats" width="240"></p>
 
-# PetaSats MCP 0.1.0
+# PetaSats MCP
 
-PetaSats MCP lets your AI app buy BSV with USDC on Base. It runs on your own computer as a local MCP server and swaps with the PetaSats market maker through a cross-chain atomic swap. It is non-custodial: the kit makes its keys on your machine and keeps them there, and no server ever holds your funds.
+Buy BSV with USDC on Base from your AI app through a local, non-custodial MCP server.
 
-## What it does today
+## What it does
 
-- **USDC on Base to BSV only.**
-- **Swap size:** from about $5 (smaller swaps are declined) up to $100.
-- **Daily limits:** each buyer can make at most 3 swaps and $200 per day. All buyers share a daily total, so the door can be busy or full. If it is, try again later.
-- **Quotes** last about 60 seconds. The swap checks your `min_bsv_out` again before it starts.
+PetaSats supports USDC on Base to BSV only. Keys are made and kept on your machine.
 
-## Install
+1. You lock USDC in the swap contract on Base.
+2. The market maker locks BSV.
+3. The kit verifies the lock against a merkle proof and block headers, then claims BSV and reveals the secret.
+4. The market maker uses that secret to claim USDC.
 
-You need Node.js 22 or newer.
+Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a shared daily total also applies. They usually take 15 to 25 minutes.
 
-```sh
-npm install -g https://github.com/BSVanon/petasats-mcp/releases/download/v0.1.0/petasats-mcp-0.1.0.tgz
-```
+## Install and connect
 
-The release page lists the archive's SHA-256 in `SHA256SUMS`. To check a downloaded copy:
-
-- macOS: `shasum -a 256 petasats-mcp-0.1.0.tgz`
-- Linux: `sha256sum petasats-mcp-0.1.0.tgz`
-- Windows: `certutil -hashfile petasats-mcp-0.1.0.tgz SHA256`
-
-## Set up
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.0` is recommended.
 
 ```sh
-petasats-mcp init
+claude mcp add petasats -- npx -y petasats-mcp
 ```
 
-This creates the kit folder: `~/.petasats`, or the folder named in `PETASATS_HOME`. It prints:
-
-- `base_address`: send USDC on Base here, plus a little ETH on Base for gas (about $1 is plenty);
-- `bsv_address`: the kit's own BSV address;
-- `mcp.command` and `mcp.args`: the exact launch command for your AI app.
-
-**Back up the kit folder.** Its `keys.json` is the only copy of the kit's keys. If you lose it while funds are in the kit, those funds are lost.
-
-## Connect your AI app
-
-Wherever `COMMAND` and `ARG` appear below, use the `mcp.command` and `mcp.args` values that `petasats-mcp init` printed. They are full paths, so they work even when a desktop app does not see your shell's PATH. Restart the app after you change its settings.
-
-**Claude Desktop.** Open Settings, then Developer, then Edit Config, and add:
+Claude Desktop (`claude_desktop_config.json`), Cursor (`~/.cursor/mcp.json`):
 
 ```json
-{ "mcpServers": { "petasats": { "command": "COMMAND", "args": ["ARG"] } } }
+{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp"]}}}
 ```
 
-**Claude Code:**
+VS Code (`.vscode/mcp.json`):
+
+```json
+{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp"]}}}
+```
+
+Codex (CLI, IDE extension, or app):
 
 ```sh
-claude mcp add --scope user petasats -- COMMAND ARG
+codex mcp add petasats -- npx -y petasats-mcp
 ```
 
-**Codex** (the CLI or the Codex app). Add this to `~/.codex/config.toml`:
+Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy.
 
-```toml
-[mcp_servers.petasats]
-command = "COMMAND"
-args = ["ARG"]
-```
+## Fund the kit
 
-**Cursor, Gemini CLI and Qwen Code.** Add the Claude Desktop JSON above to `~/.cursor/mcp.json`, `~/.gemini/settings.json` or `~/.qwen/settings.json`.
-
-On Windows, write each backslash in a JSON path as two backslashes.
-
-Assistants that run only in a web browser cannot start local tools yet.
+`wallet_info` shows the Base address. Send it USDC on Base and a little ETH for gas; 0.0002 ETH covers many swaps.
 
 ## Use it
 
-Ask your AI app things like:
+Ask: “Buy $20 of BSV and send it to 1...”
 
-- "Get a quote for 10 USDC to BSV."
-- "Swap 10 USDC to BSV and deliver it to <your BSV address>. Don't accept less than 98% of the quoted BSV."
-- "Show my swap status."
-- "Withdraw the kit's confirmed BSV to <your BSV address>."
-
-Your AI app converts the units. The tools take amounts in the smallest units: USDC has 6 decimals, and BSV amounts are in satoshis.
-
-| Tool | What it does |
+| Tool | Moves funds |
 | --- | --- |
-| `list_liquidity` | Shows the supported route. |
-| `get_quote` | Gets a live USDC to BSV quote. |
-| `swap_asset_to_bsv` | Starts a swap in the background. With `deliver_to`, the BSV goes on to that address once it confirms. |
-| `swap_status` | Shows each swap's progress and its next step. |
-| `wallet_info` | Shows the kit's addresses, balances and caps. It never shows a key. |
-| `withdraw_bsv` | Sends the kit's confirmed BSV to an address. |
-| `fund_wallet` | Plans a swap that funds a BSV address. It moves nothing. |
+| get_quote | No |
+| swap_asset_to_bsv | Yes |
+| wait_for_swap | No |
+| swap_status | No |
+| wallet_info | No |
+| withdraw_bsv | Yes |
+| withdraw_base | Yes |
+| fund_wallet | Yes |
+| list_liquidity | No |
 
-## Timing and safety
+## Progress and reporting
 
-A swap takes about 30 to 60 minutes:
+The server gives the AI an operating guide. With a person watching, it reports one line per stage and a final summary with transaction IDs. For a program it returns only the result. Reporting never holds up a swap, and nothing asks for confirmation after a swap starts.
 
-1. Your USDC lock needs 6 Base confirmations.
-2. The market maker's BSV lock then needs at least 1 BSV confirmation.
-3. The kit checks that lock's merkle proof before it claims the BSV.
+## Safety model
 
-**Keep your AI app (or `petasats-mcp`) running until the swap shows delivered.** The kit must be online to claim the BSV. If the app closes, reopen it or run `petasats-mcp recover`; swaps resume from their saved records.
+Funds can go only to the swap contract on Base, the kit’s own addresses, or an address you provide. The kit verifies before reveal. The market maker’s BSV can return about four hours (24 blocks) after lock; your USDC refunds after about 16 hours if the swap does not finish. Recovery resumes after restart. Run one swap at a time and keep the server running during a swap.
 
-If a swap cannot finish, it unwinds:
+## Costs
 
-- The market maker's BSV can return to it about 4 hours (24 blocks) after it was locked.
-- Your USDC can be refunded to you about 16 hours (28,800 Base blocks) after you lock it.
+`get_quote` shows the rate and comparison with market mid. You pay Base gas in ETH, the BSV claim fee, and a small extra BSV fee with `deliver_to`. See `get_quote` for protocol fees.
 
-Network fees are paid on both chains, and a refund also costs gas. `petasats-mcp status` lists your swaps from the command line.
+## Verify what you run
 
-## Update
+The npm package is built by GitHub Actions from a tagged commit and published with npm provenance. Run `npm audit signatures`; the npm page links the build to its commit and workflow run. `dist/petasats-mcp.mjs` is not minified. Source under `src/` is exported from the development repository for each release with internal development comments removed and internal names replaced by neutral ones; apart from that it is identical.
 
-Install the newer release with the same `npm install -g` command. Your kit folder and keys stay where they are.
+## Files, status, and recovery
+
+The kit uses `~/.petasats`. Run `npx petasats-mcp status` for status and `npx petasats-mcp recover` after interruption.
 
 ## Troubleshooting
 
-"Money tools unavailable" usually means one of these:
+`busy`, `limit`, `rate_limited`, `unavailable`, and `declined` mean nothing was locked. If keys-file permissions are wrong, restore owner-only access. For RPC trouble, check your network connection and retry.
 
-- `petasats-mcp init` has not run;
-- the kit folder's `config.json` was edited;
-- the kit cannot reach the network.
+## Security, license, and disclaimer
 
-Run `petasats-mcp init` again (it never replaces existing keys), check your connection, and restart your AI app.
-
-## Disclaimer
-
-Experimental software. Use small amounts. There is no warranty: see the license in `LICENSE`. Third-party licenses are in `THIRD_PARTY_NOTICES.md`.
+See [SECURITY.md](SECURITY.md). PetaSats uses the Open BSV License v4; third-party notices are in `THIRD_PARTY_NOTICES.md`. This is experimental software: use small amounts and there is no warranty.

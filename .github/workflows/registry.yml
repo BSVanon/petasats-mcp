@@ -1,0 +1,15 @@
+name: Publish MCP Registry
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: '22', registry-url: 'https://registry.npmjs.org' }
+      - run: test "$(npm view petasats-mcp@$(node -p "require('./server.json').version") version)" = "$(node -p "require('./server.json').version")"
+      - run: curl -fsSLo /tmp/mcp-publisher.tar.gz https://github.com/modelcontextprotocol/registry/releases/download/v1.8.6/mcp-publisher_linux_amd64.tar.gz && echo "1fbe93fc0783c2394d8012c8d6e50a59e98cb2cc2d216264cc69f405d0e21340  /tmp/mcp-publisher.tar.gz" | sha256sum -c - && tar -xzf /tmp/mcp-publisher.tar.gz -C /tmp && /tmp/mcp-publisher login github-oidc && /tmp/mcp-publisher publish server.json

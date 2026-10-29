@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": [
+      "node",
+      "mocha"
+    ],
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "petasats/sdk": [
+        "src/sdk/buyer-sdk.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "mcp/src/**/*.ts",
+    "mcp/tests/**/*.ts",
+    "tests/**/*.ts"
+  ]
+}

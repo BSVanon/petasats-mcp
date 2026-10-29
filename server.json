@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.bsvanon/petasats-mcp",
+  "title": "PetaSats",
+  "description": "Buy BSV with USDC on Base through a local non-custodial MCP server.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/BSVanon/petasats-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "petasats-mcp",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ],
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/BSVanon/petasats-mcp/main/assets/petasats-robot.svg",
+      "mimeType": "image/svg+xml"
+    }
+  ]
+}
