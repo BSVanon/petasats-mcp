@@ -1,11 +1,13 @@
+<p align="center"><img src="assets/petasats-logo.svg" alt="PetaSats" width="240"></p>
+
 # PetaSats MCP 0.1.0
 
-PetaSats MCP lets your AI app buy BSV with USDC on Base. It runs on your own computer as a local MCP server and swaps with Carl, the PetaSats market maker, through a cross-chain atomic swap. It is non-custodial: the kit makes its keys on your machine and keeps them there, and no server ever holds your funds.
+PetaSats MCP lets your AI app buy BSV with USDC on Base. It runs on your own computer as a local MCP server and swaps with the PetaSats market maker through a cross-chain atomic swap. It is non-custodial: the kit makes its keys on your machine and keeps them there, and no server ever holds your funds.
 
 ## What it does today
 
 - **USDC on Base to BSV only.**
-- **Swap size:** from about $5 (Carl declines smaller swaps) up to $100.
+- **Swap size:** from about $5 (smaller swaps are declined) up to $100.
 - **Daily limits:** each buyer can make at most 3 swaps and $200 per day. All buyers share a daily total, so the door can be busy or full. If it is, try again later.
 - **Quotes** last about 60 seconds. The swap checks your `min_bsv_out` again before it starts.
 
@@ -81,7 +83,7 @@ Your AI app converts the units. The tools take amounts in the smallest units: US
 | Tool | What it does |
 | --- | --- |
 | `list_liquidity` | Shows the supported route. |
-| `get_quote` | Gets a live USDC to BSV quote from Carl. |
+| `get_quote` | Gets a live USDC to BSV quote. |
 | `swap_asset_to_bsv` | Starts a swap in the background. With `deliver_to`, the BSV goes on to that address once it confirms. |
 | `swap_status` | Shows each swap's progress and its next step. |
 | `wallet_info` | Shows the kit's addresses, balances and caps. It never shows a key. |
@@ -93,14 +95,14 @@ Your AI app converts the units. The tools take amounts in the smallest units: US
 A swap takes about 30 to 60 minutes:
 
 1. Your USDC lock needs 6 Base confirmations.
-2. Carl's BSV lock then needs at least 1 BSV confirmation.
+2. The market maker's BSV lock then needs at least 1 BSV confirmation.
 3. The kit checks that lock's merkle proof before it claims the BSV.
 
 **Keep your AI app (or `petasats-mcp`) running until the swap shows delivered.** The kit must be online to claim the BSV. If the app closes, reopen it or run `petasats-mcp recover`; swaps resume from their saved records.
 
 If a swap cannot finish, it unwinds:
 
-- Carl's BSV returns to Carl up to about 4 hours (24 blocks) after he locks it.
+- The market maker's BSV can return to it about 4 hours (24 blocks) after it was locked.
 - Your USDC can be refunded to you about 16 hours (28,800 Base blocks) after you lock it.
 
 Network fees are paid on both chains, and a refund also costs gas. `petasats-mcp status` lists your swaps from the command line.
