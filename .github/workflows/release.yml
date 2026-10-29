@@ -14,6 +14,6 @@ jobs:
         with: { node-version: '22' }
       - run: npm ci --ignore-scripts
       - run: npm run typecheck && npm test && npm run build && npm run verify
-      - run: test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")" && test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./server.json').version")" && grep -q "${GITHUB_REF_NAME#v}" mcp/src/index.ts
+      - run: test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./package.json').version")" && test "${GITHUB_REF_NAME#v}" = "$(node -p "require('./server.json').version")" && grep -qF "VERSION = '${GITHUB_REF_NAME#v}'" mcp/src/version.ts
       - run: npm install -g npm@11.21.1
       - run: npm stage publish --provenance --access public
