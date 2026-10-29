@@ -11,6 +11,7 @@ import { DEFAULT_BSV_FEE_RATE_SAT_PER_KB } from '../../settlement/htlc/bridge-co
 import { sizeCovenantFeeBudgetSats } from '../../settlement/htlc/bridge-covenant'
 import { makeMessageBoxInitiatorCoordinator } from '../../transport/messagebox-coordinator'
 import type { BuyerExecutor, BuyerQuote, BuyerRecoveryOutcome, BuyerSwapRecord, BuyerSwapStage } from './types'
+import { resolveUnlandedLock, UNLANDED_LOCK_ABORT_REASON, type BuyerUnlandedLockRails } from './unlanded-lock'
 
 const knownBuyerStage = (stage: string): stage is BuyerSwapStage => new Set<BuyerSwapStage>([
   'quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'claimed',
@@ -66,7 +67,7 @@ function stageForRecord(record: BuyerSwapRecord, state: SettlementState): BuyerS
 export interface BuyerEngineDeps {
   comms: CommsLayer
   doorIdentity: string
-  evm: BridgeInitiatorEvmRails & Pick<RecoveryClaimEvm, 'refund'>
+  evm: BridgeInitiatorEvmRails & Pick<RecoveryClaimEvm, 'refund'> & Partial<BuyerUnlandedLockRails>
   bsv: BridgeInitiatorBsvRails & RecoveryBsvRails
   chainTracker: ChainTracker
   bsvReservePub: PublicKey
@@ -76,6 +77,10 @@ export interface BuyerEngineDeps {
   now: () => number
   sleep: (ms: number) => Promise<void>
   log: (message: string) => void
+  /** Throws while the Base pool is split or unverified; an unlanded-lock tombstone is never written past it. */
+  assertEvmPoolSafe: () => void
+  /** Operator opt-in: resolve stuck records written before the attempt marker (one kit process used this home). */
+  resolveUnmarkedStuckLocks?: boolean
 }
 
 /**
@@ -86,7 +91,9 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
   const records = makeFileSwapRecordStore(deps.settlementDir, { censusGroupRead: false, recordMode: 0o600 })
   const claimIsBuried = makeValidatedBsvFinality({ ...deps.bsv, chainTracker: deps.chainTracker } as RecoveryBsvRails)
   const known = new Map<string, { hashHex: string; state: SettlementState }>()
-  const executorClears = new Map<string, SettlementState>()
+  const executorClears = new Map<string, { state: SettlementState; reason?: string }>()
+  const lastUnlandedLockCheck = new Map<string, number>()
+  const executingHashes = new Set<string>()
   const mark = (hashHex: string, state: SettlementState): void => {
     for (const [swapId, current] of known) if (current.hashHex === hashHex) known.set(swapId, { hashHex, state })
   }
@@ -115,7 +122,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     notify?.(seen)
   }
   /** The initiator's two direct clear sites are terminal hand-offs, not deletion. */
-  const writeExecutorTombstone = (hashHex: string): SettlementState | undefined => {
+  const writeExecutorTombstone = (hashHex: string, abortReason = 'the USDC lock reverted; nothing was locked'): SettlementState | undefined => {
     const current = records.list().records.find((entry) => entry.hashHex === hashHex)
     if (!current) return undefined
     const at = Math.floor(deps.now() / 1000)
@@ -127,7 +134,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     }
     if (current.state === 'created' || current.state === 'base-locked') {
       const tombstone: SettlementRecord = {
-        ...current, state: 'aborted', abortReason: 'the USDC lock reverted; nothing was locked',
+        ...current, state: 'aborted', abortReason,
         history: [...current.history, { state: 'aborted', at }],
       }
       records.write(tombstone)
@@ -135,6 +142,14 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       return 'aborted'
     }
     return current.state
+  }
+  const clearExecutorRecord = (hashHex: string, nothingLockedReason?: string): void => {
+    // The initiator also clears a pre-lock record after a receipt-level revert plus an exact-tuple absence proof, and
+    // (with a reason) after a lock call that failed before any attempt was recorded, so was never sent.  Record what
+    // was actually last persisted; only the eventual execute result tells us whether this clear means clean
+    // settlement or "nothing locked".
+    for (const [swapId, current] of known) if (current.hashHex === hashHex) executorClears.set(swapId, { state: current.state, reason: nothingLockedReason })
+    writeExecutorTombstone(hashHex, nothingLockedReason)
   }
   const absentOutcome = async (record: BuyerSwapRecord): Promise<BuyerRecoveryOutcome> => {
     // A missing settlement record is only terminal when the kit's own DURABLE observation proves which terminal
@@ -161,9 +176,29 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       default: return { stage: knownBuyerStage(record.stage) ? record.stage : 'needs_attention', reason: 'outcome needs a chain check' }
     }
   }
+  const resolveUnlandedLockIfDue = async (record: SettlementRecord): Promise<SettlementRecord> => {
+    if (!deps.evm.finalizedBlockNumber || !deps.evm.nonceAtBlock || !deps.evm.pendingNonce || typeof deps.assertEvmPoolSafe !== 'function') return record
+    const checkedAt = lastUnlandedLockCheck.get(record.hashHex) ?? -Infinity
+    if (deps.now() - checkedAt < 30_000) return record
+    lastUnlandedLockCheck.set(record.hashHex, deps.now())
+    const resolved = await resolveUnlandedLock(record, {
+      evm: deps.evm as BuyerUnlandedLockRails,
+      now: deps.now,
+      reread: (hashHex) => records.list().records.find((entry) => entry.hashHex === hashHex),
+      persist: (tombstone) => records.write(tombstone),
+      isExecuting: (hashHex) => executingHashes.has(hashHex),
+      assertPoolSafe: () => deps.assertEvmPoolSafe(),
+      resolveUnmarkedRecords: deps.resolveUnmarkedStuckLocks === true,
+    })
+    if (!resolved) return record
+    recovery.cancel(record.hashHex, UNLANDED_LOCK_ABORT_REASON)
+    mark(resolved.hashHex, resolved.state)
+    return resolved
+  }
 
   return {
     async execute(input) {
+      let executingHash: string | undefined
       // The admission deadline gates only the intent (below). Later BSV-lock replies keep the channel's
       // default wait: capping them at the short admission window would strand a locked USDC leg until the timelock.
       const messageBox = makeMessageBoxInitiatorCoordinator({
@@ -182,41 +217,48 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       const executor = makeBridgeInitiatorExecutor({
         bsvReservePub: deps.bsvReservePub, evm: deps.evm, bsv: deps.bsv, coordinator, chainTracker: deps.chainTracker,
         now: () => Math.floor(deps.now() / 1000), nowMs: deps.now, sleep: deps.sleep,
-        persist: (record) => { records.write(record); remember(input.swapId, record, input.onSettlement) },
-        onHashlockCreated: input.onSettlementLink,
-        clearRecord: (hashHex) => {
-          // The initiator also clears a pre-lock record after a receipt-level revert plus an exact-tuple absence
-          // proof.  Record what was actually last persisted; only the eventual execute result tells us whether this
-          // clear means clean settlement or "nothing locked".
-          for (const [swapId, current] of known) if (current.hashHex === hashHex) executorClears.set(swapId, current.state)
-          writeExecutorTombstone(hashHex)
+        persist: (record) => {
+          executingHash = record.hashHex
+          executingHashes.add(record.hashHex)
+          records.write(record)
+          remember(input.swapId, record, input.onSettlement)
         },
+        onHashlockCreated: async (hashHex) => {
+          executingHash = hashHex
+          executingHashes.add(hashHex)
+          await input.onSettlementLink?.(hashHex)
+        },
+        clearRecord: (hashHex) => clearExecutorRecord(hashHex),
+        clearNeverSentLock: (hashHex, reason) => clearExecutorRecord(hashHex, reason),
         log: (tag, message) => deps.log(`${tag}: ${message}`),
         config: {
           erc20SwapAddress: deps.evm.swapAddress as `0x${string}`, baseChainId: deps.evm.chainId,
           baseTimelockBlocks: times.baseTimelockBlocks, bsvRefundBlocks: times.bsvRefundBlocks,
           claimBudgetBaseBlocks: times.claimBudgetBaseBlocks, bsvFeeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB, bsvConfirmations: 1, // both sides size the covenant fee budget identically
           capUsdPerSwap: deps.capUsdPerSwap, zeroConfCapUsd: 0, requireLockMerkleProof: true, htlcKind: 'covenant',
+          approveOnlyBelowAllowance: true, recordLockAttempts: true,
         },
       })
       try {
         const result = await executor.execute({ erc20TokenAddress: deps.usdcTokenAddress, deliverAmount: input.quote.usdcBaseUnits, receiveBsvSats: input.quote.bsvSats })
         const seen = known.get(input.swapId)
-        const clearedState = executorClears.get(input.swapId)
+        const cleared = executorClears.get(input.swapId)
         executorClears.delete(input.swapId)
-        if (!result.ok && (clearedState === 'created' || clearedState === 'base-locked')) {
-          return { ok: false, reason: 'the USDC lock reverted; nothing was locked', nothingLocked: true }
+        if (!result.ok && (cleared?.state === 'created' || cleared?.state === 'base-locked')) {
+          return { ok: false, reason: cleared.reason ?? 'the USDC lock reverted; nothing was locked', nothingLocked: true }
         }
         if (result.ok && seen) known.set(input.swapId, { hashHex: seen.hashHex, state: 'settled' })
         const settlement = seen ? records.list().records.find((entry) => entry.hashHex === seen.hashHex) : undefined
         return { ...result, bsvClaimPayoutSats: settlement ? claimPayoutSats(settlement) : undefined, revealed: seen?.state === 'revealed' || !!result.bsvClaimTxid }
       } catch (error) {
-        const clearedState = executorClears.get(input.swapId)
+        const cleared = executorClears.get(input.swapId)
         executorClears.delete(input.swapId)
-        if (clearedState === 'created' || clearedState === 'base-locked') {
-          return { ok: false, reason: 'the USDC lock reverted; nothing was locked', nothingLocked: true }
+        if (cleared?.state === 'created' || cleared?.state === 'base-locked') {
+          return { ok: false, reason: cleared.reason ?? 'the USDC lock reverted; nothing was locked', nothingLocked: true }
         }
         throw error
+      } finally {
+        if (executingHash) executingHashes.delete(executingHash)
       }
     },
     async recover(record) {
@@ -236,7 +278,8 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         deps.log(reason)
         return { stage: 'needs_attention', reason }
       }
-      const settlement = listed.records.find((item) => item.hashHex === hashHex)
+      const found = listed.records.find((item) => item.hashHex === hashHex)
+      const settlement = found ? await resolveUnlandedLockIfDue(found) : undefined
       if (!settlement) {
         if (!record.settlementRecordCreated && record.handshakeDeadlineMs !== undefined && deps.now() >= record.handshakeDeadlineMs) {
           return { stage: 'failed', reason: 'handshake expired before a settlement checkpoint was created; nothing was locked' }
@@ -249,7 +292,8 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     },
     async recoverAll(buyerRecords) {
       const listed = records.list()
-      recovery.ensure(listed.records)
+      const resolvedRecords = await Promise.all(listed.records.map((record) => resolveUnlandedLockIfDue(record)))
+      recovery.ensure(resolvedRecords)
       const stages = new Map<string, BuyerRecoveryOutcome>()
       for (const buyer of buyerRecords) {
         const hashHex = buyer.settlementHashHex
@@ -274,7 +318,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           stages.set(buyer.swapId, { stage: 'needs_attention', reason })
           continue
         }
-        const item = listed.records.find((entry) => entry.hashHex === hashHex)
+        const item = resolvedRecords.find((entry) => entry.hashHex === hashHex)
         // Track live records so the supervisor's terminal clear (refunded/settled) is visible to this swap.
         if (item) known.set(buyer.swapId, { hashHex, state: item.state })
         stages.set(buyer.swapId, item
@@ -290,6 +334,8 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       const listed = records.list()
       const settlement = listed.records.find((item) => item.hashHex === buyer.settlementHashHex)
       if (!settlement || settlement.state !== buyer.settlementState) return
+      // A never-landed lock's tombstone stays on disk: it keeps the exact tuple, so a lock that still landed after the
+      if (settlement.abortReason === UNLANDED_LOCK_ABORT_REASON) return
       // A tombstone is acknowledged only by the exact observable terminal artifacts, never merely by a UI stage.
       if (settlement.baseLockTxHash !== buyer.baseLockTxid || settlement.refundTxid !== buyer.baseRefundTxid || settlement.bsvClaimTxid !== buyer.bsvClaimTxid) return
       records.clear(settlement.hashHex, settlement)

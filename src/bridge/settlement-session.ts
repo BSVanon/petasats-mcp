@@ -127,6 +127,9 @@ export interface SettlementRecord extends SettlementParams {
   bsvLockOutpoint?: string
   /** Base lock event coordinates (to derive claim/refund calldata). */
   baseLockTxHash?: string
+  /** Presence is the buyer-kit write-ahead capability marker (including an empty array before the first lock).
+   *  Entries are locally signed lock attempts or nonce-consuming zero-value self-transfers, written before submit. */
+  baseLockAttempts?: Array<{ txHash: `0x${string}`; nonce: number; kind?: 'lock' | 'burn'; at?: number }>
   baseLockLogIndex?: number
   /** The Base block the USDC lock mined in — BOUNDS the watcher's Claim-event scan (a Claim can't
    *  precede the lock), so `eth_getLogs` never queries from block 0 and blows a public-RPC range cap. */
@@ -308,6 +311,17 @@ export function validateSettlementRecord(rec: SettlementRecord): void {
   }
   if (rec.baseLockTxHash !== undefined && !EVM_TX_HASH.test(rec.baseLockTxHash)) {
     throw new Error('SettlementRecord: baseLockTxHash must be a 0x-prefixed 32-byte EVM tx hash')
+  }
+  if (rec.baseLockAttempts !== undefined) {
+    if (!Array.isArray(rec.baseLockAttempts) || rec.baseLockAttempts.some((attempt) =>
+      typeof attempt !== 'object' || attempt === null || !EVM_TX_HASH.test(attempt.txHash) ||
+      !Number.isSafeInteger(attempt.nonce) || attempt.nonce < 0 ||
+      (attempt.kind !== undefined && attempt.kind !== 'lock' && attempt.kind !== 'burn') ||
+      (attempt.at !== undefined && (!Number.isSafeInteger(attempt.at) || attempt.at < 0)) ||
+      (attempt.kind === 'burn' && attempt.at === undefined),
+    )) {
+      throw new Error('SettlementRecord: baseLockAttempts must contain 0x-prefixed 32-byte tx hashes, non-negative safe-integer nonces, optional lock/burn kinds, and non-negative safe-integer timestamps (required for burns)')
+    }
   }
   if (rec.baseRecoveryClaimTxid !== undefined && !EVM_TX_HASH.test(rec.baseRecoveryClaimTxid)) {
     throw new Error('SettlementRecord: baseRecoveryClaimTxid must be a 0x-prefixed 32-byte EVM tx hash')
@@ -523,6 +537,17 @@ export class SettlementSession {
     if (this.rec.state !== 'base-locked') return
     this.rec.baseLockTxHash = txHash
     if (Number.isFinite(blockNumber) && blockNumber > 0) this.rec.baseLockBlock = blockNumber
+  }
+
+  /** Mark this placeholder as produced by a kit that durably records every signed lock before broadcast. */
+  beginBaseLockAttempts(): void {
+    if (this.rec.state === 'base-locked') this.rec.baseLockAttempts = []
+  }
+
+  /** Write-ahead forensic record for a locally signed Base lock.  The caller persists immediately before raw submit. */
+  noteBaseLockAttempt(attempt: { txHash: `0x${string}`; nonce: number; kind?: 'lock'; at?: number }): void {
+    if (this.rec.state !== 'base-locked') return
+    this.rec.baseLockAttempts = [...(this.rec.baseLockAttempts ?? []), attempt]
   }
 
   observeBsvLock(evt: { outpoint: string; refundTxHex?: string }, now: number): void {

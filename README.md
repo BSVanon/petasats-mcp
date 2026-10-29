@@ -17,7 +17,7 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.1` is recommended.
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.2` is recommended.
 
 ```sh
 claude mcp add petasats -- npx -y petasats-mcp
@@ -82,6 +82,8 @@ The npm package is built by GitHub Actions from a tagged commit and published wi
 ## Files, status, and recovery
 
 The kit uses `~/.petasats`. Run `npx petasats-mcp status` for status and `npx petasats-mcp recover` after interruption.
+
+A swap started with version 0.2.0 or 0.2.1 whose USDC lock never landed can stay at "Waiting for BSV lock" and block new swaps and withdrawals. If no other copy of the kit used the same folder while that swap ran, set `PETASATS_RESOLVE_OLD_STUCK_SWAPS=1` in the kit's environment (for example `"env":{"PETASATS_RESOLVE_OLD_STUCK_SWAPS":"1"}` in your client's server entry) and restart the kit. It then sends a zero-value transaction to its own Base address so the old lock can never land, and marks the swap failed once that transaction is final, usually within 30 minutes. Swaps started with 0.2.2 or later resolve without this setting.
 
 ## Troubleshooting
 

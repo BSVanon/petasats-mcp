@@ -37,6 +37,8 @@ export interface CreateBuyerRuntimeOptions {
   home?: string
   log?: (message: string) => void
   newWallet?: boolean
+  /** Resolve stuck swaps written by kits before 0.2.2. Default: PETASATS_RESOLVE_OLD_STUCK_SWAPS=1. */
+  resolveOldStuckSwaps?: boolean
   /** Internal test injection point. Never required by callers. */
   factories?: Partial<BuyerRuntimeFactories>
 }
@@ -94,6 +96,8 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     chainTracker: bsv.chainTracker, bsvReservePub: bsvKey.toPublicKey(), settlementDir: paths.settlementDir,
     usdcTokenAddress: BASE_USDC, capUsdPerSwap: config.capUsdPerSwap, now: Date.now,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log,
+    assertEvmPoolSafe: () => evmRails.assertSafeForNewLock(),
+    resolveUnmarkedStuckLocks: options.resolveOldStuckSwaps ?? process.env.PETASATS_RESOLVE_OLD_STUCK_SWAPS === '1',
   })
   const wallet = {
     baseAddress: addresses.baseAddress,

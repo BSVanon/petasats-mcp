@@ -33,7 +33,7 @@ export function guardBuyerEvmWrites(client: Erc20SwapEvmClient, assertSafeForNew
   return new Proxy(client, {
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver)
-      if (property !== 'approve' && property !== 'lock' && property !== 'transferErc20' && property !== 'transferNative') return value
+      if (property !== 'approve' && property !== 'lock' && property !== 'transferErc20' && property !== 'transferNative' && property !== 'consumeNonce') return value
       if (typeof value !== 'function') return value
       return async (...args: unknown[]) => {
         assertSafeForNewLock()

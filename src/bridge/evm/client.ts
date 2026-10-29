@@ -3,6 +3,7 @@ import {
   createWalletClient,
   encodeFunctionData,
   keccak256,
+  parseTransaction,
   parseAbiItem,
   sha256,
   type Address,
@@ -191,10 +192,10 @@ type LocalSignOpts = {
 export async function sendLocallySignedEvmTransaction(opts: LocalSignOpts & {
   writer: LocalSignOpts['writer'] & { sendRawTransaction(args: { serializedTransaction: Hex }): Promise<Hex> }
   /** Observe the serialized transaction before it is broadcast. */
-  onSignedTransaction?: (signedTx: Hex) => void
+  onSignedTransaction?: (signedTx: Hex) => void | Promise<void>
 }): Promise<Hex> {
   const serializedTransaction = await signLocallyEvmTransaction(opts)
-  opts.onSignedTransaction?.(serializedTransaction)
+  await opts.onSignedTransaction?.(serializedTransaction)
   const hash = await opts.writer.sendRawTransaction({ serializedTransaction })
   return hash
 }
@@ -313,6 +314,10 @@ export class Erc20SwapEvmClient {
   private nonceGapHealthDetail?: string
   private nonceFirstBootDetail?: string
   private feeCeilingHealthDetail?: string
+  /** No-counter clients may see stale pending-pool reads from a load-balanced RPC. A receipt-confirmed send floors it. */
+  private nonceFloor?: number
+  /** Serialize the no-counter sign→acknowledged-submit window inside this client instance. */
+  private noCounterSendTail: Promise<void> = Promise.resolve()
 
   constructor(opts: EvmClientOpts) {
     const chain = opts.chain ?? baseSepolia
@@ -595,12 +600,38 @@ export class Erc20SwapEvmClient {
     }
     // Without a counter: local sign then raw broadcast, optionally serialized by the lock. Contract identity reads
     // happen before send(), and the receipt wait stays outside the lock.
-    const broadcast = (): Promise<Hex> => sendLocallySignedEvmTransaction({
-      writer, publicClient: this.pub, sender: this.addr, localAccount: writer.account, to, data, value,
-    })
-    const hash = this.sendLock ? await this.sendLock.runExclusive(() => broadcast()) : await broadcast()
-    const rcpt = await this.pub.waitForTransactionReceipt({ hash })
-    return { hash, blockNumber: rcpt.blockNumber, status: rcpt.status }
+    const broadcast = async (): Promise<{ hash: Hex; nonce: number }> => {
+      const pending = await this.pub.getTransactionCount({ address: this.addr, blockTag: 'pending' })
+      const nonce = Math.max(pending, this.nonceFloor ?? 0)
+      const hash = await sendLocallySignedEvmTransaction({
+        writer, publicClient: this.pub, sender: this.addr, localAccount: writer.account, to, data, value, nonce,
+        ...(onRecorded ? {
+          onSignedTransaction: async (signedTx: Hex) => {
+            const signedNonce = Number(parseTransaction(signedTx).nonce)
+            if (!Number.isSafeInteger(signedNonce) || signedNonce < 0) throw new Error('EVM send refused: locally signed nonce is invalid')
+            await onRecorded({ hash: localTransactionHash(signedTx), signedTx, nonce: signedNonce })
+          },
+        } : {}),
+      })
+      return { hash, nonce }
+    }
+    // The floor is per client, so concurrent callers must not both read it before either raw submit is acknowledged.
+    // Keep the receipt wait below outside this short critical section exactly as before.
+    const prior = this.noCounterSendTail
+    let release!: () => void
+    this.noCounterSendTail = new Promise<void>((resolve) => { release = resolve })
+    await prior
+    let sent: { hash: Hex; nonce: number }
+    try {
+      sent = this.sendLock ? await this.sendLock.runExclusive(() => broadcast()) : await broadcast()
+    } finally {
+      release()
+    }
+    const rcpt = await this.pub.waitForTransactionReceipt({ hash: sent.hash })
+    // A raw-submit acknowledgement is ambiguous: the transaction can still disappear. Only a receipt proves this
+    // nonce was consumed, so an uncertain send leaves the next operation to its pending-nonce read.
+    this.nonceFloor = Math.max(this.nonceFloor ?? 0, sent.nonce + 1)
+    return { hash: sent.hash, blockNumber: rcpt.blockNumber, status: rcpt.status }
   }
 
   /** Machine: approve the swap contract to pull `amount` USDC (before lock). */
@@ -611,10 +642,49 @@ export class Erc20SwapEvmClient {
   }
 
   /** Machine (initiator): lock USDC under the hashlock + T_base. */
-  async lock(p: Erc20SwapParams, authorizeNewBroadcast?: EvmNewBroadcastAuthorizer): Promise<SentTx> {
+  async lock(
+    p: Erc20SwapParams,
+    authorizeNewBroadcast?: EvmNewBroadcastAuthorizer,
+    onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void>,
+  ): Promise<SentTx> {
+    if (onRecorded && this.nonceCounter) {
+      throw new Error('Erc20SwapEvmClient: lock attempt recording requires a client without a nonce counter')
+    }
     this.writer() // preserve the keyless write boundary before doing any network work
     await this.assertContractIdentity()
-    return this.send(this.swapAddress, encodeLock(p), undefined, undefined, authorizeNewBroadcast, true)
+    return this.send(this.swapAddress, encodeLock(p), undefined, undefined, authorizeNewBroadcast, true, undefined, onRecorded)
+  }
+
+  /** Buyer-only nonce burn: a zero-value self-transfer that replaces any recorded lock attempt at this exact nonce.
+   *  It deliberately neither reads nor raises the no-counter nonce floor. */
+  async consumeNonce(
+    nonce: number,
+    priorTxid?: Hex,
+    onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void>,
+  ): Promise<Hex> {
+    if (this.nonceCounter) throw new Error('Erc20SwapEvmClient: consumeNonce requires a client without a nonce counter')
+    if (!Number.isSafeInteger(nonce) || nonce < 0) throw new Error(`Erc20SwapEvmClient: consumeNonce nonce is invalid (${String(nonce)})`)
+    const writer = this.writer()
+    const broadcast = async (): Promise<Hex> => sendLocallySignedEvmTransaction({
+      writer, publicClient: this.pub, sender: this.addr, localAccount: writer.account, to: this.addr, data: '0x', value: 0n,
+      nonce, recoveryFeeLadder: true, ...(priorTxid ? { priorBroadcastTxid: priorTxid } : {}),
+      ...(onRecorded ? {
+        onSignedTransaction: async (signedTx: Hex) => {
+          const signedNonce = Number(parseTransaction(signedTx).nonce)
+          if (signedNonce !== nonce) throw new Error('EVM nonce burn refused: locally signed nonce changed')
+          await onRecorded({ hash: localTransactionHash(signedTx), signedTx, nonce: signedNonce })
+        },
+      } : {}),
+    })
+    const prior = this.noCounterSendTail
+    let release!: () => void
+    this.noCounterSendTail = new Promise<void>((resolve) => { release = resolve })
+    await prior
+    try {
+      return this.sendLock ? await this.sendLock.runExclusive(() => broadcast()) : await broadcast()
+    } finally {
+      release()
+    }
   }
 
   async claim(p: Erc20SwapParams, secret: number[], priorBroadcastTxid?: Hex, authorizeNewBroadcast?: EvmNewBroadcastAuthorizer): Promise<SentTx> {
@@ -778,6 +848,26 @@ export class Erc20SwapEvmClient {
   /** Latest finalized block number (OP-stack `finalized` tag) — the finality gate. */
   async finalizedBlockNumber(): Promise<bigint> {
     return (await this.pub.getBlock({ blockTag: 'finalized' })).number ?? 0n
+  }
+
+  /** Account nonce at one exact, already-resolved block; never silently substitute a moving tag. */
+  async nonceAtBlock(blockNumber: bigint): Promise<number> {
+    if (blockNumber <= 0n) throw new Error(`nonceAtBlock: blockNumber must be positive (got ${String(blockNumber)}; fail-closed)`)
+    return this.pub.getTransactionCount({ address: this.addr, blockNumber })
+  }
+
+  /** Pending account nonce, used only to avoid burning while another transaction is in flight. */
+  async pendingNonce(): Promise<number> {
+    return this.pub.getTransactionCount({ address: this.addr, blockTag: 'pending' })
+  }
+
+  /** Timestamp of one exact finalized block, in Unix seconds. */
+  async blockTimestamp(blockNumber: bigint): Promise<number> {
+    if (blockNumber <= 0n) throw new Error(`blockTimestamp: blockNumber must be positive (got ${String(blockNumber)}; fail-closed)`)
+    const timestamp = (await this.pub.getBlock({ blockNumber })).timestamp
+    const seconds = Number(timestamp)
+    if (!Number.isSafeInteger(seconds) || seconds < 0) throw new Error('blockTimestamp: RPC returned an invalid timestamp')
+    return seconds
   }
 
   /**

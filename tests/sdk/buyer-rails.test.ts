@@ -126,6 +126,14 @@ describe('buyer runtime rails', () => {
     expect(checks).deep.eq(['check', 'check']); expect(writes).deep.eq(['approve'])
   })
 
+  it('GATE: a nonce burn is also refused on a split Base pool', async () => {
+    const writes: string[] = []
+    const raw = { consumeNonce: async () => { writes.push('burn'); return '0xburn' } } as any
+    const guarded = guardBuyerEvmWrites(raw, () => { throw new Error('pool became split') })
+    await rejects(() => (guarded as any).consumeNonce(4), /pool became split/)
+    expect(writes).deep.eq([])
+  })
+
   it('header quorum refuses disagreement and a down source', async () => {
     const good = { currentHeight: async () => 10, isValidRootForHeight: async () => true }
     const bad = { currentHeight: async () => 10, isValidRootForHeight: async () => false }

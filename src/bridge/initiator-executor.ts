@@ -35,6 +35,7 @@ export interface BridgeInitiatorResult {
 
 /** SentTx-shaped subset the initiator needs from `Erc20SwapEvmClient`. */
 interface SentTx { hash: string; status: 'success' | 'reverted' | 'pending'; blockNumber?: bigint }
+type LockAttempt = { hash: `0x${string}`; signedTx: `0x${string}`; nonce: number }
 
 export const DEFAULT_EVM_LOCK_LAND_DEADLINE_MS = 120_000
 const EVM_LOCK_LAND_POLL_MS = 2_000
@@ -55,7 +56,7 @@ export interface BridgeInitiatorEvmRails {
   tokenDecimals(token: `0x${string}`): Promise<number>
   allowance(token: `0x${string}`): Promise<bigint>
   approve(token: `0x${string}`, amount: bigint): Promise<SentTx>
-  lock(p: Erc20SwapParams): Promise<SentTx>
+  lock(p: Erc20SwapParams, authorizeNewBroadcast?: unknown, onRecorded?: (attempt: LockAttempt) => void | Promise<void>): Promise<SentTx>
   currentBlockNumber(): Promise<bigint>
   /** Exact-tuple escrow read; `blockNumber` pins it to that block (a node lacking the block must error). */
   isSwapLocked(p: Erc20SwapParams, opts?: { blockNumber?: bigint }): Promise<boolean>
@@ -146,6 +147,10 @@ export interface BridgeInitiatorConfig {
   bsvRefundFeeBudgetSats?: number
   /** Bounded same-operation retry window for an outcome-unknown Base lock. Default 120 seconds. */
   lockLandDeadlineMs?: number
+  
+  approveOnlyBelowAllowance?: boolean
+  
+  recordLockAttempts?: boolean
 }
 
 export interface BridgeInitiatorDeps {
@@ -157,9 +162,7 @@ export interface BridgeInitiatorDeps {
   bsv: BridgeInitiatorBsvRails
   coordinator: BridgeInitiatorCoordinator
   config: BridgeInitiatorConfig
-  
   chainTracker?: ChainTracker
-  
   zeroConfStatus?: FetchTxStatus
   /** Seam 4a (full pilot): the MULTI-provider ARC status rail (`getMultiArcTxStatuses`) — REQUIRED when
    *  `config.zeroConfMinArcProviders ≥ 2`. Each poll queries every configured ARC provider so the reveal needs ≥N
@@ -175,6 +178,8 @@ export interface BridgeInitiatorDeps {
   /** M-4 (red-team): clear the at-risk record on a CLEAN settle. Without it the initiator re-persists on settle, so
    *  every completed swap leaves a stale 'at-risk' record that masks a genuinely stranded one on the next startup. */
   clearRecord?(swapId: string): void
+  
+  clearNeverSentLock?(hashHex: string, reason: string): void
   now?(): number
   /** Millisecond wall clock for the Base lock landing deadline (separate from SettlementSession's seconds clock). */
   nowMs?(): number
@@ -183,7 +188,6 @@ export interface BridgeInitiatorDeps {
   /** Restock-only signer arbitration: acquire reveal before the irreversible write-ahead and BSV broadcast. */
   acquireRevealSide?(hashHex: string): Promise<void>
 }
-
 const MAX_SAFE_SATS = BigInt(Number.MAX_SAFE_INTEGER)
 
 /** Reject an untrusted settlement reply before it can cause an EVM or BSV action. */
@@ -195,6 +199,7 @@ function validateResponderQuote(quote: BridgeQuote): void {
     if (PublicKey.fromString(quote.responderBsvPubKeyHex).toAddress().toString() !== quote.responderBsvAddress) fail()
   } catch { fail() }
 }
+
 // The BSV claim reveals the secret — the money-critical broadcast. Anvil is an SPV node with no UTXO set: it verifies
 // the spend from the lock's merkle proof carried in a BEEF, and REJECTS a bare tx (HTTP 422, BEEF parse-fail at byte 0;
 // block. The reveal-safety gate is re-read from a FRESH BSV height before every attempt, so the retry/backoff window
@@ -424,12 +429,14 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           refundAddress: evm.address() as `0x${string}`,
           timelock: BigInt(intent.baseTimelockBlock),
         }
-        const approval = await evm.approve(spec.erc20TokenAddress, spec.deliverAmount)
-        if (approval.status === 'reverted') throw new Error(`USDC approve reverted (${approval.hash})`)
-        if (approval.status === 'pending') log('evm', `USDC approve outcome pending (${approval.hash.slice(0, 12)}…) — waiting for allowance propagation`)
-        for (let i = 0; (await evm.allowance(spec.erc20TokenAddress)) < spec.deliverAmount; i++) {
-          if (i > 20) throw new Error('allowance did not propagate')
-          await sleep(3000)
+        if (!cfg.approveOnlyBelowAllowance || (await evm.allowance(spec.erc20TokenAddress)) < spec.deliverAmount) {
+          const approval = await evm.approve(spec.erc20TokenAddress, spec.deliverAmount)
+          if (approval.status === 'reverted') throw new Error(`USDC approve reverted (${approval.hash})`)
+          if (approval.status === 'pending') log('evm', `USDC approve outcome pending (${approval.hash.slice(0, 12)}…) — waiting for allowance propagation`)
+          for (let i = 0; (await evm.allowance(spec.erc20TokenAddress)) < spec.deliverAmount; i++) {
+            if (i > 20) throw new Error('allowance did not propagate')
+            await sleep(3000)
+          }
         }
         // review fde1afe HIGH (M-1 redone): observe 'base-locked' with a PLACEHOLDER txHash BEFORE evm.lock() returns —
         // so a crash during its receipt-wait leaves an ACTIONABLE 'base-locked' record. (The earlier fix persisted a
@@ -443,14 +450,36 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           timelock: BigInt(intent.baseTimelockBlock), contractAddress: cfg.erc20SwapAddress, chainId: cfg.baseChainId, blockNumber: 0,
         }
         session.observeBaseLock(observed, now())
+        // Presence, even while empty, is a capability marker: this kit records every locally signed lock before it
+        // broadcasts. Older records omit the field and need the conservative nonce-burn recovery path.
+        if (cfg.recordLockAttempts) session.beginBaseLockAttempts()
         deps.persist?.(session.toRecord()) // ACTIONABLE at-risk record BEFORE the lock lands → the watchtower refunds at the timelock
         const lockDeadlineAt = nowMs() + lockLandDeadlineMs
-        let lk = await evm.lock(evmParams)
+        let lockAttemptRecorded = false
+        const recordLockAttempt = cfg.recordLockAttempts ? async (attempt: LockAttempt): Promise<void> => {
+          lockAttemptRecorded = true // first: a failed persist below must never read as "never sent"
+          session.noteBaseLockAttempt({ txHash: attempt.hash, nonce: attempt.nonce })
+          deps.persist?.(session.toRecord())
+        } : undefined
+        // The buyer's rails record every signed lock before broadcasting it, so a lock call that failed before any
+        // attempt was recorded sent nothing and nothing can land (e.g. a write-boundary safety refusal once a covered
+        // allowance skips the approve). Clear the placeholder rather than block the kit until the timelock.
+        const lockOnce = async (): Promise<SentTx> => {
+          try {
+            return await evm.lock(evmParams, undefined, recordLockAttempt)
+          } catch (error) {
+            if (!recordLockAttempt || lockAttemptRecorded || !deps.clearNeverSentLock) throw error
+            const cause = error instanceof Error ? error.message : String(error)
+            deps.clearNeverSentLock(hashHex, `the USDC lock was never sent (${cause}); nothing was locked`)
+            throw new Error(`USDC lock not sent (${cause}) — cleared the pre-lock record (nothing locked)`)
+          }
+        }
+        let lk = await lockOnce()
         while (lk.status === 'pending' && nowMs() < lockDeadlineAt) {
           const remaining = lockDeadlineAt - nowMs()
           await sleep(Math.min(EVM_LOCK_LAND_POLL_MS, Math.max(1, remaining)))
           if (nowMs() >= lockDeadlineAt) break
-          lk = await evm.lock(evmParams)
+          lk = await lockOnce()
         }
         // A REVERTED receipt may be a duplicate of this lock while an earlier broadcast holds the USDC. Clear the
         // pre-lock record ONLY on a confirmed false for the exact tuple AT the reverted receipt's block (a lagging
