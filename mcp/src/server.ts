@@ -31,6 +31,7 @@ REPORTING
 SAFETY
 - Keep this MCP server running until the swap is done. If it stops, the swap resumes safely when it starts again. If it stays stopped for more than about 3 hours after the USDC lock, the swap cannot finish; the kit then refunds the USDC the next time it runs after the Base timelock ends (about 16 hours after the lock).
 - The kit refuses a new swap or a withdrawal while a swap is in progress.
+- stop_spending stops new swaps and withdrawals until the user runs \`npx petasats-mcp resume\` in a terminal. Limits in limits.json can also refuse destinations and daily spending.
 - withdraw_bsv and withdraw_base send funds out of the kit. Use only an address the user gave you, and confirm it with them.
 - Never open, print or send the kit's keys file. Tell the user to keep a backup of it: it holds the only copy of the kit's keys.`
 
@@ -67,6 +68,7 @@ const TOOLS = [
   { name: 'wait_for_swap', title: 'Wait for swap update', description: 'Read-only wait for a local swap stage change, for up to 55 seconds.', annotations: { readOnlyHint: true }, inputSchema: { type: 'object' as const, properties: { swap_id: { type: 'string' }, max_wait_seconds: { type: 'number' } }, required: ['swap_id'] } },
   { name: 'swap_status', title: 'Swap status', description: 'Read-only structured local swap status and transaction links.', annotations: { readOnlyHint: true }, inputSchema: { type: 'object' as const, properties: { swap_id: { type: 'string' } }, required: [] } },
   { name: 'wallet_info', title: 'Wallet information', description: 'Read-only local Base and BSV addresses and balances; no key material.', annotations: { readOnlyHint: true }, inputSchema: { type: 'object' as const, properties: {}, required: [] } },
+  { name: 'stop_spending', title: 'Stop spending', description: 'Stops new swaps and withdrawals until the user resumes spending from a terminal.', annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true }, inputSchema: { type: 'object' as const, properties: { reason: { type: 'string', maxLength: 200 } }, required: [] } },
   { name: 'withdraw_bsv', title: 'Withdraw all confirmed BSV', description: 'Moves all confirmed BSV from this kit to the supplied BSV address.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }, inputSchema: { type: 'object' as const, properties: { address: { type: 'string' } }, required: ['address'] } },
   { name: 'withdraw_base', title: 'Withdraw Base funds', description: 'Moves USDC or ETH from the local Base wallet. Amount is atomic or all.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }, inputSchema: { type: 'object' as const, properties: { asset: { type: 'string' }, to: { type: 'string' }, amount: { type: 'string' } }, required: ['asset', 'to', 'amount'] } },
   {
@@ -95,7 +97,7 @@ const TOOLS = [
 
 const ABOUT = `# PetaSats buyer kit
 
-The local buyer kit buys BSV with the operator’s own USDC on Base through the market maker's public door:
+The local buyer kit buys BSV with the operator’s own USDC on Base through the market maker:
 
 - **USDC → BSV only** — a cross-chain covenant atomic swap. One secret settles both legs; neither side can take one leg without the other.
 
@@ -103,7 +105,7 @@ The local buyer kit buys BSV with the operator’s own USDC on Base through the 
 PetaSats never holds your keys or funds. Identity, Base, and BSV keys are generated and retained locally. Swaps run in the background and recovery resumes durable records after restart.
 
 ## Tools
-- get_quote, swap_asset_to_bsv, wait_for_swap, swap_status, wallet_info, withdraw_bsv, withdraw_base, fund_wallet, list_liquidity.
+- get_quote, swap_asset_to_bsv, wait_for_swap, swap_status, wallet_info, stop_spending, withdraw_bsv, withdraw_base, fund_wallet, list_liquidity.
 `
 
 /** The get_quote wire shape (bigints as strings; assets as agent-facing strings). */
@@ -222,6 +224,13 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
         return success({ changed: current.stage !== initial.stage, waited_seconds: Math.ceil((seconds * 1000 - Math.max(0, until - Date.now())) / 1000), swap: buyerStatusView(current) })
       }
       case 'wallet_info': return success({ ...await petasats.walletInfo(), door_identity: details.doorIdentity ?? 'not configured' })
+      case 'stop_spending': {
+        const reason = optionalString(a, 'reason')
+        if (reason !== undefined && reason.length > 200) throw new ToolInputError('reason must be 200 characters or fewer')
+        if (!petasats.stopSpending) throw new Error('spending stop is not configured')
+        const result = await petasats.stopSpending(reason)
+        return success(result.alreadyStopped ? { stopped: true, already_stopped: true, at: result.at, reason: result.reason } : { stopped: true, at: result.at, reason: result.reason })
+      }
       case 'withdraw_bsv': return success(await petasats.withdrawBsv(requireString(a, 'address')))
       case 'withdraw_base': {
         const asset = requireString(a, 'asset'); if (asset !== 'USDC' && asset !== 'ETH') throw new ToolInputError('asset must be USDC or ETH')
@@ -235,6 +244,7 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
         const from = parseAsset(optionalString(a, 'from_asset') ?? 'USDC')
         if (from !== 'USDC') throw new ToolInputError('not available in phase 1: fund_wallet supports USDC → BSV only')
         const amountIn = requireAmount(a, 'amount_in')
+        await petasats.assertCanPlanSwap?.(bsvAddress, amountIn)
         const q = await petasats.quote({ from, to: 'BSV', amountIn, deliverTo: bsvAddress })
         return success({
           plan: 'To fund this BSV address non-custodially, call swap_asset_to_bsv with the params below (optionally passing this quote to lock terms).',

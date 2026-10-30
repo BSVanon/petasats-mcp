@@ -25,6 +25,9 @@ export const DEFAULT_EVM_REFRESH_BUDGET_MS = 20_000
 export const DEFAULT_EVM_UNRESOLVED_CONSUMED_RESEND_MS = 600_000
 export const EVM_RECEIPT_WAIT_MS = DEFAULT_EVM_RECEIPT_WAIT_MS
 export const EVM_HEAD_BUMP_AFTER_MS = DEFAULT_EVM_HEAD_BUMP_AFTER_MS
+/** A Base archive-refusal retry can last ~15.75s. Receipt probes run under the cross-process nonce lease, so cap each
+ * one well below the 30s lease-acquisition timeout: an unknown receipt delays this send, never every sender. */
+export const MAX_EVM_LOCKED_LOOKUP_MS = 5_000
 
 function boundedMs(env: Record<string, string | undefined>, name: string, fallback: number, min: number, max: number): number {
   const raw = env[name]?.trim()
@@ -107,6 +110,16 @@ export interface CounterSendDeps {
 const same = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase()
 const describe = (error: unknown): string => error instanceof Error ? error.message : String(error)
 
+function boundedLockedLookup<T>(lookup: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`EVM receipt lookup exceeded ${MAX_EVM_LOCKED_LOOKUP_MS}ms while holding the send lock`)), MAX_EVM_LOCKED_LOOKUP_MS)
+    lookup().then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
 function mined(entry: EvmInflightSend, receipt: EvmReceipt, consumesSendAllowance = false): CounterSendOutcome {
   return {
     hash: receipt.transactionHash ?? entry.hash,
@@ -135,6 +148,11 @@ export async function sendCounterLeasedTransaction(deps: CounterSendDeps): Promi
   let sent: { entry: EvmInflightSend; consumesSendAllowance: boolean } | undefined
   let immediate: CounterSendOutcome | undefined
   let resendPermitted = false
+  // Receipt reads can be retried by the Base transport for ~15.75s. Their result is advisory while the nonce is
+  // already durably recorded, so timeout is safe: return/defer with the entry intact and release the lease.
+  const lockedReceiptReader = {
+    getTransactionReceipt: (args: { hash: Hex }) => boundedLockedLookup(() => deps.publicClient.getTransactionReceipt(args)),
+  }
 
   await deps.sendLock.runExclusive(async () => {
     for (let refresh = 0; refresh <= MAX_EVM_INFLIGHT_SENDS + 1; refresh += 1) {
@@ -151,7 +169,7 @@ export async function sendCounterLeasedTransaction(deps: CounterSendDeps): Promi
 
       if (!target && generations.length > 0 && !resendPermitted) {
         const verdict = await resolveConsumedGenerations({
-          publicClient: deps.publicClient,
+          publicClient: lockedReceiptReader,
           unresolvedConsumedResendMs: deps.unresolvedConsumedResendMs,
           now: deps.now,
           log: deps.log,
@@ -166,7 +184,7 @@ export async function sendCounterLeasedTransaction(deps: CounterSendDeps): Promi
 
       if (target) {
         try {
-          const hit = await probeGenerations(deps.publicClient, [target, ...generations])
+          const hit = await probeGenerations(lockedReceiptReader, [target, ...generations])
           // Only the in-flight generation's own receipt, or a success of any generation, resolves the op. An older
           // generation's revert resolves nothing while the in-flight bytes are unmined: they can still mine.
           if (hit && (hit.generation === target || hit.receipt.status === 'success')) {
@@ -183,7 +201,7 @@ export async function sendCounterLeasedTransaction(deps: CounterSendDeps): Promi
       }
 
       if (head) {
-        const headReceipt = target === head ? undefined : await receiptForHashes(deps.publicClient, head.hashes)
+        const headReceipt = target === head ? undefined : await receiptForHashes(lockedReceiptReader, head.hashes)
         if (headReceipt) {
           deps.nonceCounter.recordConsumed({ chainId: deps.chainId, address: deps.sender, nonce: head.nonce })
           continue
@@ -208,7 +226,7 @@ export async function sendCounterLeasedTransaction(deps: CounterSendDeps): Promi
             const hashes = [...new Set([
               ...head.hashes, ...(latest?.hashes ?? []), ...(consumed?.hashes ?? []), replacement.hash,
             ])]
-            const minedHash = await receiptForHashes(deps.publicClient, hashes)
+            const minedHash = await receiptForHashes(lockedReceiptReader, hashes)
             if (minedHash) {
               immediate = {
                 hash: minedHash.receipt.transactionHash ?? minedHash.queriedHash, nonce: head.nonce,

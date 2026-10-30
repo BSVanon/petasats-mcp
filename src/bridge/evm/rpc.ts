@@ -194,7 +194,11 @@ export function baseReadTransport(url: string, fetchImpl?: typeof fetch, retryDe
 export function baseRpcTransport(urls: readonly string[], fetchImpl?: typeof fetch, retryDelayMs = BASE_READ_RETRY_DELAY_MS): Transport {
   if (urls.length === 0) throw new Error('baseRpcTransport requires at least one RPC URL')
   if (urls.length === 1) return baseReadTransport(urls[0], fetchImpl, retryDelayMs)
-  return lookupRefusalGuard(fallback(urls.map((url) => baseReadTransport(url, fetchImpl, retryDelayMs)), { rank: false, shouldThrow: () => false }))
+  // Each endpoint already gets the bounded Base read retry schedule.  Do not also accept viem fallback's default
+  // outer retries: that multiplies a refusal across the whole endpoint set and makes an unknown lookup unbounded.
+  return lookupRefusalGuard(fallback(urls.map((url) => baseReadTransport(url, fetchImpl, retryDelayMs)), {
+    rank: false, shouldThrow: () => false, retryCount: 0, retryDelay: retryDelayMs,
+  }))
 }
 
 type RpcReply = { result?: unknown; error?: { code?: number; message?: string } }

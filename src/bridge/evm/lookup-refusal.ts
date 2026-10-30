@@ -59,7 +59,15 @@ export async function guardLookup<T>(method: string, run: () => Promise<T>): Pro
   if (!LOOKUP_METHODS.has(method)) return run()
   const outer = lookupScope.getStore()
   const scope = outer ?? { refused: false }
-  const result = outer ? await run() : await lookupScope.run(scope, run)
+  let result: T
+  try {
+    result = outer ? await run() : await lookupScope.run(scope, run)
+  } catch (error) {
+    // Exhausting the retry/fallback set after any archive refusal is still an unknown lookup.  Do not leak the
+    // transport's final 503 to a caller which might otherwise collapse it into an absent transaction.
+    if (scope.refused) throw new LookupRefusedError(method)
+    throw error
+  }
   if (result == null && scope.refused) throw new LookupRefusedError(method)
   return result
 }

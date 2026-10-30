@@ -20,7 +20,8 @@ export interface BuyerEvmRailsOptions {
 export interface BuyerEvmRails {
   client: Erc20SwapEvmClient
   pool: BaseRpcFailoverPool
-  assertSafeForNewLock(): void
+  /** Re-probes on every money boundary; returned snapshot detects a changed verified set. */
+  assertSafeForNewLock(): Promise<string>
   balances(): Promise<{ usdc: bigint; eth: bigint }>
 }
 
@@ -29,14 +30,14 @@ export interface BuyerEvmRails {
  * take long enough for a previously healthy pool to become split, so the
  * safety decision belongs at each write boundary rather than at its caller.
  */
-export function guardBuyerEvmWrites(client: Erc20SwapEvmClient, assertSafeForNewLock: () => void): Erc20SwapEvmClient {
+export function guardBuyerEvmWrites(client: Erc20SwapEvmClient, assertSafeForNewLock: () => unknown | Promise<unknown>): Erc20SwapEvmClient {
   return new Proxy(client, {
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver)
       if (property !== 'approve' && property !== 'lock' && property !== 'transferErc20' && property !== 'transferNative' && property !== 'consumeNonce') return value
       if (typeof value !== 'function') return value
       return async (...args: unknown[]) => {
-        assertSafeForNewLock()
+        await assertSafeForNewLock()
         return value.apply(target, args)
       }
     },
@@ -65,10 +66,14 @@ export async function makeBuyerEvmRails(opts: BuyerEvmRailsOptions): Promise<Buy
   })
   const reader = createPublicClient({ chain: base, transport: pool.transport })
   await rawClient.assertChainId()
-  const assertSafeForNewLock = (): void => {
-    if (pool.isSplit() || pool.isUnverified()) {
+  const assertSafeForNewLock = async (): Promise<string> => {
+    await pool.probeNow()
+    // A vetted fallback can keep recovery reads live, but a new withdrawal or
+    // lock must not proceed after any configured observer falls behind or forks.
+    if (pool.isSplit() || pool.isUnverified() || pool.activeUrls.length !== urls.length) {
       throw new Error('buyer EVM rail is split or unverified — refusing a new lock')
     }
+    return pool.activeUrls.join('\u0000')
   }
   return {
     client: guardBuyerEvmWrites(rawClient, assertSafeForNewLock),

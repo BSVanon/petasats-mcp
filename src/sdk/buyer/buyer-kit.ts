@@ -1,9 +1,10 @@
 import { randomBytes } from 'crypto'
 import { isAddress } from 'viem'
 import { isBsv, isErc20, type ConvertRequest, type Quote, type SwapResult } from '../convert'
-import type { BuyerBaseWallet, BuyerKit, BuyerKitConfig, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, BuyerStore, BuyerWallet, DoorClient, BuyerExecutor, StartSwapRequest } from './types'
+import type { BuyerBaseWallet, BuyerKit, BuyerKitConfig, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, BuyerStore, BuyerWallet, DoorClient, BuyerExecutor, StartSwapRequest, BuyerWithdrawalIntents, BuyerWithdrawalReconcileOutcome } from './types'
 import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
+import { assertBaseDestination, assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
 
 const HARD_CAP_USD = 1000
 const DEFAULT_CAP_USD = 100
@@ -36,7 +37,7 @@ function nextEvent(stage: BuyerSwapStage | string): string {
  * Stateful USDC→BSV buyer façade.  It owns no transport and no RPC: those are injected by the local runtime, which
  * makes the same lifecycle safe to test on in-memory chains and to resume after process restart.
  */
-export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient; executor: BuyerExecutor; store: BuyerStore; wallet: BuyerWallet & BuyerBaseWallet; /** Checked immediately before the first door call for every new swap. */ beforeNewSwap?: () => void | Promise<void>; log?: (message: string) => void }): BuyerKit {
+export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient; executor: BuyerExecutor; store: BuyerStore; wallet: BuyerWallet & BuyerBaseWallet; /** Checked immediately before the first door call for every new swap. */ beforeNewSwap?: () => void | Promise<void>; limits?: () => BuyerLimits | undefined; spendingStopped?: () => { at: number; reason?: string } | undefined; withdrawalIntents?: BuyerWithdrawalIntents; stopSpending?: (reason?: string) => { alreadyStopped: boolean; at?: number; reason?: string }; log?: (message: string) => void }): BuyerKit {
   const capUsdPerSwap = config.capUsdPerSwap ?? DEFAULT_CAP_USD
   if (!Number.isFinite(capUsdPerSwap) || capUsdPerSwap <= 0 || capUsdPerSwap > HARD_CAP_USD) throw new Error(`capUsdPerSwap must be > 0 and ≤ ${HARD_CAP_USD}`)
   const maxActive = config.maxActiveSwaps ?? 1
@@ -54,6 +55,26 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     moneyOperation = new Promise<void>((resolve) => { release = resolve })
     await previous
     try { return await operation() } finally { release() }
+  }
+  const assertNotStopped = (): void => {
+    if (deps.spendingStopped?.()) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`')
+  }
+  const limits = (): BuyerLimits | undefined => deps.limits?.()
+  const prepareNewBaseSpend = async (): Promise<{ snapshot: BuyerLimits | undefined; reconciled?: BuyerWithdrawalReconcileOutcome }> => {
+    assertNotStopped()
+    const snapshot = limits() // Read once and fail closed before any balance, door, or chain I/O.
+    const reconciled = await deps.withdrawalIntents?.reconcile()
+    return { snapshot, reconciled }
+  }
+  const priorWithdrawalMessage = (outcome: BuyerWithdrawalReconcileOutcome): string => outcome.status === 'success'
+    ? `the previous Base withdrawal ${outcome.hash} (${outcome.amount} ${outcome.asset} to ${outcome.to}) succeeded; nothing new was sent`
+    : `the previous Base withdrawal ${outcome.hash} (${outcome.amount} ${outcome.asset} to ${outcome.to}) did not go through; nothing new was sent; call again to retry`
+  const assertNoDuplicateWithdrawal = (asset: 'USDC' | 'ETH', to: string, amount: bigint): void => {
+    const duplicate = deps.withdrawalIntents?.list?.().find((record) => { const age = Math.max(0, now() - record.createdAtMs); return record.asset === asset && record.to.toLowerCase() === to.toLowerCase() && record.amount === amount.toString() && age < 60 * 60_000 && (record.state === 'pending' || record.status === 'success' || record.status === 'sent') })
+    if (!duplicate) return
+    const retryAt = new Date(duplicate.createdAtMs + 60 * 60_000).toISOString()
+    const minutes = Math.max(0, Math.floor((now() - duplicate.createdAtMs) / 60_000))
+    throw new Error(`a Base withdrawal of ${amount} ${asset} to ${to} (${duplicate.hash}) was sent ${minutes} minutes ago; nothing new was sent; to send the same amount to the same address again, wait until ${retryAt} or use a different amount`)
   }
 
   const write = async (record: BuyerSwapRecord, stage: BuyerSwapStage, extra: Partial<BuyerSwapRecord> = {}): Promise<BuyerSwapRecord> => {
@@ -133,11 +154,14 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       throw new Error('min_bsv_out must be a positive number of satoshis; nothing was locked')
     }
     const record = await serializeMoney(async () => {
+      const { snapshot: activeLimits } = await prepareNewBaseSpend()
       if (!input.quote && input.minBsvOut === undefined) throw new Error('a quote or min_bsv_out is required; nothing was locked')
-      if (input.deliverTo) assertAddress(input.deliverTo)
+      if (input.deliverTo) { assertAddress(input.deliverTo); assertBsvDestination(activeLimits, input.deliverTo) }
       if (input.deliverTo && !hasDurableSweep()) throw new Error('deliver_to requires the durable sweep interface (buildSweep, broadcastSweep, and isSweepConfirmed)')
       if (input.amountIn < 1n || input.amountIn > 1_000_000_000n || input.amountIn > BigInt(Math.floor(capUsdPerSwap * 1e6))) throw new Error(`amount exceeds this kit’s $${capUsdPerSwap} per-swap cap`)
-      const existing = (await deps.store.list()).filter((r) => !knownStage(r.stage) || active.has(r.stage))
+      const allRecords = await deps.store.list()
+      assertDailySwapCap(activeLimits, allRecords, input.amountIn, now())
+      const existing = allRecords.filter((r) => !knownStage(r.stage) || active.has(r.stage))
       if (existing.length >= maxActive) throw new Error(`a swap is already active (${existing[0].swapId}: ${nextEvent(existing[0].stage)})`)
       // Do all locally decidable checks before touching the door. ETH need only be non-zero here: exact gas is priced by
       // the signed lock path, but a zero balance can never submit an approval/lock transaction.
@@ -153,6 +177,8 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       const floor = input.minBsvOut ?? (retained ? retained.bsvSats * 99n / 100n : undefined)
       if (floor !== undefined && q.bsvSats < floor) throw new Error('price moved below the permitted BSV amount; nothing was locked')
       const next: BuyerSwapRecord = { schemaVersion: 2, swapId: swapId(), requestId: requestId(), stage: 'quoted', amountIn: input.amountIn.toString(), quote: q, deliverTo: input.deliverTo, createdAtMs: now(), updatedAtMs: now() }
+      // STOP linearizes with the first durable swap row, not just earlier planning.
+      assertNotStopped()
       await deps.store.put(next) // durable BEFORE admission/lock
       return next
     })
@@ -241,29 +267,55 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       return deps.store.list()
     },
     withdrawBsv: async (address) => serializeMoney(async () => {
+      assertNotStopped()
+      const activeLimits = limits()
       assertAddress(address)
+      assertBsvDestination(activeLimits, address)
       const blocked = (await deps.store.list()).find((r) => !knownStage(r.stage) || active.has(r.stage) || (!!r.deliverTo && ['claimed', 'settled', 'sweeping'].includes(r.stage)))
       if (blocked) throw new Error(`a swap blocks withdrawals (${blocked.swapId}: ${nextEvent(blocked.stage)})`)
       if (!deps.wallet.withdrawBsv) throw new Error('BSV sweeping is not configured')
-      return deps.wallet.withdrawBsv(address)
+      // STOP can arrive while the above reads are in flight.
+      assertNotStopped()
+      return deps.wallet.withdrawBsv(address, { beforeBroadcast: assertNotStopped })
     }),
     withdrawBase: async ({ asset, to, amount }) => serializeMoney(async () => {
+      const { snapshot: activeLimits, reconciled } = await prepareNewBaseSpend()
+      // Reconciliation belongs to the prior withdrawal. Never make its caller
+      // look like it initiated a new transfer just because its receipt arrived.
+      if (reconciled) throw new Error(priorWithdrawalMessage(reconciled))
       if (!isAddress(to, { strict: true }) || /^0x0{40}$/i.test(to)) throw new Error('to must be a non-zero checksummed Base address')
+      assertBaseDestination(activeLimits, to)
       if (to.toLowerCase() === deps.wallet.baseAddress.toLowerCase()) throw new Error('cannot withdraw to the kit address')
       if ((config.baseWithdrawalForbidden ?? []).some((address) => address.toLowerCase() === to.toLowerCase())) throw new Error('cannot withdraw to a swap or token contract')
       const blocked = (await deps.store.list()).find((r) => !knownStage(r.stage) || active.has(r.stage) || (!!r.deliverTo && ['claimed', 'settled', 'sweeping'].includes(r.stage)))
       if (blocked) throw new Error(`a swap blocks withdrawals (${blocked.swapId}: ${nextEvent(blocked.stage)})`)
       if (!/^(?:all|[1-9]\d*)$/.test(amount)) throw new Error('amount must be a positive atomic decimal string or all')
       const balances = await deps.wallet.balances(); let value: bigint
-      if (asset === 'USDC') { value = amount === 'all' ? balances.usdc : BigInt(amount); if (value < 1n || value > balances.usdc) throw new Error('amount exceeds USDC balance'); if (balances.eth < 1n) throw new Error('ETH is needed for Base gas'); if (!deps.wallet.transferUsdc) throw new Error('Base USDC withdrawals are not configured'); const sent = await deps.wallet.transferUsdc(to as `0x${string}`, value); if (sent.status !== 'success') throw new Error('Base USDC transfer reverted'); return { asset, amount: value, to, txid: sent.hash, status: sent.status } }
+      if (asset === 'USDC') { value = amount === 'all' ? balances.usdc : BigInt(amount); if (value < 1n || value > balances.usdc) throw new Error('amount exceeds USDC balance'); if (balances.eth < 1n) throw new Error('ETH is needed for Base gas'); if (!deps.wallet.transferUsdc) throw new Error('Base USDC withdrawals are not configured'); assertNoDuplicateWithdrawal(asset, to, value); const sent = await deps.wallet.transferUsdc(to as `0x${string}`, value, async (signed) => { assertNotStopped(); await deps.withdrawalIntents?.record({ asset, to, amount: value, ...signed }) }); if (deps.withdrawalIntents) try { await deps.withdrawalIntents.done(sent.hash, { status: sent.status === 'success' ? 'success' : 'reverted', blockNumber: sent.blockNumber }) } catch { log(`could not mark Base withdrawal done: ${sent.hash}`) } if (sent.status !== 'success') throw new Error('Base USDC transfer reverted'); return { asset, amount: value, to, txid: sent.hash, status: sent.status } }
       if (asset !== 'ETH') throw new Error('asset must be USDC or ETH')
       if (amount === 'all') { if (balances.usdc > 0n) throw new Error('withdraw the USDC first; it needs ETH for gas'); if (!deps.wallet.estimateEthTransferFee) throw new Error('Base ETH gas estimation is not configured'); const fee = await deps.wallet.estimateEthTransferFee(to as `0x${string}`); value = balances.eth - fee * 12n / 10n } else value = BigInt(amount)
-      if (value < 1n || value > balances.eth) throw new Error('amount exceeds ETH balance'); if (!deps.wallet.transferEth) throw new Error('Base ETH withdrawals are not configured'); const sent = await deps.wallet.transferEth(to as `0x${string}`, value); if (sent.status !== 'success') throw new Error('Base ETH transfer reverted'); return { asset, amount: value, to, txid: sent.hash, status: sent.status }
+      if (value < 1n || value > balances.eth) throw new Error('amount exceeds ETH balance'); if (!deps.wallet.transferEth) throw new Error('Base ETH withdrawals are not configured'); assertNoDuplicateWithdrawal(asset, to, value); const sent = await deps.wallet.transferEth(to as `0x${string}`, value, async (signed) => { assertNotStopped(); await deps.withdrawalIntents?.record({ asset, to, amount: value, ...signed }) }); if (deps.withdrawalIntents) try { await deps.withdrawalIntents.done(sent.hash, { status: sent.status === 'success' ? 'success' : 'reverted', blockNumber: sent.blockNumber }) } catch { log(`could not mark Base withdrawal done: ${sent.hash}`) } if (sent.status !== 'success') throw new Error('Base ETH transfer reverted'); return { asset, amount: value, to, txid: sent.hash, status: sent.status }
     }),
     walletInfo: async () => {
       const isNew = reportNewWallet; reportNewWallet = false
-      return { ...await deps.wallet.balances(), baseAddress: deps.wallet.baseAddress, bsvAddress: deps.wallet.bsvAddress, capUsdPerSwap,
+      let limitsView: unknown = 'none'; try { const current = limits(); limitsView = current ?? 'none' } catch (error) { limitsView = `invalid: ${error instanceof Error ? error.message.replace(/^refused by your limits file: /, '').replace(/; fix limits\.json at the terminal; nothing was sent$/, '') : String(error)}` }
+      let stopped: { at: number; reason?: string } | undefined
+      try { stopped = deps.spendingStopped?.() } catch { stopped = { at: 0, reason: 'invalid STOP record; fix STOP at the terminal' } }
+      return { ...await deps.wallet.balances(), baseAddress: deps.wallet.baseAddress, bsvAddress: deps.wallet.bsvAddress, capUsdPerSwap, spending_stopped: !!stopped, ...(stopped ? { stopped_at: stopped.at, ...(stopped.reason ? { stop_reason: stopped.reason } : {}) } : {}), limits: limitsView,
         ...(isNew ? { new_wallet: true, backup_note: `Back up ${config.keysPath ?? 'keys.json'}: it is the only copy of this kit's keys.` } : {}) }
+    },
+    assertCanPlanSwap: async (address, amountIn) => {
+      assertNotStopped()
+      const activeLimits = limits()
+      assertBsvDestination(activeLimits, address)
+      if (amountIn !== undefined) {
+        const records = await deps.store.list()
+        assertDailySwapCap(activeLimits, records, amountIn, now())
+      }
+    },
+    stopSpending: async (reason) => {
+      if (!deps.stopSpending) throw new Error('spending stop is not configured')
+      return deps.stopSpending(reason)
     },
   }
 }

@@ -35,13 +35,13 @@ async function rejects(work: () => Promise<unknown>, pattern: RegExp | string): 
   expect((thrown as Error).message).to.match(typeof pattern === 'string' ? new RegExp(pattern) : pattern)
 }
 
-function rpcFetch(state: Record<string, { chain?: string; hash?: string }>): typeof fetch {
+function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?: string }>): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input).replace(/\/$/, '')
     const request = JSON.parse(String(init?.body)) as { id: unknown; method: string; params: unknown[] }
     const s = state[url] ?? {}
     if (request.method === 'eth_chainId') return response(request.id, s.chain ?? '0x2105')
-    if (request.method === 'eth_blockNumber') return response(request.id, '0x202')
+    if (request.method === 'eth_blockNumber') return response(request.id, s.latest ?? '0x202')
     if (request.method === 'eth_getBlockByNumber') {
       if (request.params[0] === 'safe') return response(request.id, { number: '0x200', hash: s.hash ?? `0x${'a'.repeat(64)}` })
       if (request.params[0] === 'finalized') return response(request.id, { number: '0x200', hash: s.hash ?? `0x${'a'.repeat(64)}` })
@@ -142,14 +142,16 @@ describe('buyer runtime rails', () => {
     expect(await makeQuorumChainTracker([good, down] as any, 2).isValidRootForHeight('x', 1)).eq(false)
   })
 
-  it('EVM factory rejects a wrong chain and a split pool before a new lock', async () => {
+  it('EVM factory re-probes and rejects a primary endpoint that forks or lags after startup', async () => {
     const key = (`0x${'11'.repeat(32)}`) as `0x${string}`; const swap = (`0x${'22'.repeat(20)}`) as `0x${string}`
     await rejects(() => makeBuyerEvmRails({ privateKey: key, swapAddress: swap, usdcTokenAddress: swap, rpcUrls: ['http://wrong.test'], fetchImpl: rpcFetch({ 'http://wrong.test': { chain: '0x1' } }) }), /no endpoint|chain mismatch/)
-    const state = { 'http://one.test': {}, 'http://two.test': {} as { hash?: string } }
+    const state: Record<string, { hash?: string; latest?: string }> = { 'http://one.test': {}, 'http://two.test': {} }
     const rails = await makeBuyerEvmRails({ privateKey: key, swapAddress: swap, usdcTokenAddress: swap, rpcUrls: ['http://one.test', 'http://two.test'], fetchImpl: rpcFetch(state) })
     state['http://two.test'].hash = `0x${'b'.repeat(64)}`
-    await rails.pool.probeNow()
-    expect(() => rails.assertSafeForNewLock()).to.throw(/split or unverified/)
+    await rejects(() => rails.assertSafeForNewLock(), /split or unverified/)
+    state['http://two.test'].hash = `0x${'a'.repeat(64)}`
+    state['http://one.test'].latest = '0x100'
+    await rejects(() => rails.assertSafeForNewLock(), /split or unverified/)
   })
 
   it('buildSweepTx spends exactly requested confirmed coins, charges a fee, and refuses unsafe input', async () => {

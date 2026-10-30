@@ -1,13 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DoorDeclineError, type BuyerKit, type ConvertRequest, type StartSwapRequest } from 'petasats/sdk'
-import { handleToolCall } from '../src/server.js'
-import { initResult, isMainModule, startBackgroundRecovery } from '../src/index.js'
+import { isAddress } from 'viem'
+import { handleToolCall, TOOLS } from '../src/server.js'
+import { initResult, isMainModule, limitsOutput, resumeOutput, startBackgroundRecovery, statusOutput, withdrawalOutput, withdrawalsOutput } from '../src/index.js'
 import { DOOR_IDENTITY_PLACEHOLDER, initialiseBuyerHome } from '../../src/sdk/buyer/local-state.js'
-import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { makeBuyerWithdrawalIntents } from '../../src/sdk/buyer/withdrawal-intent.js'
+import { createBuyerKit } from '../../src/sdk/buyer/buyer-kit.js'
+import { readSpendingStop, stopSpending } from '../../src/sdk/buyer/stop.js'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 /** A fake buyer kit: quote doubles the input and startSwap records the request. */
 function fakePetasats(sink: { last?: StartSwapRequest } = {}): BuyerKit {
@@ -25,6 +29,8 @@ function payload(r: { content: Array<{ text: string }>; isError?: boolean }): an
   assert.equal(r.isError, undefined, `unexpected tool error: ${r.content[0]?.text}`)
   return JSON.parse(r.content[0].text)
 }
+
+const MCP_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 test('get_quote prices a pair (bigint amounts as strings)', async () => {
   const r = await handleToolCall(fakePetasats(), 'get_quote', { from_asset: 'USDC', to_asset: 'BSV', amount_in: '1000000' })
@@ -91,6 +97,17 @@ test('wallet_info includes the pinned door identity and never serializes private
   const result = payload(await handleToolCall(fakePetasats(), 'wallet_info', {}, { doorIdentity: identity }))
   assert.equal(result.door_identity, identity)
   assert.equal(JSON.stringify(result).includes('private'), false)
+})
+
+test('stop_spending is registered, idempotent, and fund_wallet asks the core planning guard with amount_in', async () => {
+  const tool = TOOLS.find((item) => item.name === 'stop_spending')
+  assert.deepEqual(tool?.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true })
+  let planned = ''; let plannedAmount: bigint | undefined; let stopped = ''
+  const kit = { ...fakePetasats(), assertCanPlanSwap: async (address: string, amount: bigint) => { planned = address; plannedAmount = amount }, stopSpending: async (reason?: string) => { stopped = reason ?? ''; return { alreadyStopped: false, at: 1, reason } } }
+  payload(await handleToolCall(kit, 'fund_wallet', { bsv_address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', amount_in: '1' }))
+  assert.equal(planned, '1BoatSLRHtKNngkdXEeobR76b53LETtpyT')
+  assert.equal(plannedAmount, 1n)
+  assert.equal(payload(await handleToolCall(kit, 'stop_spending', { reason: 'pause' })).stopped, true); assert.equal(stopped, 'pause')
 })
 
 test('background recovery starts immediately without blocking and serializes overlapping ticks', async () => {
@@ -192,4 +209,95 @@ test('init prints absolute MCP launch paths', () => {
   assert.equal(mcp.command, process.execPath)
   assert.equal(mcp.args.length, 1)
   assert.match(mcp.args[0], /^\//)
+})
+
+test('a 0.2.2 home without withdrawals works with status, limits, and resume CLI handlers', async () => {
+  const home = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-old-home-')))
+  const config = JSON.parse(readFileSync(home.configPath, 'utf8'))
+  config.doorIdentity = `02${'1'.repeat(64)}`
+  writeFileSync(home.configPath, JSON.stringify(config)); chmodSync(home.configPath, 0o600)
+  rmdirSync(home.withdrawalsDir)
+  assert.deepEqual(JSON.parse(await statusOutput(home)), { swaps: [] })
+  assert.equal(limitsOutput(home), 'none')
+  writeFileSync(home.stopPath, '{'); chmodSync(home.stopPath, 0o600)
+  assert.equal(resumeOutput(home), 'removed invalid STOP; spending resumed')
+  assert.equal(existsSync(home.stopPath), false)
+  const limits = { format: 'not-a-limit' }
+  writeFileSync(home.limitsPath, JSON.stringify(limits)); chmodSync(home.limitsPath, 0o600)
+  const renderedLimits = limitsOutput(home)
+  assert.match(renderedLimits, /^limits\.json format must be petasats\.limits\/1$/)
+  assert.equal(renderedLimits.includes('refused by your limits file'), false)
+  assert.equal(existsSync(home.withdrawalsDir), false)
+})
+
+test('withdrawals CLI lists no signed bytes and only resolves a nonce-consumed record', async () => {
+  const home = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-withdrawals-')))
+  const hash = `0x${'a'.repeat(64)}` as `0x${string}`; const signed = `0x${'b'.repeat(64)}` as `0x${string}`
+  const intents = makeBuyerWithdrawalIntents(home, { finalizedBlockNumber: async () => 10n, nonceAtBlock: async () => 2, receipt: async () => undefined, resendSigned: async () => hash })
+  await intents.record({ asset: 'USDC', to: '0x1111111111111111111111111111111111111111', amount: 1n, hash, signedTx: signed, nonce: 1 })
+  await assert.rejects(withdrawalOutput(hash, 'sent', home), /may still land; wait for it to confirm/)
+  await assert.rejects(intents.reconcile(), /used its nonce but its receipt was not found/)
+  writeFileSync(join(home.withdrawalsDir, `${hash}.lock`), JSON.stringify({ pid: process.pid, createdAt: Date.now() }) + '\n', { mode: 0o600 })
+  const listed = withdrawalsOutput(home)
+  assert.match(listed, /nonce-consumed-requires-user-outcome/); assert.equal(listed.includes(signed), false)
+  unlinkSync(join(home.withdrawalsDir, `${hash}.lock`))
+  assert.equal(JSON.parse(await withdrawalOutput(hash, 'not-sent', home)).outcome, 'not-sent')
+  assert.deepEqual(JSON.parse(withdrawalsOutput(home)), { withdrawals: [] })
+})
+
+test('T4 withdrawal CLI preserves the stored outcome and refuses a conflicting one', async () => {
+  const home = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-withdrawal-outcome-')))
+  const hash = `0x${'a'.repeat(64)}` as `0x${string}`; const signed = `0x${'b'.repeat(64)}` as `0x${string}`
+  const intents = makeBuyerWithdrawalIntents(home, { finalizedBlockNumber: async () => 10n, nonceAtBlock: async () => 2, receipt: async () => undefined, resendSigned: async () => hash })
+  await intents.record({ asset: 'USDC', to: '0x1111111111111111111111111111111111111111', amount: 1n, hash, signedTx: signed, nonce: 1 }); await intents.reconcile().catch(() => {})
+  assert.equal(JSON.parse(await withdrawalOutput(hash, 'sent', home)).outcome, 'sent')
+  await assert.rejects(withdrawalOutput(hash, 'not-sent', home), /already recorded as sent; nothing changed/)
+})
+
+test('the limits README Base address is a copyable 40-hex address', () => {
+  // The development tree keeps the README as a template; the published repository has it at its root.
+  const readme = [join(MCP_ROOT, 'public', 'template', 'README.md'), join(MCP_ROOT, '..', 'README.md')].find((path) => existsSync(path))
+  assert.ok(readme)
+  const template = readFileSync(readme, 'utf8')
+  const address = template.match(/"baseDestinations": \["(0x[0-9a-fA-F]+)"\]/)?.[1]
+  assert.ok(address)
+  assert.match(address!, /^0x[0-9a-fA-F]{40}$/)
+  assert.equal(isAddress(address!, { strict: true }), true)
+})
+
+function guardedCore(home: ReturnType<typeof initialiseBuyerHome>, limits: () => any = () => undefined) {
+  return createBuyerKit({}, {
+    limits, spendingStopped: () => readSpendingStop(home), stopSpending: (reason) => stopSpending(home, reason),
+    store: { list: async () => [], get: async () => undefined, put: async () => {} },
+    wallet: { baseAddress: '0x2222222222222222222222222222222222222222', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', balances: async () => ({ usdc: 1n, eth: 1n, claimedBsvSats: 0n }), withdrawBsv: async () => ({ sats: 0n }), transferUsdc: async () => ({ hash: `0x${'a'.repeat(64)}`, status: 'success' }) },
+    door: { quote: async () => ({ quoteId: 'q'.repeat(16), bsvSats: 1, usdcBaseUnits: '1', expiresAtMs: Date.now() + 60_000 }), admit: async () => ({ swapNamespace: 'a'.repeat(32), handshakeDeadlineMs: Date.now() + 60_000 }) }, executor: { execute: async () => ({ ok: true }) },
+  })
+}
+
+test('S3 every MCP tool leaves STOP in place', async () => {
+  const home = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-stop-'))); stopSpending(home, 'pause', 1)
+  const args: Record<string, Record<string, unknown>> = {
+    get_quote: { from_asset: 'USDC', to_asset: 'BSV', amount_in: '1' }, swap_asset_to_bsv: { from_asset: 'USDC', amount_in: '1', min_bsv_out: '1' }, wait_for_swap: { swap_id: 'x', max_wait_seconds: 1 }, swap_status: {}, wallet_info: {}, stop_spending: { reason: 'again' }, withdraw_bsv: { address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT' }, withdraw_base: { asset: 'USDC', to: '0x1111111111111111111111111111111111111111', amount: '1' }, fund_wallet: { bsv_address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', amount_in: '1' }, list_liquidity: {},
+  }
+  for (const tool of TOOLS) { await handleToolCall(guardedCore(home), tool.name, args[tool.name]); assert.equal(existsSync(home.stopPath), true, tool.name) }
+})
+
+test('S2 STOP leaves every read-only MCP tool available', async () => {
+  const home = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-read-stop-'))); stopSpending(home, 'pause', 1)
+  const terminal = { swapId: 'a'.repeat(32), requestId: 'r', stage: 'settled' as const, amountIn: '1', quote: {} as any, createdAtMs: 1, updatedAtMs: 1 }
+  const readable = { ...guardedCore(home), status: async () => [terminal] }
+  for (const [tool, args] of [
+    ['get_quote', { from_asset: 'USDC', to_asset: 'BSV', amount_in: '1' }], ['swap_status', {}], ['wait_for_swap', { swap_id: terminal.swapId, max_wait_seconds: 1 }], ['wallet_info', {}], ['list_liquidity', {}],
+  ] as const) assert.equal((await handleToolCall(readable, tool, args)).isError, undefined, tool)
+})
+
+test('M1 fund_wallet sends STOP and limits refusals to the tool result, and wallet_info carries stop and limits fields', async () => {
+  const stoppedHome = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-refusal-'))); stopSpending(stoppedHome, 'pause', 9)
+  const stopped = await handleToolCall(guardedCore(stoppedHome), 'fund_wallet', { bsv_address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', amount_in: '1' })
+  assert.equal(stopped.isError, true); assert.match(stopped.content[0].text, /spending is stopped/)
+  const limitsHome = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-mcp-limit-')))
+  const limited = await handleToolCall(guardedCore(limitsHome, () => ({ format: 'petasats.limits/1', bsvDestinations: [] })), 'fund_wallet', { bsv_address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', amount_in: '1' })
+  assert.equal(limited.isError, true); assert.match(limited.content[0].text, /bsvDestinations/)
+  const info = payload(await handleToolCall(guardedCore(stoppedHome, () => ({ format: 'petasats.limits/1', maxSwapUsdPerDay: 3 })), 'wallet_info', {}))
+  assert.deepEqual({ spending_stopped: info.spending_stopped, stopped_at: info.stopped_at, stop_reason: info.stop_reason, limits: info.limits }, { spending_stopped: true, stopped_at: 9, stop_reason: 'pause', limits: { format: 'petasats.limits/1', maxSwapUsdPerDay: 3 } })
 })

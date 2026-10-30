@@ -110,7 +110,7 @@ export interface BuyerWallet {
   bsvAddress: string
   balances(): Promise<{ usdc: bigint; eth: bigint; claimedBsvSats: bigint }>
   /** Optional sweep hook; implementation must reject dust before broadcast. */
-  withdrawBsv?(address: string, opts?: { onlyTxid?: string }): Promise<{ txid?: string; sats: bigint; reason?: string }>
+  withdrawBsv?(address: string, opts?: { onlyTxid?: string; beforeBroadcast?: () => void | Promise<void> }): Promise<{ txid?: string; sats: bigint; reason?: string }>
   buildSweep?(address: string, opts: { onlyTxid: string }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
   broadcastSweep?(outbox: { rawTx: string; atomicBeefHex?: string; txid: string; sats: string }): Promise<void>
   /** Must validate the same confirmation threshold as the claim path. */
@@ -118,9 +118,26 @@ export interface BuyerWallet {
 }
 
 export interface BuyerBaseWallet {
-  transferUsdc?(to: `0x${string}`, amount: bigint): Promise<{ hash: string; status: string }>
-  transferEth?(to: `0x${string}`, amount: bigint): Promise<{ hash: string; status: string }>
+  transferUsdc?(to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder): Promise<{ hash: string; status: string; blockNumber?: bigint }>
+  transferEth?(to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder): Promise<{ hash: string; status: string; blockNumber?: bigint }>
   estimateEthTransferFee?(to: `0x${string}`): Promise<bigint>
+}
+
+export type BuyerWithdrawalRecorder = (signed: { hash: `0x${string}`; signedTx: `0x${string}`; nonce: number }) => void | Promise<void>
+export interface BuyerWithdrawalReconcileOutcome {
+  hash: string
+  asset: 'USDC' | 'ETH'
+  to: string
+  amount: string
+  status: 'success' | 'reverted'
+}
+export interface BuyerWithdrawalIntents {
+  /** A receipt can settle an older withdrawal, but only the caller decides whether that ends its operation. */
+  reconcile(): Promise<BuyerWithdrawalReconcileOutcome | undefined>
+  record(input: { asset: 'USDC' | 'ETH'; to: string; amount: bigint; hash: string; signedTx: string; nonce: number }): Promise<void>
+  done(hash: string, result: { status: 'success' | 'reverted'; blockNumber?: bigint }): Promise<void>
+  /** Local, read-only records used to reject a likely duplicate retry. */
+  list?(): Array<{ asset: 'USDC' | 'ETH'; to: string; amount: string; hash: string; createdAtMs: number; state: 'pending' | 'done'; status?: 'success' | 'reverted' | 'sent' | 'not-sent' }>
 }
 
 export interface BuyerKitConfig {
@@ -148,7 +165,9 @@ export interface BuyerKit extends PetaSats {
   recover(): Promise<BuyerSwapRecord[]>
   withdrawBsv(address: string): Promise<{ txid?: string; sats: bigint; reason?: string }>
   withdrawBase(request: { asset: 'USDC' | 'ETH'; to: string; amount: string }): Promise<{ asset: 'USDC' | 'ETH'; amount: bigint; to: string; txid: string; status: string }>
-  walletInfo(): Promise<{ baseAddress: string; bsvAddress: string; usdc: bigint; eth: bigint; claimedBsvSats: bigint; capUsdPerSwap: number; new_wallet?: boolean; backup_note?: string }>
+  walletInfo(): Promise<{ baseAddress: string; bsvAddress: string; usdc: bigint; eth: bigint; claimedBsvSats: bigint; capUsdPerSwap: number; spending_stopped?: boolean; stopped_at?: number; stop_reason?: string; limits?: unknown; new_wallet?: boolean; backup_note?: string }>
+  assertCanPlanSwap?(deliverTo: string, amountIn?: bigint): Promise<void>
+  stopSpending?(reason?: string): Promise<{ alreadyStopped: boolean; at?: number; reason?: string }>
 }
 
 export type { ConvertRequest, PetaSats, Quote, SwapResult }

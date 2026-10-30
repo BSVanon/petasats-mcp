@@ -3,7 +3,7 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { existsSync, realpathSync } from 'fs'
 import { fileURLToPath } from 'url'
-import { type BuyerHome, type BuyerKit, buyerAddresses, buyerHome, DOOR_IDENTITY_PLACEHOLDER, createBuyerRuntime, initialiseBuyerHome, makeFileBuyerStore, readBuyerConfig, readBuyerKeys } from 'petasats/sdk'
+import { type BuyerHome, type BuyerKit, buyerAddresses, buyerHome, DOOR_IDENTITY_PLACEHOLDER, createBuyerRuntime, initialiseBuyerHome, listBuyerWithdrawalIntents, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, readBuyerLimits, resolveBuyerWithdrawalIntent, resumeSpending } from 'petasats/sdk'
 import { createPetaSatsMcpServer, handleToolCall, TOOLS } from './server.js'
 import { supportedPairs, parseAsset } from './assets.js'
 
@@ -43,7 +43,7 @@ function actionable(rows: Awaited<ReturnType<BuyerKit['status']>>): boolean {
 async function smoke(): Promise<void> {
   const unavailable = unavailableKit('buyer home is not initialised; run `petasats-mcp init` first')
   const checks: Array<{ name: string; ok: boolean; detail: string }> = []
-  checks.push({ name: 'tools_registered', ok: TOOLS.length === 9, detail: `${TOOLS.length} tools` })
+  checks.push({ name: 'tools_registered', ok: TOOLS.length === 10, detail: `${TOOLS.length} tools` })
   checks.push({ name: 'supported_pairs', ok: supportedPairs().length === 1, detail: 'one phase-1 pair' })
   let parseOk = false
   try { parseAsset('USDC'); parseAsset('BSV'); parseAsset(`bsv21:${'a'.repeat(64)}_0`); try { parseAsset('NOPE') } catch { parseOk = true } } catch { /* failed */ }
@@ -93,6 +93,39 @@ export function initResult(home: BuyerHome): Record<string, unknown> {
   }
 }
 
+/** CLI text is factored for tests; these commands never need a live rail. */
+export async function statusOutput(home = buyerHome()): Promise<string> {
+  const rows = await makeFileBuyerStore(home).list()
+  return JSON.stringify({ swaps: rows.map((row) => ({ swap_id: row.swapId, stage: row.stage, base_lock: row.baseLockTxid, bsv_claim: row.bsvClaimTxid, reason: row.reason })) }, null, 2)
+}
+export function resumeOutput(home = buyerHome()): string {
+  const stop = resumeSpending(home)
+  if (!stop) return 'not stopped'
+  if (stop.invalid) return 'removed invalid STOP; spending resumed'
+  return `${JSON.stringify(stop, null, 2)}\nOK`
+}
+export function limitsOutput(home = buyerHome()): string {
+  try {
+    const limits = readBuyerLimits(home)
+    return limits ? JSON.stringify(limits, null, 2) : 'none'
+  } catch (error) {
+    return safeMessage(error)
+      .replace(/^refused by your limits file: /, '')
+      .replace(/; fix limits\.json at the terminal; nothing was sent$/, '')
+  }
+}
+/** Pending withdrawal records only; signed bytes and all key material stay local. */
+export function withdrawalsOutput(home = buyerHome()): string {
+  return JSON.stringify({ withdrawals: listBuyerWithdrawalIntents(home)
+    .filter((record) => record.state !== 'done')
+    .map((record) => ({ hash: record.hash, asset: record.asset, amount: record.amount, destination: record.to, state: record.nonceConsumedAtBlock === undefined ? 'pending' : 'nonce-consumed-requires-user-outcome' })) }, null, 2)
+}
+export async function withdrawalOutput(hash: string, outcome: string, home = buyerHome()): Promise<string> {
+  if (outcome !== 'sent' && outcome !== 'not-sent') throw new Error('usage: npx petasats-mcp withdrawal <hash> sent|not-sent')
+  const record = await resolveBuyerWithdrawalIntent(home, hash, outcome)
+  return JSON.stringify({ hash: record.hash, asset: record.asset, amount: record.amount, destination: record.to, state: record.state, outcome: record.status }, null, 2)
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2]
   if (process.argv.includes('--smoke')) return smoke()
@@ -102,8 +135,23 @@ async function main(): Promise<void> {
     return
   }
   if (command === 'status') {
-    const rows = await makeFileBuyerStore(buyerHome()).list()
-    console.log(JSON.stringify({ swaps: rows.map((row) => ({ swap_id: row.swapId, stage: row.stage, base_lock: row.baseLockTxid, bsv_claim: row.bsvClaimTxid, reason: row.reason })) }, null, 2))
+    console.log(await statusOutput())
+    return
+  }
+  if (command === 'resume') {
+    console.log(resumeOutput())
+    return
+  }
+  if (command === 'limits') {
+    console.log(limitsOutput())
+    return
+  }
+  if (command === 'withdrawals') {
+    console.log(withdrawalsOutput())
+    return
+  }
+  if (command === 'withdrawal') {
+    console.log(await withdrawalOutput(process.argv[3] ?? '', process.argv[4] ?? ''))
     return
   }
   let runtime: Awaited<ReturnType<typeof createBuyerRuntime>> | undefined

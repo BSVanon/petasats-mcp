@@ -6,6 +6,7 @@ import {
   parseTransaction,
   parseAbiItem,
   sha256,
+  TransactionReceiptNotFoundError,
   type Address,
   type Chain,
   type Hex,
@@ -18,6 +19,7 @@ import type { EvmSendLock } from './send-lock'
 import {
   EvmFeeCeilingError,
   evmOperationKey,
+  MAX_EVM_LOCKED_LOOKUP_MS,
   type EvmNewBroadcastAuthorizer,
   resolveEvmReceiptWaitMs,
   resolveEvmHeadBumpAfterMs,
@@ -186,8 +188,20 @@ type LocalSignOpts = {
   recoveryFeeLadder?: boolean
   /** Hash of the prior recovery broadcast at this nonce, persisted by the watchtower for a reliable RBF floor. */
   priorBroadcastTxid?: Hex
+  /** Optional ceiling for advisory transaction/pending-pool probes while the cross-process nonce lease is held. */
+  lockedLookupTimeoutMs?: number
 }
 
+function boundedLookup<T>(timeoutMs: number | undefined, lookup: () => Promise<T>): Promise<T> {
+  if (timeoutMs === undefined) return lookup()
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`EVM transaction lookup exceeded ${timeoutMs}ms while holding the send lock`)), timeoutMs)
+    lookup().then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
 /** The only write primitive used by Erc20SwapEvmClient: local sign then raw broadcast. */
 export async function sendLocallySignedEvmTransaction(opts: LocalSignOpts & {
   writer: LocalSignOpts['writer'] & { sendRawTransaction(args: { serializedTransaction: Hex }): Promise<Hex> }
@@ -215,8 +229,8 @@ export async function signLocallyEvmTransaction(opts: LocalSignOpts): Promise<He
       throw new Error('EVM send refused: estimateFeesPerGas did not return non-negative EIP-1559 maxFeePerGas and maxPriorityFeePerGas')
     }
     const sources = [
-      await priorBroadcastEip1559Fees(opts.publicClient, opts.priorBroadcastTxid),
-      await pendingEip1559Fees(opts.publicClient, opts.sender, expectedSenderNonce),
+      await priorBroadcastEip1559Fees(opts.publicClient, opts.priorBroadcastTxid, opts.lockedLookupTimeoutMs),
+      await pendingEip1559Fees(opts.publicClient, opts.sender, expectedSenderNonce, opts.lockedLookupTimeoutMs),
     ].filter((fees): fees is { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } => fees !== undefined)
     const bumpFloor = sources.reduce<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | undefined>(
       (floor, fees) => floor
@@ -245,10 +259,11 @@ export async function signLocallyEvmTransaction(opts: LocalSignOpts): Promise<He
 async function priorBroadcastEip1559Fees(
   publicClient: { getTransaction?(args: { hash: Hex }): Promise<unknown> },
   priorBroadcastTxid?: Hex,
+  lockedLookupTimeoutMs?: number,
 ): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | undefined> {
   if (!priorBroadcastTxid || !publicClient.getTransaction) return undefined
   try {
-    const candidate = await publicClient.getTransaction({ hash: priorBroadcastTxid })
+    const candidate = await boundedLookup(lockedLookupTimeoutMs, () => publicClient.getTransaction!({ hash: priorBroadcastTxid }))
     if (typeof candidate !== 'object' || candidate === null) return undefined
     const tx = candidate as Record<string, unknown>
     if (tx.blockNumber !== null || typeof tx.maxFeePerGas !== 'bigint' || typeof tx.maxPriorityFeePerGas !== 'bigint') return undefined
@@ -272,10 +287,11 @@ async function pendingEip1559Fees(
   publicClient: { getBlock?(args: { blockTag: 'pending'; includeTransactions: true }): Promise<{ transactions?: unknown[] }> },
   sender: Address,
   nonce: number,
+  lockedLookupTimeoutMs?: number,
 ): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint } | undefined> {
   if (!publicClient.getBlock) return undefined
   try {
-    const pending = await publicClient.getBlock({ blockTag: 'pending', includeTransactions: true })
+    const pending = await boundedLookup(lockedLookupTimeoutMs, () => publicClient.getBlock!({ blockTag: 'pending', includeTransactions: true }))
     for (const candidate of pending.transactions ?? []) {
       if (typeof candidate !== 'object' || candidate === null) continue
       const tx = candidate as Record<string, unknown>
@@ -570,7 +586,7 @@ export class Erc20SwapEvmClient {
           try {
             const signedTx = await signLocallyEvmTransaction({
               writer, publicClient: this.pub, sender: this.addr, localAccount: writer.account, to, data, value, nonce,
-              recoveryFeeLadder: true, maxFeePerGasCeiling: this.maxFeePerGasCeiling,
+              recoveryFeeLadder: true, maxFeePerGasCeiling: this.maxFeePerGasCeiling, lockedLookupTimeoutMs: MAX_EVM_LOCKED_LOOKUP_MS,
               ...(priorBroadcastTxid ? { priorBroadcastTxid } : {}),
             })
             return { hash: localTransactionHash(signedTx), signedTx }
@@ -704,7 +720,7 @@ export class Erc20SwapEvmClient {
     token: Address,
     to: Address,
     amount: bigint,
-    opts: { operationSalt?: Hex; retainConsumedAttribution?: boolean } = {},
+    opts: { operationSalt?: Hex; retainConsumedAttribution?: boolean; onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void> } = {},
   ): Promise<SentTx> {
     return this.send(
       token,
@@ -714,13 +730,14 @@ export class Erc20SwapEvmClient {
       undefined,
       opts.retainConsumedAttribution ?? false,
       opts.operationSalt,
+      opts.onRecorded,
     )
   }
 
   /** Native ETH transfer using the same local-sign and raw-broadcast path as the swap writes. */
-  async transferNative(to: Address, value: bigint): Promise<SentTx> {
+  async transferNative(to: Address, value: bigint, opts: { onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void> } = {}): Promise<SentTx> {
     if (value <= 0n) throw new Error('transferNative value must be positive')
-    return this.send(to, '0x', value)
+    return this.send(to, '0x', value, undefined, undefined, false, undefined, opts.onRecorded)
   }
   /** Conservative EIP-1559 cost for a simple native transfer, used only to
    * leave gas behind for a buyer's explicit ETH "all" withdrawal. */
@@ -799,9 +816,16 @@ export class Erc20SwapEvmClient {
   }
 
   /** Resolve the mined block of a tx from its receipt — a BOUNDED anchor for findLockup (never scan getLogs from 0).
-   *  Returns null if the tx is not yet mined / not found (caller falls back to a recent window). */
+   *  Returns null only for viem's definite not-found receipt. Transport/refusal errors remain unknown and propagate so a
+   *  responder cannot treat an unread Base lock as absent before deciding whether to lock BSV. */
   async blockOfTx(txHash: Hex): Promise<number | null> {
-    const r = await this.pub.getTransactionReceipt({ hash: txHash }).catch(() => null)
+    let r: Awaited<ReturnType<typeof this.pub.getTransactionReceipt>>
+    try {
+      r = await this.pub.getTransactionReceipt({ hash: txHash })
+    } catch (error) {
+      if (error instanceof TransactionReceiptNotFoundError) return null
+      throw error
+    }
     return r != null && r.blockNumber != null ? Number(r.blockNumber) : null
   }
 
@@ -856,6 +880,20 @@ export class Erc20SwapEvmClient {
     return this.pub.getTransactionCount({ address: this.addr, blockNumber })
   }
 
+  /** Receipt lookup for a locally recorded raw transaction; absence is not an error. */
+  async receipt(hash: Hex): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint } | undefined> {
+    try {
+      const receipt = await this.pub.getTransactionReceipt({ hash })
+      return { status: receipt.status, blockNumber: receipt.blockNumber }
+    } catch (error) {
+      if (error instanceof TransactionReceiptNotFoundError) return undefined
+      throw error
+    }
+  }
+
+  /** Re-submit exactly a previously recorded signed transaction; never signs a replacement. */
+  async resendSigned(signedTx: Hex): Promise<Hex> { return this.pub.sendRawTransaction({ serializedTransaction: signedTx }) }
+
   /** Pending account nonce, used only to avoid burning while another transaction is in flight. */
   async pendingNonce(): Promise<number> {
     return this.pub.getTransactionCount({ address: this.addr, blockTag: 'pending' })
@@ -898,7 +936,9 @@ export class Erc20SwapEvmClient {
       const confs = Number(tip - rcpt.blockNumber) + 1
       return confs > 0 ? confs : 0
     } catch {
-      return 0 // not mined yet / not found
+      // Watchtower callers treat 0 as "not confirmed yet" and keep the record/retry loop armed. A refused lookup is
+      // therefore conservative here: it can delay recovery but can never terminalize it as absent.
+      return 0
     }
   }
 
@@ -912,6 +952,7 @@ export class Erc20SwapEvmClient {
       const finalized = await this.finalizedBlockNumber()
       return rcpt.blockNumber <= finalized
     } catch {
+      // As with confirmations, false is a non-terminal finality result for all watchtower callers.
       return false
     }
   }

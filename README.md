@@ -17,7 +17,7 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.2` is recommended.
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.3` is recommended.
 
 ```sh
 claude mcp add petasats -- npx -y petasats-mcp
@@ -58,10 +58,30 @@ Ask: “Buy $20 of BSV and send it to 1...”
 | wait_for_swap | No |
 | swap_status | No |
 | wallet_info | No |
+| stop_spending | No |
 | withdraw_bsv | Yes |
 | withdraw_base | Yes |
-| fund_wallet | Yes |
+| fund_wallet | No — it only plans a USDC-to-BSV swap and returns a quote |
 | list_liquidity | No |
+
+## Limits you control
+
+You can create `~/.petasats/limits.json` to restrict where an AI may send funds and how much it may swap per UTC day:
+
+```json
+{
+  "format": "petasats.limits/1",
+  "bsvDestinations": ["1BoatSLRHtKNngkdXEeobR76b53LETtpyT"],
+  "baseDestinations": ["0x1111111111111111111111111111111111111111"],
+  "maxSwapUsdPerDay": 50
+}
+```
+
+Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp limits` to inspect it.
+
+`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp resume`; recovery for swaps already started keeps working.
+
+These controls protect against an AI that can only use the kit's tools. An AI app that can run shell commands or edit files as you can also edit `limits.json` or `STOP`.
 
 ## Progress and reporting
 
@@ -82,6 +102,10 @@ The npm package is built by GitHub Actions from a tagged commit and published wi
 ## Files, status, and recovery
 
 The kit uses `~/.petasats`. Run `npx petasats-mcp status` for status and `npx petasats-mcp recover` after interruption.
+
+A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp withdrawal <hash> sent` or `npx petasats-mcp withdrawal <hash> not-sent`.
+
+Repeating the same Base withdrawal (same asset, amount, and address) within an hour is refused as a likely retry. Do not run two AI apps using the kit on the same folder at the same time.
 
 A swap started with version 0.2.0 or 0.2.1 whose USDC lock never landed can stay at "Waiting for BSV lock" and block new swaps and withdrawals. If no other copy of the kit used the same folder while that swap ran, set `PETASATS_RESOLVE_OLD_STUCK_SWAPS=1` in the kit's environment (for example `"env":{"PETASATS_RESOLVE_OLD_STUCK_SWAPS":"1"}` in your client's server entry) and restart the kit. It then sends a zero-value transaction to its own Base address so the old lock can never land, and marks the swap failed once that transaction is final, usually within 30 minutes. Swaps started with 0.2.2 or later resolve without this setting.
 

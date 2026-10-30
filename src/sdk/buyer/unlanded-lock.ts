@@ -59,7 +59,7 @@ export async function resolveUnlandedLock(record: SettlementRecord, deps: {
   persist: (record: SettlementRecord) => void
   isExecuting?: (hashHex: string) => boolean
   /** Throws while the Base pool is split or unverified: such a pool can serve a fork, so its reads prove nothing. */
-  assertPoolSafe: () => void
+  assertPoolSafe: () => void | Promise<void>
   /** Operator statement that one kit process used this home while records without the attempt marker were written. */
   resolveUnmarkedRecords?: boolean
 }): Promise<SettlementRecord | undefined> {
@@ -70,12 +70,12 @@ export async function resolveUnlandedLock(record: SettlementRecord, deps: {
     const params = baseRefundParamsFromRecord(record)
     const locked = await deps.evm.isSwapLocked(params, { blockNumber: finalized })
     if (locked !== false) return undefined
-    const tombstone = (): SettlementRecord | undefined => {
+    const tombstone = async (): Promise<SettlementRecord | undefined> => {
       // Re-read immediately before the terminal write: a landing/reveal/refund updater wins over this diagnosis.
       const current = deps.reread(record.hashHex)
       if (!current || !sameRecord(current, record) || deps.isExecuting?.(record.hashHex)) return undefined
       // After the reads and immediately before the terminal write; a throw means "try later", like a read error.
-      deps.assertPoolSafe()
+      await deps.assertPoolSafe()
       const next: SettlementRecord = {
         ...current, state: 'aborted', abortReason: UNLANDED_LOCK_ABORT_REASON,
         history: [...current.history, { state: 'aborted', at: Math.floor(deps.now() / 1000) }],
@@ -84,12 +84,12 @@ export async function resolveUnlandedLock(record: SettlementRecord, deps: {
       return next
     }
     // An explicitly empty marker proves this kit never signed a lock. No nonce (and therefore no burn) is needed.
-    if (record.baseLockAttempts !== undefined && record.baseLockAttempts.length === 0) return tombstone()
+    if (record.baseLockAttempts !== undefined && record.baseLockAttempts.length === 0) return await tombstone()
 
     const nonceAtFinalized = await deps.evm.nonceAtBlock(finalized)
     if (!Number.isSafeInteger(nonceAtFinalized) || nonceAtFinalized < 0) return undefined
     const attempts = record.baseLockAttempts
-    if (attempts && nonceAtFinalized > nonceBound(attempts)) return tombstone()
+    if (attempts && nonceAtFinalized > nonceBound(attempts)) return await tombstone()
     // Kit 0.2.0 did not keep a second process off its home, so an unmarked record has no provable bound unless the
     // operator states that only one kit process used this home. Without that statement, leave the record as it is.
     if (!attempts && deps.resolveUnmarkedRecords !== true) return undefined

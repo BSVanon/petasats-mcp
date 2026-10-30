@@ -78,7 +78,7 @@ export interface BuyerEngineDeps {
   sleep: (ms: number) => Promise<void>
   log: (message: string) => void
   /** Throws while the Base pool is split or unverified; an unlanded-lock tombstone is never written past it. */
-  assertEvmPoolSafe: () => void
+  assertEvmPoolSafe: () => void | Promise<void>
   /** Operator opt-in: resolve stuck records written before the attempt marker (one kit process used this home). */
   resolveUnmarkedStuckLocks?: boolean
 }

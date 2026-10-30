@@ -14,10 +14,10 @@ export const RELEASED_DOOR_IDENTITY = typeof __PETASATS_DOOR_IDENTITY__ === 'str
   : DOOR_IDENTITY_PLACEHOLDER
 export interface BuyerDiskConfig { doorIdentity?: string; baseRpcUrls: string[]; bsvSources: string[]; anvilHost: string; capUsdPerSwap: number }
 export interface BuyerKeys { identityWif: string; evmPrivateKey: `0x${string}`; bsvWif: string }
-export interface BuyerHome { home: string; keysPath: string; configPath: string; swapsDir: string; settlementDir: string }
+export interface BuyerHome { home: string; keysPath: string; configPath: string; limitsPath: string; stopPath: string; swapsDir: string; settlementDir: string; withdrawalsDir: string }
 
 export function buyerHome(home = process.env.PETASATS_HOME || join(process.env.HOME || '.', '.petasats')): BuyerHome {
-  return { home, keysPath: join(home, 'keys.json'), configPath: join(home, 'config.json'), swapsDir: join(home, 'swaps'), settlementDir: join(home, 'settlement') }
+  return { home, keysPath: join(home, 'keys.json'), configPath: join(home, 'config.json'), limitsPath: join(home, 'limits.json'), stopPath: join(home, 'STOP'), swapsDir: join(home, 'swaps'), settlementDir: join(home, 'settlement'), withdrawalsDir: join(home, 'withdrawals') }
 }
 type BuyerHomeFs = Pick<typeof fs, 'chmodSync' | 'existsSync' | 'mkdirSync' | 'openSync' | 'readFileSync' | 'writeFileSync' | 'closeSync' | 'readdirSync' | 'renameSync' | 'fsyncSync' | 'lstatSync' | 'fstatSync' | 'fchmodSync'>
 
@@ -67,7 +67,7 @@ function assertReadableBuyerKeys(keys: unknown): asserts keys is BuyerKeys {
 /** Creates local keys once. No key is logged, returned by CLI output, or sent to a dependency. */
 export function initialiseBuyerHome(homePath?: string, fileSystem: BuyerHomeFs = fs): BuyerHome {
   const paths = buyerHome(homePath)
-  safeMkdir(paths.home, fileSystem); safeMkdir(paths.swapsDir, fileSystem); safeMkdir(paths.settlementDir, fileSystem)
+  safeMkdir(paths.home, fileSystem); safeMkdir(paths.swapsDir, fileSystem); safeMkdir(paths.settlementDir, fileSystem); safeMkdir(paths.withdrawalsDir, fileSystem)
   if (!fileSystem.existsSync(paths.keysPath)) {
     const evmPrivateKey = generatePrivateKey()
     const keys: BuyerKeys = { identityWif: PrivateKey.fromRandom().toWif(), evmPrivateKey, bsvWif: PrivateKey.fromRandom().toWif() }
@@ -83,7 +83,7 @@ export function initialiseBuyerHome(homePath?: string, fileSystem: BuyerHomeFs =
   } satisfies BuyerDiskConfig, 0o600, fileSystem)
   return paths
 }
-function secureFileText(path: string): string {
+export function secureFileText(path: string): string {
   const before = fs.lstatSync(path)
   const owner = typeof process.getuid === 'function' ? process.getuid() : undefined
   if (!before.isFile() || before.isSymbolicLink()) throw new Error(`unsafe local file ${path}; replace it with a regular file and chmod 600 ${path}`)
@@ -102,13 +102,15 @@ function secureFileText(path: string): string {
 /** Validate runtime directories before a sensitive file inside them is opened. */
 export function assertSecureBuyerHome(paths: BuyerHome): void {
   const owner = typeof process.getuid === 'function' ? process.getuid() : undefined
-  for (const path of [paths.home, paths.swapsDir, paths.settlementDir]) {
+  for (const path of [paths.home, paths.swapsDir, paths.settlementDir, paths.withdrawalsDir]) {
     const stat = fs.lstatSync(path)
     if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (owner !== undefined && stat.uid !== owner)) {
       throw new Error(`unsafe local directory ${path}; run chmod 700 ${path}`)
     }
   }
 }
+/** Create the one added runtime directory before the regular owner-only assertion. */
+export function ensureBuyerRuntimeDirs(paths: BuyerHome): void { safeMkdir(paths.withdrawalsDir) }
 export function readBuyerKeys(paths: BuyerHome): BuyerKeys { return JSON.parse(secureFileText(paths.keysPath)) as BuyerKeys }
 export function readBuyerConfig(paths: BuyerHome): BuyerDiskConfig {
   const parsed = JSON.parse(secureFileText(paths.configPath)) as Record<string, unknown>

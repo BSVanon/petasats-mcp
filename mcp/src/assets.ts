@@ -34,6 +34,6 @@ export function formatAsset(a: Asset): string {
 export function supportedPairs(): Array<{ pair: string; route: 'bridge' | 'dex'; note: string }> {
   return [{
     pair: 'USDC -> BSV', route: 'bridge' as const,
-    note: 'A bound quote and covenant atomic swap through the market maker public door (Base -> BSV). Keys remain local.',
+    note: 'A bound quote and covenant atomic swap through the market maker (Base -> BSV). Keys remain local.',
   }]
 }

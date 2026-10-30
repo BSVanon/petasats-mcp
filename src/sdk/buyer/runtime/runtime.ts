@@ -6,15 +6,18 @@ import { makeAnvilMessageBoxComms } from '../../../transport/anvil-messagebox-co
 import { DEFAULT_BSV_FEE_RATE_SAT_PER_KB } from '../../../settlement/htlc/bridge-covenant'
 import { createBuyerKit } from '../buyer-kit'
 import { makeMessageBoxDoorClient } from '../door-client'
-import { DOOR_IDENTITY_PLACEHOLDER, RELEASED_DOOR_IDENTITY, assertSecureBuyerHome, buyerAddresses, buyerHome, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, type BuyerDiskConfig, type BuyerHome } from '../local-state'
+import { DOOR_IDENTITY_PLACEHOLDER, RELEASED_DOOR_IDENTITY, assertSecureBuyerHome, buyerAddresses, buyerHome, ensureBuyerRuntimeDirs, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, type BuyerDiskConfig, type BuyerHome } from '../local-state'
 import { makeBuyerEngine } from '../engine'
-import type { BuyerKit } from '../types'
+import type { BuyerKit, BuyerWithdrawalRecorder } from '../types'
 import { assertBuyerMainnetP2pkhAddress } from './address'
 import { makeBuyerBsvRails } from './bsv-rails'
 import { guardBuyerEvmWrites, makeBuyerEvmRails } from './evm-rails'
 import { makeIdentityOnlyWallet } from './identity-wallet'
 import { buildSweepTx } from './sweep'
 import { acquireBuyerHomeLock } from './home-lock'
+import { readBuyerLimits } from '../limits'
+import { readSpendingStop, stopSpending } from '../stop'
+import { makeBuyerWithdrawalIntents } from '../withdrawal-intent'
 
 export interface BuyerRuntime {
   kit: BuyerKit
@@ -68,6 +71,7 @@ function assertConfig(config: BuyerDiskConfig): asserts config is BuyerDiskConfi
 export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}): Promise<BuyerRuntime> {
   const paths = buyerHome(options.home)
   assertReady(paths)
+  ensureBuyerRuntimeDirs(paths)
   assertSecureBuyerHome(paths)
   acquireBuyerHomeLock(paths.home)
   const config = readBuyerConfig(paths)
@@ -92,11 +96,11 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
   const bsvKey = PrivateKey.fromWif(keys.bsvWif)
   const addresses = buyerAddresses(keys)
   const engine = f.makeBuyerEngine({
-    comms, doorIdentity: config.doorIdentity, evm: guardBuyerEvmWrites(evmRails.client, () => evmRails.assertSafeForNewLock()), bsv: bsv as any,
+    comms, doorIdentity: config.doorIdentity, evm: guardBuyerEvmWrites(evmRails.client, async () => { await evmRails.assertSafeForNewLock() }), bsv: bsv as any,
     chainTracker: bsv.chainTracker, bsvReservePub: bsvKey.toPublicKey(), settlementDir: paths.settlementDir,
     usdcTokenAddress: BASE_USDC, capUsdPerSwap: config.capUsdPerSwap, now: Date.now,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log,
-    assertEvmPoolSafe: () => evmRails.assertSafeForNewLock(),
+    assertEvmPoolSafe: async () => { await evmRails.assertSafeForNewLock() },
     resolveUnmarkedStuckLocks: options.resolveOldStuckSwaps ?? process.env.PETASATS_RESOLVE_OLD_STUCK_SWAPS === '1',
   })
   const wallet = {
@@ -108,7 +112,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
       return { ...base, claimedBsvSats: coins.filter((coin) => coin.confirmations >= 1).reduce((total, coin) => total + BigInt(coin.value), 0n) }
     },
     // `onlyTxid` limits a swap's deliver_to sweep to that swap's own claimed coin; withdraw_bsv sweeps everything.
-    withdrawBsv: async (address: string, opts?: { onlyTxid?: string }) => {
+    withdrawBsv: async (address: string, opts?: { onlyTxid?: string; beforeBroadcast?: () => void | Promise<void> }) => {
       assertBuyerMainnetP2pkhAddress(address, 'address')
       const unspent = (await bsv.unspentFor(addresses.bsvAddress)).filter((coin) => coin.confirmations >= 1 && (opts?.onlyTxid === undefined || coin.tx_hash === opts.onlyTxid))
       if (!unspent.length) return { sats: 0n, reason: opts?.onlyTxid ? 'this swap\'s claimed BSV is not confirmed yet' : 'no confirmed BSV is available to sweep' }
@@ -118,6 +122,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
         return { ...coin, sourceTx }
       }))
       const built = await f.buildSweepTx({ coins, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB })
+      await opts?.beforeBroadcast?.()
       const txid = await bsv.broadcast(built.rawTx, built.atomicBeefHex)
       return { txid, sats: BigInt(built.outputSatoshis) }
     },
@@ -144,19 +149,21 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
       if (!sweep?.merklePath) return false
       try { return await sweep.merklePath.verify(txid, bsv.chainTracker) } catch { return false }
     },
-    transferUsdc: async (to: `0x${string}`, amount: bigint) => {
-      const receipt = await evmRails.client.transferErc20(BASE_USDC, to, amount)
-      return { hash: receipt.hash, status: receipt.status }
+    transferUsdc: async (to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder) => {
+      const receipt = await evmRails.client.transferErc20(BASE_USDC, to, amount, onRecorded ? { onRecorded } : {})
+      return { hash: receipt.hash, status: receipt.status, blockNumber: receipt.blockNumber }
     },
-    transferEth: async (to: `0x${string}`, amount: bigint) => {
-      const receipt = await evmRails.client.transferNative(to, amount)
-      return { hash: receipt.hash, status: receipt.status }
+    transferEth: async (to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder) => {
+      const receipt = await evmRails.client.transferNative(to, amount, onRecorded ? { onRecorded } : {})
+      return { hash: receipt.hash, status: receipt.status, blockNumber: receipt.blockNumber }
     },
     estimateEthTransferFee: async (to: `0x${string}`) => evmRails.client.estimateNativeTransferFee(to),
   }
+  const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, Date.now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') } })
   const kit = createBuyerKit({ capUsdPerSwap: config.capUsdPerSwap, baseWithdrawalForbidden: [ERC20_SWAP.deployments.baseMainnet.address, BASE_USDC], newWallet: options.newWallet, keysPath: paths.keysPath }, {
     door, executor: engine, store: makeFileBuyerStore(paths), wallet,
-    beforeNewSwap: () => evmRails.assertSafeForNewLock(), log,
+    beforeNewSwap: async () => { await evmRails.assertSafeForNewLock() }, limits: () => readBuyerLimits(paths), spendingStopped: () => readSpendingStop(paths), withdrawalIntents,
+    stopSpending: (reason) => stopSpending(paths, reason), log,
   })
   return { kit, paths, config }
 }
