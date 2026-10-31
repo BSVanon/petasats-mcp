@@ -3,7 +3,7 @@
   "name": "io.github.BSVanon/petasats-mcp",
   "title": "PetaSats",
   "description": "Buy BSV with USDC on Base through a local non-custodial MCP server.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "repository": {
     "url": "https://github.com/BSVanon/petasats-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "npm",
       "identifier": "petasats-mcp",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "transport": {
         "type": "stdio"
       }

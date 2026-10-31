@@ -1,5 +1,6 @@
 import {
   createPublicClient,
+  decodeEventLog,
   createWalletClient,
   encodeFunctionData,
   keccak256,
@@ -12,6 +13,7 @@ import {
   type Hex,
   type Transport,
 } from 'viem'
+import { estimateL1Fee } from 'viem/op-stack'
 import { privateKeyToAccount } from 'viem/accounts'
 import { baseSepolia } from 'viem/chains'
 import type { EvmNonceChainState, EvmNonceCounter, EvmNonceSelection } from './nonce-counter'
@@ -37,6 +39,7 @@ import {
   encodeClaim,
   encodeLock,
   encodeRefund,
+  decodeLockupLog,
   type Erc20SwapParams,
   type LockupEvent,
 } from './erc20swap'
@@ -86,6 +89,7 @@ const LOCKUP_EVENT = parseAbiItem(
 )
 const CLAIM_EVENT = parseAbiItem('event Claim(bytes32 indexed preimageHash, bytes32 preimage)')
 const REFUND_EVENT = parseAbiItem('event Refund(bytes32 indexed preimageHash)')
+const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)')
 
 const ERC20_TRANSFER_ABI = [parseAbiItem('function transfer(address to, uint256 amount) returns (bool)')]
 
@@ -152,6 +156,21 @@ export interface SentTx {
   consumesSendAllowance?: boolean
 }
 
+/** A native-transfer price which can be reused verbatim by the local signer. */
+export interface NativeTransferPrice {
+  gas: bigint
+  maxFeePerGas: bigint
+  maxPriorityFeePerGas: bigint
+  l1FeeWei: bigint
+  reserveWei: bigint
+}
+
+export interface PinnedNativeTransferFees {
+  gas: bigint
+  maxFeePerGas: bigint
+  maxPriorityFeePerGas: bigint
+}
+
 /** Canonical finalized resolution of one ERC20Swap hashlock. Event transaction identity is retained so a competing
  * resolution can be persisted and surfaced to an operator. `unresolved` is deliberately broad: absence, malformed
  * provider data, contradictory Claim+Refund events, and every read failure all refuse terminal classification. */
@@ -159,6 +178,12 @@ export type SwapResolutionOutcome =
   | { kind: 'claimed'; preimage: Hex; eventTxid: Hex }
   | { kind: 'refunded'; eventTxid: Hex }
   | { kind: 'unresolved'; reason: 'not-found' | 'invalid-anchor' | 'malformed-log' | 'contradictory' | 'read-error'; detail?: string }
+
+/** Finalized receipt evidence for how a responder's exact ERC-20 tuple left escrow. */
+export type ClaimPaymentOutcome =
+  | { kind: 'paid'; txid: Hex }
+  | { kind: 'refunded'; txid: Hex; scannedThrough: bigint }
+  | { kind: 'none'; scannedThrough: bigint }
 
 type LocalSignOpts = {
   writer: {
@@ -190,6 +215,8 @@ type LocalSignOpts = {
   priorBroadcastTxid?: Hex
   /** Optional ceiling for advisory transaction/pending-pool probes while the cross-process nonce lease is held. */
   lockedLookupTimeoutMs?: number
+  /** Exact native-transfer EIP-1559 fields, supplied by the buyer's one-shot price plan. */
+  pinnedFees?: PinnedNativeTransferFees
 }
 
 function boundedLookup<T>(timeoutMs: number | undefined, lookup: () => Promise<T>): Promise<T> {
@@ -202,6 +229,7 @@ function boundedLookup<T>(timeoutMs: number | undefined, lookup: () => Promise<T
     )
   })
 }
+
 /** The only write primitive used by Erc20SwapEvmClient: local sign then raw broadcast. */
 export async function sendLocallySignedEvmTransaction(opts: LocalSignOpts & {
   writer: LocalSignOpts['writer'] & { sendRawTransaction(args: { serializedTransaction: Hex }): Promise<Hex> }
@@ -252,8 +280,12 @@ export async function signLocallyEvmTransaction(opts: LocalSignOpts): Promise<He
     value: opts.value,
     nonce: expectedSenderNonce,
     ...feeFields,
+    ...(opts.pinnedFees ?? {}),
   })
-  return opts.writer.signTransaction(prepared)
+  // prepareTransactionRequest may fill missing fields.  A buyer ETH-all plan has
+  // none missing, and these assignments make its signed envelope exact even if a
+  // transport wrapper attempts to re-price the prepared request.
+  return opts.writer.signTransaction(opts.pinnedFees ? { ...prepared, ...opts.pinnedFees } : prepared)
 }
 
 async function priorBroadcastEip1559Fees(
@@ -556,6 +588,7 @@ export class Erc20SwapEvmClient {
     retainConsumedAttribution = false,
     operationSalt?: Hex,
     onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void>,
+    pinnedFees?: PinnedNativeTransferFees,
   ): Promise<SentTx> {
     // Keep this explicit: a local account signs, then only eth_sendRawTransaction
     // leaves the process. Never let an RPC node choose/sign an eth_sendTransaction.
@@ -621,6 +654,7 @@ export class Erc20SwapEvmClient {
       const nonce = Math.max(pending, this.nonceFloor ?? 0)
       const hash = await sendLocallySignedEvmTransaction({
         writer, publicClient: this.pub, sender: this.addr, localAccount: writer.account, to, data, value, nonce,
+        ...(pinnedFees ? { pinnedFees } : {}),
         ...(onRecorded ? {
           onSignedTransaction: async (signedTx: Hex) => {
             const signedNonce = Number(parseTransaction(signedTx).nonce)
@@ -735,22 +769,26 @@ export class Erc20SwapEvmClient {
   }
 
   /** Native ETH transfer using the same local-sign and raw-broadcast path as the swap writes. */
-  async transferNative(to: Address, value: bigint, opts: { onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void> } = {}): Promise<SentTx> {
+  async transferNative(to: Address, value: bigint, opts: { onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void>; pinnedFees?: PinnedNativeTransferFees } = {}): Promise<SentTx> {
     if (value <= 0n) throw new Error('transferNative value must be positive')
-    return this.send(to, '0x', value, undefined, undefined, false, undefined, opts.onRecorded)
+    return this.send(to, '0x', value, undefined, undefined, false, undefined, opts.onRecorded, opts.pinnedFees)
   }
-  /** Conservative EIP-1559 cost for a simple native transfer, used only to
-   * leave gas behind for a buyer's explicit ETH "all" withdrawal. */
-  async estimateNativeTransferFee(to: Address): Promise<bigint> {
+  /** Price a Base native transfer once, including the OP-stack L1 data fee. */
+  async priceNativeTransfer(to: Address): Promise<NativeTransferPrice> {
     if (this.nonceCounter) throw new Error('transferNative is not supported by a counter-leased client')
-    const [gas, fees] = await Promise.all([
+    const [gas, fees, l1FeeWei] = await Promise.all([
       this.pub.estimateGas({ account: this.addr, to, data: '0x', value: 1n }),
       this.pub.estimateFeesPerGas(),
+      estimateL1Fee(this.pub, { account: this.addr, to, data: '0x', value: 1n }),
     ])
-    if (gas <= 0n || fees.maxFeePerGas === undefined || fees.maxFeePerGas <= 0n) {
-      throw new Error('could not estimate Base native-transfer gas')
+    if (gas <= 0n || fees.maxFeePerGas === undefined || fees.maxFeePerGas <= 0n ||
+        fees.maxPriorityFeePerGas === undefined || fees.maxPriorityFeePerGas <= 0n || l1FeeWei <= 0n) {
+      throw new Error('could not price the Base ETH withdrawal; nothing was sent')
     }
-    return gas * fees.maxFeePerGas
+    return {
+      gas, maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas, l1FeeWei,
+      reserveWei: gas * fees.maxFeePerGas + (l1FeeWei * 3n + 1n) / 2n,
+    }
   }
 
   async sendPinnedContract(
@@ -827,6 +865,26 @@ export class Erc20SwapEvmClient {
       throw error
     }
     return r != null && r.blockNumber != null ? Number(r.blockNumber) : null
+  }
+
+  /** Read the Lockup from the announced transaction's receipt, never from an untrusted block range. */
+  async lockupInReceipt(txHash: Hex, preimageHash: Hex): Promise<(LockupEvent & { txHash: Hex; logIndex: number; contractAddress: Address; chainId: number; blockNumber: number }) | null> {
+    await this.assertContractIdentity()
+    try {
+      const receipt = await this.pub.getTransactionReceipt({ hash: txHash })
+      if (receipt.status !== 'success') return null
+      for (const log of receipt.logs) {
+        if (log.address.toLowerCase() !== this.swapAddress.toLowerCase()) continue
+        const lockup = decodeLockupLog({ topics: [...log.topics], data: log.data })
+        if (lockup && lockup.preimageHash.toLowerCase() === preimageHash.toLowerCase()) {
+          return { ...lockup, txHash, logIndex: log.logIndex, contractAddress: this.swapAddress, chainId: this.chainId, blockNumber: Number(receipt.blockNumber) }
+        }
+      }
+      return null
+    } catch (error) {
+      if (error instanceof TransactionReceiptNotFoundError) return null
+      throw error
+    }
   }
 
   /**
@@ -1041,6 +1099,98 @@ export class Erc20SwapEvmClient {
     } catch (error) {
       return { kind: 'unresolved', reason: 'read-error', detail: error instanceof Error ? error.message : String(error) }
     }
+  }
+
+  /**
+   * Scan finalized Claim and Refund receipts for this tuple's payment evidence. Claim/refund are permissionless or
+   * wrapper-submitted, so the ERC-20 Transfer in a successful receipt is the proof rather than outer calldata. A
+   * refund is returned only after every window succeeds and no payment is found: a same-hash decoy refund must never
+   * outrank a payment. All reads intentionally propagate; the executor advances its cursor only after a full window.
+   */
+  async findClaimPayingTuple(p: Erc20SwapParams, fromBlock: bigint): Promise<ClaimPaymentOutcome> {
+    if (fromBlock <= 0n) throw new Error('findClaimPayingTuple: recorded lock block must be positive')
+    await this.assertContractIdentity()
+    const finalizedHead = await this.finalizedBlockNumber()
+    let refunded: Hex | undefined
+    for (const w of blockScanWindows(fromBlock, finalizedHead, CLAIM_SCAN_STEP)) {
+      const claimLogs = await this.pub.getLogs({
+        address: this.swapAddress, event: CLAIM_EVENT, args: { preimageHash: p.preimageHash },
+        fromBlock: w.from, toBlock: w.to,
+      })
+      const refundLogs = await this.pub.getLogs({
+        address: this.swapAddress, event: REFUND_EVENT, args: { preimageHash: p.preimageHash },
+        fromBlock: w.from, toBlock: w.to,
+      })
+      for (const log of claimLogs) {
+        const txid = log.transactionHash
+        if (!txid) throw new Error('findClaimPayingTuple: Claim log omitted its transaction hash')
+        const receipt = await this.pub.getTransactionReceipt({ hash: txid })
+        // A finalized-range log should have a finalized receipt.  A provider disagreement is not absence of payment;
+        // leave it to the next retry rather than return a terminal negative.
+        if (receipt.blockNumber > finalizedHead) throw new Error(`findClaimPayingTuple: Claim receipt ${txid} is not finalized`)
+        if (receipt.status !== 'success') continue
+        const paid = this.eventPairsWithTransfer(receipt, log, p, p.claimAddress)
+        if (paid) return { kind: 'paid', txid }
+      }
+      for (const log of refundLogs) {
+        const txid = log.transactionHash
+        if (!txid) throw new Error('findClaimPayingTuple: Refund log omitted its transaction hash')
+        const receipt = await this.pub.getTransactionReceipt({ hash: txid })
+        if (receipt.blockNumber > finalizedHead) throw new Error(`findClaimPayingTuple: Refund receipt ${txid} is not finalized`)
+        if (receipt.status !== 'success') continue
+        if (this.eventPairsWithTransfer(receipt, log, p, p.refundAddress)) refunded = txid
+      }
+    }
+    return refunded
+      ? { kind: 'refunded', txid: refunded, scannedThrough: finalizedHead }
+      : { kind: 'none', scannedThrough: finalizedHead }
+  }
+
+  /** A Claim/Refund immediately precedes its ERC-20 payment in ERC20Swap v6.  Bind evidence to that event rather
+   * than accepting an unrelated Transfer elsewhere in a wrapper transaction. */
+  private eventPairsWithTransfer(
+    receipt: { logs: readonly { address: Address; topics: readonly Hex[]; data: Hex; logIndex: number; transactionHash: Hex }[] },
+    sourceLog: { address: Address; topics: readonly Hex[]; logIndex: number | null; transactionHash: Hex | null },
+    p: Erc20SwapParams,
+    recipient: Address,
+  ): boolean {
+    if (sourceLog.logIndex == null || !sourceLog.transactionHash) {
+      throw new Error('payment evidence log omitted its transaction hash or log index')
+    }
+    const sourceIndex = sourceLog.logIndex
+    const sourceTxid = sourceLog.transactionHash
+    const sameHex = (a: Hex, b: Hex): boolean => a.toLowerCase() === b.toLowerCase()
+    const sameTopics = (a: readonly Hex[], b: readonly Hex[]): boolean => a.length === b.length && a.every((topic, i) => sameHex(topic, b[i]))
+    const eventLog = receipt.logs.find((receiptLog) =>
+      receiptLog.logIndex === sourceIndex && sameHex(receiptLog.transactionHash, sourceTxid),
+    )
+    if (!eventLog) throw new Error(`payment evidence log ${sourceTxid}:${sourceIndex} is absent from its receipt`)
+    if (sourceLog.address.toLowerCase() !== this.swapAddress.toLowerCase() ||
+        eventLog.address.toLowerCase() !== sourceLog.address.toLowerCase() || !sameTopics(eventLog.topics, sourceLog.topics)) {
+      throw new Error(`payment evidence log ${sourceTxid}:${sourceIndex} disagrees with its receipt`)
+    }
+    const transferLog = receipt.logs.find((receiptLog) => receiptLog.logIndex === sourceIndex + 1)
+    if (!transferLog || transferLog.address.toLowerCase() !== p.tokenAddress.toLowerCase()) return false
+    try {
+      const event = decodeEventLog({ abi: [TRANSFER_EVENT], topics: transferLog.topics as [Hex, ...Hex[]], data: transferLog.data })
+      const args = event.args as { from?: Address; to?: Address; value?: bigint }
+      return args.from?.toLowerCase() === this.swapAddress.toLowerCase() && args.to?.toLowerCase() === recipient.toLowerCase() && args.value === p.amount
+    } catch { return false }
+  }
+
+  async claimPaysTuple(hash: Hex, p: Erc20SwapParams): Promise<boolean> {
+    await this.assertContractIdentity()
+    const receipt = await this.pub.getTransactionReceipt({ hash })
+    if (receipt.blockNumber > await this.finalizedBlockNumber()) throw new Error(`claimPaysTuple: receipt ${hash} is not finalized`)
+    if (receipt.status !== 'success') return false
+    const claims = receipt.logs.filter((log) => {
+      if (log.address.toLowerCase() !== this.swapAddress.toLowerCase()) return false
+      try {
+        const event = decodeEventLog({ abi: [CLAIM_EVENT], topics: log.topics as [Hex, ...Hex[]], data: log.data })
+        return (event.args as { preimageHash?: Hex }).preimageHash?.toLowerCase() === p.preimageHash.toLowerCase()
+      } catch { return false }
+    })
+    return claims.some((log) => this.eventPairsWithTransfer(receipt, log, p, p.claimAddress))
   }
 
   /**

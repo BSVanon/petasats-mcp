@@ -1,7 +1,8 @@
 import { randomBytes } from 'crypto'
 import { isAddress } from 'viem'
 import { isBsv, isErc20, type ConvertRequest, type Quote, type SwapResult } from '../convert'
-import type { BuyerBaseWallet, BuyerKit, BuyerKitConfig, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, BuyerStore, BuyerWallet, DoorClient, BuyerExecutor, StartSwapRequest, BuyerWithdrawalIntents, BuyerWithdrawalReconcileOutcome } from './types'
+import type { BuyerBaseWallet, BuyerKit, BuyerKitConfig, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, BuyerStore, BuyerWallet, DoorClient, BuyerExecutor, StartSwapRequest, BuyerWithdrawalCancelResult, BuyerWithdrawalIntents, BuyerWithdrawalReconcileOutcome } from './types'
+import { isBaseInsufficientFunds } from './withdrawal-intent'
 import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
 import { assertBaseDestination, assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
@@ -68,7 +69,18 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
   }
   const priorWithdrawalMessage = (outcome: BuyerWithdrawalReconcileOutcome): string => outcome.status === 'success'
     ? `the previous Base withdrawal ${outcome.hash} (${outcome.amount} ${outcome.asset} to ${outcome.to}) succeeded; nothing new was sent`
-    : `the previous Base withdrawal ${outcome.hash} (${outcome.amount} ${outcome.asset} to ${outcome.to}) did not go through; nothing new was sent; call again to retry`
+    : outcome.status === 'cancelled'
+      ? `the previous Base withdrawal ${outcome.hash} was refused by the Base RPC and is now cancelled on chain at its nonce. Nothing was sent. Call again to withdraw.`
+      : `the previous Base withdrawal ${outcome.hash} (${outcome.amount} ${outcome.asset} to ${outcome.to}) did not go through; nothing new was sent; call again to retry`
+  const cancelMessage = (hash: string, result: BuyerWithdrawalCancelResult, reserveWei?: bigint): string => {
+    if (result.status === 'cancelling') return `the Base RPC refused the withdrawal ${hash} for insufficient funds${reserveWei === undefined ? '' : ` after the kit reserved ${reserveWei} wei for Base gas`}. The kit broadcast a zero-value cancellation at the same nonce. Either the withdrawal or the cancellation can still land, never both. The kit stays blocked until one is final on Base. Do not retry this withdrawal from another copy of this wallet. Nothing new was sent.`
+    if (result.status === 'unaffordable') return `the account cannot pay the gas to cancel the refused withdrawal ${hash}. Add a little ETH for Base gas, then call again. The kit will then complete or cancel it, never both. Nothing new was sent.`
+    if (result.status === 'limit') return `the previous Base withdrawal ${hash} could not be cancelled after 3 attempts. It stays recorded. Nothing new was sent.`
+    if (result.status === 'waiting') return `the previous Base withdrawal ${hash} is being cancelled at its nonce (cancellation ${result.cancelHash ?? 'not yet confirmed'}). Try again after the cancellation is final on Base. Nothing new was sent.`
+    if (result.status === 'unsupported') return `this kit runtime cannot cancel the refused Base withdrawal ${hash}. The withdrawal stays recorded and blocks new money until it is resolved. Nothing new was sent.`
+    return `the previous Base withdrawal ${hash} stays recorded, and the next call continues checking it. Nothing new was sent.`
+  }
+  const unknownBroadcastMessage = (hash: string): string => `the Base withdrawal ${hash} was signed and recorded but its broadcast was not confirmed. It stays recorded, and the next call re-sends it or reports its outcome. Nothing new was sent.`
   const assertNoDuplicateWithdrawal = (asset: 'USDC' | 'ETH', to: string, amount: bigint): void => {
     const duplicate = deps.withdrawalIntents?.list?.().find((record) => { const age = Math.max(0, now() - record.createdAtMs); return record.asset === asset && record.to.toLowerCase() === to.toLowerCase() && record.amount === amount.toString() && age < 60 * 60_000 && (record.state === 'pending' || record.status === 'success' || record.status === 'sent') })
     if (!duplicate) return
@@ -291,10 +303,64 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       if (blocked) throw new Error(`a swap blocks withdrawals (${blocked.swapId}: ${nextEvent(blocked.stage)})`)
       if (!/^(?:all|[1-9]\d*)$/.test(amount)) throw new Error('amount must be a positive atomic decimal string or all')
       const balances = await deps.wallet.balances(); let value: bigint
-      if (asset === 'USDC') { value = amount === 'all' ? balances.usdc : BigInt(amount); if (value < 1n || value > balances.usdc) throw new Error('amount exceeds USDC balance'); if (balances.eth < 1n) throw new Error('ETH is needed for Base gas'); if (!deps.wallet.transferUsdc) throw new Error('Base USDC withdrawals are not configured'); assertNoDuplicateWithdrawal(asset, to, value); const sent = await deps.wallet.transferUsdc(to as `0x${string}`, value, async (signed) => { assertNotStopped(); await deps.withdrawalIntents?.record({ asset, to, amount: value, ...signed }) }); if (deps.withdrawalIntents) try { await deps.withdrawalIntents.done(sent.hash, { status: sent.status === 'success' ? 'success' : 'reverted', blockNumber: sent.blockNumber }) } catch { log(`could not mark Base withdrawal done: ${sent.hash}`) } if (sent.status !== 'success') throw new Error('Base USDC transfer reverted'); return { asset, amount: value, to, txid: sent.hash, status: sent.status } }
+      if (asset === 'USDC') {
+        value = amount === 'all' ? balances.usdc : BigInt(amount)
+        if (value < 1n || value > balances.usdc) throw new Error('amount exceeds USDC balance')
+        if (balances.eth < 1n) throw new Error('ETH is needed for Base gas')
+        if (!deps.wallet.transferUsdc) throw new Error('Base USDC withdrawals are not configured')
+        assertNoDuplicateWithdrawal(asset, to, value)
+        let recordedHash: string | undefined
+        let sent: { hash: string; status: string; blockNumber?: bigint }
+        try {
+          sent = await deps.wallet.transferUsdc(to as `0x${string}`, value, async (signed) => {
+            assertNotStopped(); await deps.withdrawalIntents?.record({ asset, to, amount: value, ...signed }); recordedHash = signed.hash
+          })
+        } catch (error) {
+          if (recordedHash && isBaseInsufficientFunds(error)) {
+            let result: BuyerWithdrawalCancelResult
+            try { result = await deps.withdrawalIntents?.cancel?.(recordedHash) ?? { status: 'unsupported' } } catch { result = { status: 'unconfirmed' } }
+            throw new Error(cancelMessage(recordedHash, result))
+          }
+          if (recordedHash) throw new Error(unknownBroadcastMessage(recordedHash))
+          throw error
+        }
+        if (deps.withdrawalIntents) try { await deps.withdrawalIntents.done(sent.hash, { status: sent.status === 'success' ? 'success' : 'reverted', blockNumber: sent.blockNumber }) } catch { log(`could not mark Base withdrawal done: ${sent.hash}`) }
+        if (sent.status !== 'success') throw new Error('Base USDC transfer reverted')
+        return { asset, amount: value, to, txid: sent.hash, status: sent.status }
+      }
       if (asset !== 'ETH') throw new Error('asset must be USDC or ETH')
-      if (amount === 'all') { if (balances.usdc > 0n) throw new Error('withdraw the USDC first; it needs ETH for gas'); if (!deps.wallet.estimateEthTransferFee) throw new Error('Base ETH gas estimation is not configured'); const fee = await deps.wallet.estimateEthTransferFee(to as `0x${string}`); value = balances.eth - fee * 12n / 10n } else value = BigInt(amount)
-      if (value < 1n || value > balances.eth) throw new Error('amount exceeds ETH balance'); if (!deps.wallet.transferEth) throw new Error('Base ETH withdrawals are not configured'); assertNoDuplicateWithdrawal(asset, to, value); const sent = await deps.wallet.transferEth(to as `0x${string}`, value, async (signed) => { assertNotStopped(); await deps.withdrawalIntents?.record({ asset, to, amount: value, ...signed }) }); if (deps.withdrawalIntents) try { await deps.withdrawalIntents.done(sent.hash, { status: sent.status === 'success' ? 'success' : 'reverted', blockNumber: sent.blockNumber }) } catch { log(`could not mark Base withdrawal done: ${sent.hash}`) } if (sent.status !== 'success') throw new Error('Base ETH transfer reverted'); return { asset, amount: value, to, txid: sent.hash, status: sent.status }
+      let plan: Awaited<ReturnType<NonNullable<BuyerBaseWallet['priceEthTransfer']>>> | undefined
+      if (amount === 'all') {
+        if (balances.usdc > 0n) throw new Error('withdraw the USDC first; it needs ETH for gas')
+        if (!deps.wallet.priceEthTransfer) throw new Error('Base ETH gas pricing is not configured')
+        plan = await deps.wallet.priceEthTransfer(to as `0x${string}`)
+        value = balances.eth - plan.reserveWei
+        if (value < 1n) throw new Error('the ETH balance does not cover the Base gas for a withdrawal; nothing was sent')
+      } else value = BigInt(amount)
+      if (value < 1n || value > balances.eth) throw new Error('amount exceeds ETH balance')
+      if (!deps.wallet.transferEth) throw new Error('Base ETH withdrawals are not configured')
+      assertNoDuplicateWithdrawal(asset, to, value)
+      let recordedHash: string | undefined
+      let sent: { hash: string; status: string; blockNumber?: bigint }
+      try {
+        const record = async (signed: { hash: `0x${string}`; signedTx: `0x${string}`; nonce: number }) => {
+          assertNotStopped(); await deps.withdrawalIntents?.record({ asset, to, amount: value, ...signed }); recordedHash = signed.hash
+        }
+        sent = plan
+          ? await deps.wallet.transferEth(to as `0x${string}`, value, record, { pinnedFees: { gas: plan.gas, maxFeePerGas: plan.maxFeePerGas, maxPriorityFeePerGas: plan.maxPriorityFeePerGas } })
+          : await deps.wallet.transferEth(to as `0x${string}`, value, record)
+      } catch (error) {
+        if (recordedHash && isBaseInsufficientFunds(error)) {
+          let result: BuyerWithdrawalCancelResult
+          try { result = await deps.withdrawalIntents?.cancel?.(recordedHash) ?? { status: 'unsupported' } } catch { result = { status: 'unconfirmed' } }
+          throw new Error(cancelMessage(recordedHash, result, amount === 'all' ? plan!.reserveWei : undefined))
+        }
+        if (recordedHash) throw new Error(unknownBroadcastMessage(recordedHash))
+        throw error
+      }
+      if (deps.withdrawalIntents) try { await deps.withdrawalIntents.done(sent.hash, { status: sent.status === 'success' ? 'success' : 'reverted', blockNumber: sent.blockNumber }) } catch { log(`could not mark Base withdrawal done: ${sent.hash}`) }
+      if (sent.status !== 'success') throw new Error('Base ETH transfer reverted')
+      return { asset, amount: value, to, txid: sent.hash, status: sent.status }
     }),
     walletInfo: async () => {
       const isNew = reportNewWallet; reportNewWallet = false

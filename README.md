@@ -17,7 +17,7 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.3` is recommended.
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.4` is recommended.
 
 ```sh
 claude mcp add petasats -- npx -y petasats-mcp
@@ -41,7 +41,7 @@ Codex (CLI, IDE extension, or app):
 codex mcp add petasats -- npx -y petasats-mcp
 ```
 
-Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy.
+Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
 
 ## Fund the kit
 

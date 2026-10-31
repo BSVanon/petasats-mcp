@@ -51,6 +51,7 @@ export const TOKEN_ALLOWLIST: AllowedToken[] = [
 ]
 
 const norm = (a: string): string => a.toLowerCase()
+const CANONICAL_ADDRESS = /^0x[0-9a-fA-F]{40}$/
 
 /**
  * The ONLY sanctioned way to turn a (chainId, address) into swap parameters. Fail-closed: throws if the
@@ -58,6 +59,10 @@ const norm = (a: string): string => a.toLowerCase()
  * The runner MUST resolve every token through this — an un-vetted token then cannot be swapped.
  */
 export function resolveAllowedToken(chainId: number, address: string): AllowedToken {
+  // Do not reflect attacker-controlled unbounded input into durable audit/error rows.
+  if (!CANONICAL_ADDRESS.test(address)) {
+    throw new Error(`token address is non-canonical token address — refusing`)
+  }
   const hit = TOKEN_ALLOWLIST.find((t) => t.chainId === chainId && norm(t.address) === norm(address))
   if (!hit) {
     throw new Error(`token ${address} is not allowlisted on chain ${chainId} — refusing (un-vetted ERC20 could be fee-on-transfer/rebasing/mis-decimaled). Verify + add to TOKEN_ALLOWLIST first.`)

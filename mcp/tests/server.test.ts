@@ -133,13 +133,16 @@ test('init reports public addresses and changes its next step when a door identi
   assert.match(String(initResult(home).next), /fund the Base address with USDC/)
 })
 
-test('tool errors redact WIFs, private-key hex, and keys-file paths', async () => {
-  const wif = 'L'.padEnd(51, '1'); const hex = `0x${'a'.repeat(64)}`
-  const kit = { ...fakePetasats(), quote: async () => { throw new Error(`failed with ${wif} ${hex} at keys.json`) } }
+test('tool errors redact WIFs, private-key hex, signed data, and keys-file paths', async () => {
+  const wif = 'L'.padEnd(51, '1'); const hex = `0x${'a'.repeat(64)}`; const signedData = `0x${'b'.repeat(200)}`
+  const kit = { ...fakePetasats(), quote: async () => { throw new Error(`failed with ${wif} ${hex} ${signedData} at keys.json`) } }
   const result = await handleToolCall(kit, 'get_quote', { from_asset: 'USDC', to_asset: 'BSV', amount_in: '1' })
   assert.equal(result.isError, true)
   assert.equal(result.content[0].text.includes(wif), false)
   assert.equal(result.content[0].text.includes(hex), false)
+  assert.equal(result.content[0].text.includes(signedData), false)
+  assert.equal(result.content[0].text.includes('[redacted signed data]'), true)
+  assert.equal(result.content[0].text.includes('b'.repeat(20)), false)
   assert.equal(result.content[0].text.includes('keys.json'), false)
 })
 

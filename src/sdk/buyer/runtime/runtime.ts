@@ -8,7 +8,7 @@ import { createBuyerKit } from '../buyer-kit'
 import { makeMessageBoxDoorClient } from '../door-client'
 import { DOOR_IDENTITY_PLACEHOLDER, RELEASED_DOOR_IDENTITY, assertSecureBuyerHome, buyerAddresses, buyerHome, ensureBuyerRuntimeDirs, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, type BuyerDiskConfig, type BuyerHome } from '../local-state'
 import { makeBuyerEngine } from '../engine'
-import type { BuyerKit, BuyerWithdrawalRecorder } from '../types'
+import type { BuyerKit, BuyerWithdrawalRecorder, BuyerEthTransferFees } from '../types'
 import { assertBuyerMainnetP2pkhAddress } from './address'
 import { makeBuyerBsvRails } from './bsv-rails'
 import { guardBuyerEvmWrites, makeBuyerEvmRails } from './evm-rails'
@@ -153,11 +153,11 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
       const receipt = await evmRails.client.transferErc20(BASE_USDC, to, amount, onRecorded ? { onRecorded } : {})
       return { hash: receipt.hash, status: receipt.status, blockNumber: receipt.blockNumber }
     },
-    transferEth: async (to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder) => {
-      const receipt = await evmRails.client.transferNative(to, amount, onRecorded ? { onRecorded } : {})
+    transferEth: async (to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder, opts?: { pinnedFees?: BuyerEthTransferFees }) => {
+      const receipt = await evmRails.client.transferNative(to, amount, { ...(onRecorded ? { onRecorded } : {}), ...(opts?.pinnedFees ? { pinnedFees: opts.pinnedFees } : {}) })
       return { hash: receipt.hash, status: receipt.status, blockNumber: receipt.blockNumber }
     },
-    estimateEthTransferFee: async (to: `0x${string}`) => evmRails.client.estimateNativeTransferFee(to),
+    priceEthTransfer: async (to: `0x${string}`) => evmRails.client.priceNativeTransfer(to),
   }
   const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, Date.now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') } })
   const kit = createBuyerKit({ capUsdPerSwap: config.capUsdPerSwap, baseWithdrawalForbidden: [ERC20_SWAP.deployments.baseMainnet.address, BASE_USDC], newWallet: options.newWallet, keysPath: paths.keysPath }, {

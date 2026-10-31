@@ -108,6 +108,8 @@ export interface MessageBoxRequestReplyResponderOpts<Request, Reply> {
   maxPerPoll?: number
   /** Drop (and acknowledge) a request body larger than this before decoding it. */
   maxBodyBytes?: number
+  /** Backstop for an injected/non-Anvil comms implementation that never resolves a list. */
+  pollTimeoutMs?: number
 }
 
 /** Safe defaults keep every production poll and attacker-controlled body bounded. */
@@ -128,10 +130,19 @@ export function makeMessageBoxRequestReplyResponder<Request, Reply>(opts: Messag
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MESSAGEBOX_MAX_BODY_BYTES
   if (!Number.isInteger(maxPerPoll) || maxPerPoll < 1) throw new Error('maxPerPoll must be a positive integer')
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes < 0) throw new Error('maxBodyBytes must be a non-negative integer')
+  if (opts.pollTimeoutMs !== undefined && (!Number.isInteger(opts.pollTimeoutMs) || opts.pollTimeoutMs < 1_000 || opts.pollTimeoutMs > 60_000)) throw new Error('pollTimeoutMs must be 1000..60000')
   const peer = opts.peerIdentityPubKeyHex?.toLowerCase()
   const pollMs = opts.pollMs ?? 2000
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const requestBox = `${opts.boxPrefix}:req`
+  const listWithin = async (): Promise<PeerMessage[]> => {
+    const listed = (opts.comms.listMessages as any)({ messageBox: requestBox, limit: maxPerPoll }) as Promise<PeerMessage[]>
+    if (opts.pollTimeoutMs === undefined) return listed
+    return new Promise<PeerMessage[]>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`messagebox poll timed out after ${opts.pollTimeoutMs}ms`)), opts.pollTimeoutMs)
+      listed.then(resolve, reject).finally(() => clearTimeout(timer))
+    })
+  }
 
   const handleOne = async (message: PeerMessage, sender?: string): Promise<void> => {
     const acknowledge = () => opts.comms.acknowledgeMessage({ messageIds: [message.messageId] })
@@ -148,7 +159,12 @@ export function makeMessageBoxRequestReplyResponder<Request, Reply>(opts: Messag
       return
     }
 
-    const candidateSwapId = opts.getSwapId(request)
+    let candidateSwapId: unknown
+    try { candidateSwapId = opts.getSwapId(request) } catch (error) {
+      opts.onInvalidSwapId?.(undefined)
+      await acknowledge()
+      return
+    }
     if (!opts.isSwapId(candidateSwapId)) {
       opts.onInvalidSwapId?.(candidateSwapId)
       await acknowledge() // an unaddressable request is dropped so its caller times out fail-closed
@@ -174,10 +190,11 @@ export function makeMessageBoxRequestReplyResponder<Request, Reply>(opts: Messag
   return {
     start(): () => void {
       let stopped = false
+      let backoffMs = pollMs
       const loop = async (): Promise<void> => {
         while (!stopped) {
           try {
-            const listed: PeerMessage[] = await opts.comms.listMessages({ messageBox: requestBox })
+            const listed = await listWithin()
             const messages = listed.slice(0, maxPerPoll)
             const strangerIds: string[] = []
             for (const message of messages) {
@@ -206,10 +223,13 @@ export function makeMessageBoxRequestReplyResponder<Request, Reply>(opts: Messag
               }
               opts.onUnauthorizedMessagesDropped?.(strangerIds.length, requestBox)
             }
+            backoffMs = pollMs
           } catch (error) {
             opts.onPollError?.(error)
+            const baseBackoffMs = Math.max(pollMs, 1_000)
+            backoffMs = Math.min(baseBackoffMs * 8, Math.max(backoffMs * 2, baseBackoffMs))
           }
-          if (!stopped) await sleep(pollMs)
+          if (!stopped) await sleep(backoffMs)
         }
       }
       void loop()

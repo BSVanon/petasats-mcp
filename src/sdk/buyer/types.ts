@@ -119,8 +119,20 @@ export interface BuyerWallet {
 
 export interface BuyerBaseWallet {
   transferUsdc?(to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder): Promise<{ hash: string; status: string; blockNumber?: bigint }>
-  transferEth?(to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder): Promise<{ hash: string; status: string; blockNumber?: bigint }>
-  estimateEthTransferFee?(to: `0x${string}`): Promise<bigint>
+  transferEth?(to: `0x${string}`, amount: bigint, onRecorded?: BuyerWithdrawalRecorder, opts?: { pinnedFees?: BuyerEthTransferFees }): Promise<{ hash: string; status: string; blockNumber?: bigint }>
+  priceEthTransfer?(to: `0x${string}`): Promise<BuyerEthTransferPlan>
+}
+
+/** Exact EIP-1559 fields used by an ETH-all withdrawal; they must also be used to sign it. */
+export interface BuyerEthTransferFees {
+  gas: bigint
+  maxFeePerGas: bigint
+  maxPriorityFeePerGas: bigint
+}
+
+export interface BuyerEthTransferPlan extends BuyerEthTransferFees {
+  l1FeeWei: bigint
+  reserveWei: bigint
 }
 
 export type BuyerWithdrawalRecorder = (signed: { hash: `0x${string}`; signedTx: `0x${string}`; nonce: number }) => void | Promise<void>
@@ -129,15 +141,22 @@ export interface BuyerWithdrawalReconcileOutcome {
   asset: 'USDC' | 'ETH'
   to: string
   amount: string
-  status: 'success' | 'reverted'
+  status: 'success' | 'reverted' | 'cancelled'
 }
+export type BuyerWithdrawalCancelResult =
+  | { status: 'cancelling'; cancelHash: string }
+  | { status: 'unaffordable' | 'unconfirmed'; cancelHash?: string }
+  | { status: 'waiting'; cancelHash?: string }
+  | { status: 'limit' | 'unsupported' }
 export interface BuyerWithdrawalIntents {
   /** A receipt can settle an older withdrawal, but only the caller decides whether that ends its operation. */
   reconcile(): Promise<BuyerWithdrawalReconcileOutcome | undefined>
   record(input: { asset: 'USDC' | 'ETH'; to: string; amount: bigint; hash: string; signedTx: string; nonce: number }): Promise<void>
   done(hash: string, result: { status: 'success' | 'reverted'; blockNumber?: bigint }): Promise<void>
+  /** Start a durable same-nonce cancellation for a recorded withdrawal. */
+  cancel?(hash: string): Promise<BuyerWithdrawalCancelResult>
   /** Local, read-only records used to reject a likely duplicate retry. */
-  list?(): Array<{ asset: 'USDC' | 'ETH'; to: string; amount: string; hash: string; createdAtMs: number; state: 'pending' | 'done'; status?: 'success' | 'reverted' | 'sent' | 'not-sent' }>
+  list?(): Array<{ asset: 'USDC' | 'ETH'; to: string; amount: string; hash: string; createdAtMs: number; state: 'pending' | 'done'; status?: 'success' | 'reverted' | 'sent' | 'not-sent' | 'cancelled' }>
 }
 
 export interface BuyerKitConfig {

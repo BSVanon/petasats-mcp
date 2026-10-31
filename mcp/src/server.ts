@@ -155,6 +155,7 @@ export type ToolResult = { content: Array<{ type: 'text'; text: string }>; isErr
 
 const redact = (message: string): string => message
   .replace(/[5KLc][1-9A-HJ-NP-Za-km-z]{50,51}/g, '[redacted credential]')
+  .replace(/0x[0-9a-fA-F]{65,}/g, '[redacted signed data]')
   .replace(/0x[0-9a-fA-F]{64}/g, '[redacted secret]')
   .replace(/keys\.json/gi, '[redacted credential source]')
   .replace(/\b(?:private\s+key|wif|keys?\s+file)\b/gi, '[redacted credential]')

@@ -9,6 +9,7 @@ import type { BridgeIntent, BridgeQuote } from './settlement-types'
 import { assertLockSafeForZeroConf, assertLockSafeForZeroConfMultiArc, watchRevealThroughClaim, watchRevealThroughClaimMultiArc, coverageLabel, type FetchTxStatus, type FetchArcStatuses } from './mainnet-zeroconf'
 import { ARC_PROVIDERS, classifyArcStatus, classifyMultiArc, watchLockThroughClaim } from './zeroconf-monitor'
 import { DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
+import { makePreRevealHeightRead } from './pre-reveal-height'
 /** The concrete swap the initiator runs: deliver an allowlisted ERC-20, receive BSV. */
 export interface BridgeDeliverErc20Spec {
   /** The ERC-20 the initiator delivers (locks on Base). Validated against the allowlist. */
@@ -419,6 +420,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         }
         const session = SettlementSession.create(paramsFrom(intent, quote, token.decimals, cfg, now()), 'initiator', now())
         session.holdSecret(Utils.toHex(secret))
+        const revealHeight = makePreRevealHeightRead({ read: () => bsv.chainHeight(), revealed: () => session.state === 'revealed', sleep, log: (m) => log('bsv', m) })
 
         // 5. Lock USDC on Base (approve → wait allowance → lock).
         const evmParams: Erc20SwapParams = {
@@ -559,7 +561,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             // A lock that never confirms must not strand this executor (or its restock tick) indefinitely. The same
             // reveal runway applies before every confirmation poll, whether this is the direct confirmed path or a
             // 0-conf fallback.
-            const waitGate = session.guardInitiatorCanReveal(await bsv.chainHeight())
+            const waitGate = session.guardInitiatorCanReveal(await revealHeight())
             if (!waitGate.ok) throw new Error(`confirmed-path lock wait stopped: reveal gate refused: ${waitGate.reason}`)
             if ((await bsv.txConfirmations(bsvLocked.bsvLockTxid)) >= confs) break
             log('bsv', `waiting BSV lock conf ${i + 1}/${confs}…`)
@@ -672,7 +674,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           }
         }
         if (!useZeroConfFastPath) await confirmLockAndVerify()
-        const gate = session.guardInitiatorCanReveal(await bsv.chainHeight())
+        const gate = session.guardInitiatorCanReveal(await revealHeight())
         if (!gate.ok) throw new Error(`reveal gate refused: ${gate.reason}`)
 
         // 8. Reveal: claim the BSV (publishes `s` on-chain). The instant the claim BROADCASTS the swap is WON from our
@@ -741,7 +743,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             await confirmLockAndVerify()
             // The confirmation and proof waits can span blocks, and the retry gate above was read before them. Re-read
             // the runway before this attempt goes on to the reveal.
-            const provenGate = session.guardInitiatorCanReveal(await bsv.chainHeight())
+            const provenGate = session.guardInitiatorCanReveal(await revealHeight())
             if (!provenGate.ok) throw new Error(`reveal-safety margin expired while waiting for a confirmed lock: ${provenGate.reason}`)
           }
         }
@@ -756,7 +758,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           // its height becomes stale while a broadcaster or /beef indexer is failing. Re-read the live height before
           // EVERY irreversible broadcast attempt and abort outside the retryable-error catch once the safety margin is
           // gone. In particular, never let the responder's at-maturity refund race a later claim carrying public `s`.
-          const retryGate = preRevealSession.guardInitiatorCanReveal(await bsv.chainHeight())
+          const retryGate = preRevealSession.guardInitiatorCanReveal(await revealHeight())
           if (!retryGate.ok) {
             throw new Error(`reveal-safety margin expired mid-retry — aborting to avoid disclosing s past the safe window: ${retryGate.reason}`)
           }
