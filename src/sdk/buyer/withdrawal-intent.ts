@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import { join } from 'path'
 import { writeSettlementRecordAtomically } from '../../bridge/atomic-record-write'
 import { InsufficientFundsError } from 'viem'
+import { isLookupRefusal } from '../../bridge/evm/lookup-refusal'
 import { secureFileText, type BuyerHome } from './local-state'
 import type { BuyerWithdrawalCancelResult, BuyerWithdrawalIntents, BuyerWithdrawalReconcileOutcome } from './types'
 
@@ -29,6 +30,8 @@ export interface BuyerWithdrawalReconcileGuards {
   /** Re-probes before every money decision and returns the verified endpoint set when available. */
   assertSafeForNewLock?: () => string | void | Promise<string | void>
   beforeResend?: () => void | Promise<void>
+  /** Diagnostics only; it never receives a signed transaction or error.message. */
+  log?: (message: string) => void
 }
 const validHash = (hash: string): hash is `0x${string}` => /^0x[0-9a-f]{64}$/i.test(hash)
 const validSignedTx = (signedTx: string): signedTx is `0x${string}` => /^0x[0-9a-f]+$/i.test(signedTx)
@@ -127,6 +130,19 @@ export function makeBuyerWithdrawalIntents(paths: BuyerHome, rails: BuyerWithdra
   const safeSnapshot = async (): Promise<string | void> => {
     try { return await guards.assertSafeForNewLock?.() } catch { throw new Error(RPC_REFUSAL) }
   }
+  // After a missing receipt, every action is bound to this record's nonce: re-send uses its exact bytes and cancellation
+  // is zero-value at that nonce, so at most one can land. A used nonce without a readable receipt stops at the manual
+  // nonce warning and never resolves by itself.
+  const readReceipt = async (hash: `0x${string}`): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint } | undefined> => {
+    try { return await rails.receipt(hash) } catch (error) { if (isLookupRefusal(error)) return undefined; throw error }
+  }
+  const diagnostic = (error: unknown): string => {
+    const value: { constructor?: { name?: unknown }; code?: unknown; shortMessage?: unknown; details?: unknown } = (typeof error === 'object' || typeof error === 'function') && error !== null ? error as { constructor?: { name?: unknown }; code?: unknown; shortMessage?: unknown; details?: unknown } : {}
+    const name = typeof value.constructor?.name === 'string' ? value.constructor.name : typeof error
+    const code = typeof value.code === 'number' ? ` code=${value.code}` : ''
+    const text = [typeof value.shortMessage === 'string' ? ` shortMessage=${value.shortMessage}` : '', typeof value.details === 'string' ? ` details=${value.details}` : ''].join('')
+    return (`${name}${code}${text}`).replace(/[\r\n]+/g, ' ').replace(/0x[0-9a-f]+/gi, (hex) => hex.length > 66 ? '0x…' : hex).slice(0, 300)
+  }
   const nonceWarning = (hash: string): Error => new Error(`a previous Base withdrawal (${hash}) used its nonce but its receipt was not found, so it may have been paid; check ${hash} on a Base block explorer, then run \`npx petasats-mcp withdrawal ${hash} sent\` or \`npx petasats-mcp withdrawal ${hash} not-sent\`; nothing new was sent`)
   const latestCancel = (record: BuyerWithdrawalRecord): BuyerWithdrawalCancel | undefined => record.cancels?.[record.cancels.length - 1]
   const beingCancelled = (record: BuyerWithdrawalRecord, cancelHash = latestCancel(record)?.hash): Error => new Error(`the previous Base withdrawal ${record.hash} is being cancelled at its nonce (cancellation ${cancelHash ?? 'not yet confirmed'}). Try again after the cancellation is final on Base. Nothing new was sent.`)
@@ -192,7 +208,7 @@ export function makeBuyerWithdrawalIntents(paths: BuyerHome, rails: BuyerWithdra
           const finalized = await rails.finalizedBlockNumber()
           const nonce = await rails.nonceAtBlock(finalized)
           if (!Number.isSafeInteger(nonce) || nonce < 0) throw new Error('invalid finalized account nonce')
-          const receipt = await rails.receipt(record.hash as `0x${string}`)
+          const receipt = await readReceipt(record.hash as `0x${string}`)
           if (receipt) {
             if (receipt.blockNumber > finalized) throw new Error(`a previous Base withdrawal (${record.hash}) is mined and waiting for Base finality; try again later; nothing new was sent`)
             if (nonce <= record.nonce) throw new Error('could not confirm the previous Base withdrawal; nothing new was sent')
@@ -207,7 +223,7 @@ export function makeBuyerWithdrawalIntents(paths: BuyerHome, rails: BuyerWithdra
           }
           let cancelled = false
           for (const cancel of record.cancels ?? []) {
-            const cancelReceipt = await rails.receipt(cancel.hash as `0x${string}`)
+            const cancelReceipt = await readReceipt(cancel.hash as `0x${string}`)
             if (!cancelReceipt) continue
             if (cancelReceipt.blockNumber > finalized) throw beingCancelled(record)
             if (nonce <= record.nonce) throw new Error('could not confirm the previous Base withdrawal; nothing new was sent')
@@ -289,6 +305,7 @@ export function makeBuyerWithdrawalIntents(paths: BuyerHome, rails: BuyerWithdra
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           if (message === RPC_REFUSAL || message.startsWith('another petasats-mcp process is updating withdrawal') || message.startsWith('a previous Base withdrawal is still pending') || message.startsWith('a previous Base withdrawal (') || message.startsWith('the previous Base withdrawal ') || message.startsWith('the Base RPC refused the withdrawal ') || message.startsWith('the account cannot pay the gas ') || message.startsWith('this kit runtime cannot cancel ')) throw error
+          guards.log?.(diagnostic(error))
           throw new Error('could not confirm the previous Base withdrawal; nothing new was sent')
         }
       }

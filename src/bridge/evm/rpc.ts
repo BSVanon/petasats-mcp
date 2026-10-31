@@ -300,6 +300,8 @@ export class BaseRpcFailoverPool {
     alert: (message: string) => void
     log?: (message: string) => void
     fetchImpl?: typeof fetch
+    /** Test seam: production uses the normal bounded read retry schedule. */
+    retryDelayMs?: number
     maxHeadLagBlocks?: number
     degradedProbeIntervalMs?: number
     now?: () => number
@@ -369,7 +371,7 @@ export class BaseRpcFailoverPool {
     const key = urls.join('\u0000')
     let transport = this.transports.get(key)
     if (!transport) {
-      transport = baseRpcTransport(urls, this.opts.fetchImpl)
+      transport = baseRpcTransport(urls, this.opts.fetchImpl, this.opts.retryDelayMs)
       this.transports.set(key, transport)
     }
     return transport

@@ -2,7 +2,8 @@
  * Base read fetch wrapper: retry a provider's refusal of a transaction or receipt lookup instead of failing on it.
  *
  * publicnode answers a lookup that the backend it routed to cannot serve with a JSON-RPC error (-32602 "Archive
- * requests require a personal token") instead of the standard null. It does this for a hash that is not mined yet and,
+ * requests require a personal token") as HTTP 403 (measured 2026-10-31), instead of the standard null. A 200 refusal
+ * is still handled. It does this for a hash that is not mined yet and,
  * on some backends, for an old mined one. viem does not retry that error, so every receipt wait for a just-sent
  * transaction failed at once (2026-10-29: a buyer's USDC approve and a funding transfer, both mined fine).
  *
@@ -31,6 +32,21 @@ export class LookupRefusedError extends Error {
   }
 }
 
+/** Identifies this provider-specific unknown-lookup failure without treating an ordinary missing receipt as one. */
+export function isLookupRefusal(error: unknown): boolean {
+  const visited = new Set<object>()
+  let entry = error
+  for (let depth = 0; depth < 16 && (typeof entry === 'object' || typeof entry === 'function') && entry !== null; depth++) {
+    if (visited.has(entry as object)) return false
+    visited.add(entry as object)
+    if (entry instanceof LookupRefusedError) return true
+    const value = entry as { message?: unknown; details?: unknown; shortMessage?: unknown; cause?: unknown }
+    if ([value.message, value.details, value.shortMessage].some((text) => typeof text === 'string' && LOOKUP_REFUSAL.test(text))) return true
+    entry = value.cause
+  }
+  return false
+}
+
 function isLookupRequest(body: unknown): boolean {
   if (typeof body !== 'string') return false
   try {
@@ -42,7 +58,7 @@ function isLookupRequest(body: unknown): boolean {
 export function lookupRefusalRetryableFetch(inner: typeof fetch = fetch): typeof fetch {
   return async (input, init) => {
     const res = await inner(input, init)
-    if (!res.ok || !isLookupRequest(init?.body)) return res
+    if (!isLookupRequest(init?.body)) return res
     let message: unknown
     try { message = (JSON.parse(await res.clone().text()) as { error?: { message?: unknown } } | null)?.error?.message } catch { return res }
     if (typeof message !== 'string' || !LOOKUP_REFUSAL.test(message)) return res

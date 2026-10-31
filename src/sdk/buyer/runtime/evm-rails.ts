@@ -12,6 +12,8 @@ export interface BuyerEvmRailsOptions {
   usdcTokenAddress: Address
   rpcUrls?: readonly string[]
   fetchImpl?: typeof fetch
+  /** Test seam: production uses the normal bounded read retry schedule. */
+  retryDelayMs?: number
   probeIntervalMs?: number
   alert?: (message: string) => void
   log?: (message: string) => void
@@ -57,6 +59,7 @@ export async function makeBuyerEvmRails(opts: BuyerEvmRailsOptions): Promise<Buy
     alert: opts.alert ?? (() => {}),
     log: opts.log,
     fetchImpl: opts.fetchImpl,
+    retryDelayMs: opts.retryDelayMs,
   })
   await pool.probeNow()
   const rawClient = new Erc20SwapEvmClient({

@@ -159,7 +159,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     },
     priceEthTransfer: async (to: `0x${string}`) => evmRails.client.priceNativeTransfer(to),
   }
-  const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, Date.now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') } })
+  const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, Date.now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') }, log })
   const kit = createBuyerKit({ capUsdPerSwap: config.capUsdPerSwap, baseWithdrawalForbidden: [ERC20_SWAP.deployments.baseMainnet.address, BASE_USDC], newWallet: options.newWallet, keysPath: paths.keysPath }, {
     door, executor: engine, store: makeFileBuyerStore(paths), wallet,
     beforeNewSwap: async () => { await evmRails.assertSafeForNewLock() }, limits: () => readBuyerLimits(paths), spendingStopped: () => readSpendingStop(paths), withdrawalIntents,
