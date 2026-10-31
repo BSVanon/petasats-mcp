@@ -17,7 +17,7 @@ export interface BuyerWithdrawalRails {
   receipt(hash: `0x${string}`): Promise<{ status: 'success' | 'reverted'; blockNumber: bigint } | undefined>
   finalizedBlockNumber(): Promise<bigint>
   nonceAtBlock(blockNumber: bigint): Promise<number>
-  pendingNonce(): Promise<number>
+  pendingNonce?(): Promise<number>
   resendSigned(signedTx: `0x${string}`): Promise<`0x${string}`>
   consumeNonce?(
     nonce: number,
