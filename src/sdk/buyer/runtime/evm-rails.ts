@@ -1,7 +1,7 @@
-import { base } from 'viem/chains'
 import { createPublicClient, type Address, type Hex } from 'viem'
 import { Erc20SwapEvmClient } from '../../../bridge/evm/client'
 import { BaseRpcFailoverPool, DEFAULT_BASE_RPC_PROBE_INTERVAL_MS } from '../../../bridge/evm/rpc'
+import { buyerBaseChain } from '../../../bridge/evm/tip-floor'
 
 /** The public Base endpoint already used by the unattended boxes. */
 export const DEFAULT_BUYER_BASE_RPC_URLS = ['https://base-rpc.publicnode.com'] as const
@@ -65,9 +65,9 @@ export async function makeBuyerEvmRails(opts: BuyerEvmRailsOptions): Promise<Buy
   const rawClient = new Erc20SwapEvmClient({
     rpcUrl: urls[0], rpcUrls: urls, privateKey: opts.privateKey,
     swapAddress: opts.swapAddress, pinnedTokenAddresses: [opts.usdcTokenAddress],
-    chain: base, transport: pool.transport,
+    chain: buyerBaseChain, transport: pool.transport,
   })
-  const reader = createPublicClient({ chain: base, transport: pool.transport })
+  const reader = createPublicClient({ chain: buyerBaseChain, transport: pool.transport })
   await rawClient.assertChainId()
   const assertSafeForNewLock = async (): Promise<string> => {
     await pool.probeNow()
