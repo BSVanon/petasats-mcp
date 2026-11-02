@@ -142,5 +142,14 @@ export function makeFileBuyerStore(paths: BuyerHome): BuyerStore {
       record.schemaVersion = 2
       writeSettlementRecordAtomically(path, encode(record), 0o600)
     },
+    async update(id, derive) {
+      const path = file(id)
+      const current = fs.existsSync(path) ? decode(secureFileText(path)) : undefined
+      const next = derive(current)
+      if (next.swapId !== id) throw new Error('buyer swap update changed its id')
+      next.schemaVersion = 2
+      writeSettlementRecordAtomically(path, encode(next), 0o600)
+      return next
+    },
   }
 }

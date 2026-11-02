@@ -500,7 +500,24 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
               const candidate = { ...session.toRecord(), bsvClaimProvenHeight: proof.height, bsvClaimProvenRoot: proof.root }
               try {
                 validateSettlementRecord(candidate)
-                await deps.persist(candidate)
+                let saveProof = true
+                if (deps.reloadPersistedRecord) {
+                  let fresh: SettlementRecord
+                  try {
+                    fresh = await deps.reloadPersistedRecord()
+                  } catch (e) {
+                    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return session.toRecord()
+                    throw e
+                  }
+                  if (fresh.state !== rec.state) {
+                    // The one-confirmation swap path may leave a settled tombstone carrying this exact claim artifact.
+                    // Do not overwrite it with the old revealed snapshot, but keep the in-memory burial/re-broadcast
+                    // watch alive until finality.
+                    if (rec.state === 'revealed' && fresh.state === 'settled') saveProof = false
+                    else return session.toRecord()
+                  }
+                }
+                if (saveProof) await deps.persist(candidate)
                 session.recordBsvClaimProof(proof.height, proof.root)
               } catch (e) {
                 // Evidence is advisory to recovery, but a failed durable write must be audible.

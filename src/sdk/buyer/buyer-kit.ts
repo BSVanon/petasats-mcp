@@ -13,6 +13,9 @@ const active = new Set<BuyerSwapStage>(['quoted', 'admitted', 'usdc_locked', 'wa
 const terminal = new Set<BuyerSwapStage>(['settled', 'delivered', 'refunded', 'failed'])
 const known = new Set<BuyerSwapStage>([...active, ...terminal, 'claimed'])
 const knownStage = (stage: string): stage is BuyerSwapStage => known.has(stage as BuyerSwapStage)
+const claimProgress = new Map<BuyerSwapStage, number>([['claiming', 0], ['claimed', 1], ['settled', 2], ['sweeping', 3], ['delivered', 4]])
+const claimProgressStage = (stage: string): stage is BuyerSwapStage => claimProgress.has(stage as BuyerSwapStage)
+const protectedClaimStage = (stage: string): stage is BuyerSwapStage => claimProgressStage(stage) && claimProgress.get(stage)! >= 1
 const requestId = (): string => randomBytes(18).toString('base64url')
 const swapId = (): string => randomBytes(16).toString('hex')
 
@@ -89,10 +92,41 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     throw new Error(`a Base withdrawal of ${amount} ${asset} to ${to} (${duplicate.hash}) was sent ${minutes} minutes ago; nothing new was sent; to send the same amount to the same address again, wait until ${retryAt} or use a different amount`)
   }
 
+  let rowWrite: Promise<void> = Promise.resolve()
+  const updateRow = async (record: BuyerSwapRecord, derive: (current: BuyerSwapRecord) => BuyerSwapRecord): Promise<BuyerSwapRecord> => {
+    const previous = rowWrite
+    let release!: () => void
+    rowWrite = new Promise<void>((resolve) => { release = resolve })
+    await previous
+    try {
+      if (deps.store.update) return await deps.store.update(record.swapId, (current) => derive(current ?? record))
+      const current = await deps.store.get(record.swapId) ?? record
+      const next = derive(current)
+      await deps.store.put(next)
+      return next
+    } finally { release() }
+  }
   const write = async (record: BuyerSwapRecord, stage: BuyerSwapStage, extra: Partial<BuyerSwapRecord> = {}): Promise<BuyerSwapRecord> => {
-    const next = { ...record, ...extra, stage, updatedAtMs: now() }
-    await deps.store.put(next)
-    return next
+    return updateRow(record, (current) => ({ ...record, ...current, ...extra, stage, updatedAtMs: now() }))
+  }
+  const guardRecovery = (record: BuyerSwapRecord, outcome: import('./types').BuyerRecoveryOutcome): import('./types').BuyerRecoveryOutcome => {
+    // A stage label alone is untrusted and must not hide a real refund/failure.  A coherent terminal settlement
+    // observation, however, is the durable hand-off written by the money path and cannot be undone by stale recovery.
+    if (record.settlementState === 'settled') {
+      const floor = protectedClaimStage(record.stage) ? record.stage : 'settled'
+      if (outcome.settlementState !== 'settled' || !claimProgress.has(outcome.stage) || claimProgress.get(outcome.stage)! < claimProgress.get(floor)!) {
+        return { ...outcome, stage: floor, settlementState: 'settled' }
+      }
+    }
+    if (record.settlementState === 'refunded' && outcome.settlementState !== 'refunded') return { ...outcome, stage: 'refunded', settlementState: 'refunded' }
+    if (record.settlementState === 'aborted' && outcome.settlementState !== 'aborted') return { ...outcome, stage: 'failed', settlementState: 'aborted' }
+    return outcome
+  }
+  const writeRecovery = async (record: BuyerSwapRecord, outcome: import('./types').BuyerRecoveryOutcome): Promise<BuyerSwapRecord> => {
+    return updateRow(record, (current) => {
+      const guarded = guardRecovery(current, outcome)
+      return { ...record, ...current, ...guarded, stage: guarded.stage, updatedAtMs: now() }
+    })
   }
   const issuedQuotes = new Map<string, BuyerQuote>()
   const quote = async (amountIn: bigint): Promise<BuyerQuote> => {
@@ -226,10 +260,12 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         // replace it when it can; otherwise turn it into the current explicit
         // attention state so a later recovery has a known state to render.
         if (!knownStage(record.stage)) {
-          const derived = all?.get(record.swapId) ?? await deps.executor.recover?.(record)
-          await write(record, derived?.stage ?? 'needs_attention', derived ?? {
+          const recovered = all?.get(record.swapId) ?? await deps.executor.recover?.(record)
+          const derived = recovered ?? {
+            stage: 'needs_attention',
             reason: 'an older or unknown record; recovery will update it',
-          })
+          } as const
+          await writeRecovery(record, derived)
           continue
         }
         if (terminal.has(record.stage)) {
@@ -240,14 +276,14 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         if (record.stage === 'sweeping') continue
         const derived = all?.get(record.swapId)
         if (derived) {
-          const saved = await write(record, derived.stage, derived)
+          const saved = await writeRecovery(record, derived)
           if (saved.settlementState === 'settled' || saved.settlementState === 'refunded' || saved.settlementState === 'aborted') await deps.executor.acknowledgeTerminal?.(saved)
           continue
         }
         if (!deps.executor.recover) continue
         const outcome = await deps.executor.recover(record)
         if (outcome) {
-          const saved = await write(record, outcome.stage, outcome)
+          const saved = await writeRecovery(record, outcome)
           if (saved.settlementState === 'settled' || saved.settlementState === 'refunded' || saved.settlementState === 'aborted') await deps.executor.acknowledgeTerminal?.(saved)
         }
       }

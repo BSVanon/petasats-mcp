@@ -3,7 +3,7 @@ import { makeBridgeInitiatorExecutor, type BridgeInitiatorBsvRails, type BridgeI
 import { defaultInitiatorTimelocks } from '../../bridge/initiator-timelocks'
 import { makeInitiatorRecoverySupervisor, makeValidatedBsvFinality, type RecoveryBsvRails } from '../../bridge/in-process-recovery'
 import type { RecoveryClaimEvm } from '../../bridge/watchtower-adapters'
-import { DEFAULT_BSV_FINALITY_CONFIRMATIONS } from '../../bridge/watchtower'
+import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, hasPersistedBsvClaimArtifact } from '../../bridge/watchtower'
 import type { Erc20SwapEvmClient } from '../../bridge/evm/client'
 import type { SettlementRecord, SettlementState } from '../../bridge/settlement-session'
 import { makeFileSwapRecordStore } from '../../market-maker/swap-record-store'
@@ -42,7 +42,6 @@ export function buyerStageForSettlement(state: SettlementState): BuyerSwapStage 
 }
 
 const terminalSettlement = (state: SettlementState): boolean => state === 'settled' || state === 'refunded' || state === 'aborted'
-
 /** The covenant claim pays the buyer from output 0.  Prefer the persisted bytes over a derived estimate. */
 function claimPayoutSats(record: SettlementRecord): number | undefined {
   if (record.bsvClaimTxHex) {
@@ -61,8 +60,11 @@ function claimPayoutSats(record: SettlementRecord): number | undefined {
 
 /** A persisted reveal is irreversible: stale/contradictory later labels must never put its USDC on a refund UI path. */
 function stageForRecord(record: BuyerSwapRecord, state: SettlementState): BuyerSwapStage {
-  return record.settlementState === 'revealed' && state !== 'settled' ? 'claiming' : buyerStageForSettlement(state)
+  if (record.settlementState === 'revealed' && !terminalSettlement(state)) return 'claiming'
+  return buyerStageForSettlement(state)
 }
+
+function settlementStateForRecord(_record: BuyerSwapRecord, state: SettlementState): SettlementState { return state }
 
 export interface BuyerEngineDeps {
   comms: CommsLayer
@@ -288,7 +290,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       }
       known.set(record.swapId, { hashHex, state: settlement.state })
       recovery.ensure([settlement])
-      return { stage: stageForRecord(record, settlement.state), baseLockTxid: settlement.baseLockTxHash, baseRefundTxid: settlement.refundTxid, bsvClaimTxid: settlement.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(settlement), bsvLockOutpoint: settlement.bsvLockOutpoint, bsvRefundLocktime: settlement.bsvRefundLocktime, baseTimelockBlock: settlement.baseTimelockBlock, settlementState: settlement.state }
+      return { stage: stageForRecord(record, settlement.state), baseLockTxid: settlement.baseLockTxHash, baseRefundTxid: settlement.refundTxid, bsvClaimTxid: settlement.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(settlement), bsvLockOutpoint: settlement.bsvLockOutpoint, bsvRefundLocktime: settlement.bsvRefundLocktime, baseTimelockBlock: settlement.baseTimelockBlock, settlementState: settlementStateForRecord(record, settlement.state) }
     },
     async recoverAll(buyerRecords) {
       const listed = records.list()
@@ -322,7 +324,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         // Track live records so the supervisor's terminal clear (refunded/settled) is visible to this swap.
         if (item) known.set(buyer.swapId, { hashHex, state: item.state })
         stages.set(buyer.swapId, item
-          ? { stage: stageForRecord(buyer, item.state), settlementState: item.state, baseLockTxid: item.baseLockTxHash, baseRefundTxid: item.refundTxid, bsvClaimTxid: item.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(item), bsvLockOutpoint: item.bsvLockOutpoint, bsvRefundLocktime: item.bsvRefundLocktime, baseTimelockBlock: item.baseTimelockBlock, reason: item.abortReason }
+          ? { stage: stageForRecord(buyer, item.state), settlementState: settlementStateForRecord(buyer, item.state), baseLockTxid: item.baseLockTxHash, baseRefundTxid: item.refundTxid, bsvClaimTxid: item.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(item), bsvLockOutpoint: item.bsvLockOutpoint, bsvRefundLocktime: item.bsvRefundLocktime, baseTimelockBlock: item.baseTimelockBlock, reason: item.abortReason }
           : !buyer.settlementRecordCreated && buyer.handshakeDeadlineMs !== undefined && deps.now() >= buyer.handshakeDeadlineMs
             ? { stage: 'failed', reason: 'handshake expired before a settlement checkpoint was created; nothing was locked' }
             : await absentOutcome(buyer))
@@ -338,6 +340,12 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       if (settlement.abortReason === UNLANDED_LOCK_ABORT_REASON) return
       // A tombstone is acknowledged only by the exact observable terminal artifacts, never merely by a UI stage.
       if (settlement.baseLockTxHash !== buyer.baseLockTxid || settlement.refundTxid !== buyer.baseRefundTxid || settlement.bsvClaimTxid !== buyer.bsvClaimTxid) return
+      // The executor considers one SPV-proven confirmation sufficient for delivery, but the raw/BEEF claim is still
+      // the reorg/re-broadcast backstop until the recovery finality depth. Keep that artifact durable across restarts.
+      if (settlement.state === 'settled' && hasPersistedBsvClaimArtifact(settlement)) {
+        if (!claimIsBuried || !settlement.bsvClaimTxid) return
+        try { if (!await claimIsBuried(settlement.bsvClaimTxid, DEFAULT_BSV_FINALITY_CONFIRMATIONS)) return } catch { return }
+      }
       records.clear(settlement.hashHex, settlement)
     },
   }

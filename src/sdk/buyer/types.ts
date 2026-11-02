@@ -103,6 +103,8 @@ export interface BuyerStore {
   get(swapId: string): Promise<BuyerSwapRecord | undefined>
   /** Must be durable before a money-moving executor step starts. */
   put(record: BuyerSwapRecord): Promise<void>
+  /** Atomically derive a replacement from the row that is current at write time. */
+  update?(swapId: string, derive: (current: BuyerSwapRecord | undefined) => BuyerSwapRecord): Promise<BuyerSwapRecord>
 }
 
 export interface BuyerWallet {

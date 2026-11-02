@@ -1,5 +1,5 @@
 import { Transaction, type ChainTracker } from '@bsv/sdk'
-import { hasPersistedBsvClaimArtifact, runWatchtower, type WatchtowerDeps } from './watchtower'
+import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, hasPersistedBsvClaimArtifact, runWatchtower, type WatchtowerDeps, type WatchtowerStatus } from './watchtower'
 import { makeBsvWatchtowerDeps, makeBaseWatchtowerDeps } from './watchtower-adapters'
 import { broadcastHtlcSpendAsBeef } from '../settlement/htlc/beef-spend-broadcast'
 import { SettlementSession, type SettlementRecord, type SettlementState } from './settlement-session'
@@ -10,6 +10,10 @@ import { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
 import type { BsvHeightPurpose } from '../wallet/bsv-height'
 import { proveBsvClaim } from './bsv-claim-proof'
 export { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
+const emitInitiatorWatchtowerProgress = (s: WatchtowerStatus): void => console.error(
+  `  [wt] ${s.action} · ${s.note}${s.gate ? ` (${s.gate.chain} gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`,
+)
+
 export interface RecoveryBsvRails {
   chainHeight: () => Promise<number>
   /** Purpose-aware two-source tip reader. Required by live mainnet rails; optional for legacy/test adapters. */
@@ -81,6 +85,7 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
     fetchTx: (txid) => bsvRails.fetchTx(txid),
     beforeSend: opts.beforeSend,
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
+    emit: emitInitiatorWatchtowerProgress,
   })
 }
 
@@ -409,11 +414,12 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
     })
     const persist = deps.persist
     deps.persist = async (record): Promise<void> => {
+      if (opts.shouldContinue && !opts.shouldContinue()) return
       await persist(record)
       opts.onPersist?.(record)
     }
     deps.shouldContinue = opts.shouldContinue
-    launch(deps, `BSV claim re-broadcast + burial target ${rec.claimConfirmationTarget}`)
+    launch(deps, `BSV claim re-broadcast + burial target ${Math.max(rec.claimConfirmationTarget ?? 0, DEFAULT_BSV_FINALITY_CONFIRMATIONS)}`)
     return
   }
 
@@ -463,6 +469,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
     assertInitiatorRefundSafe: (record) => assertInitiatorRefundSafeOnBsv(record, opts.bsvRails),
     onInitiatorRefundSafetyResult: opts.onRefundSafetyResult,
+    emit: emitInitiatorWatchtowerProgress,
   })
   const persist = deps.persist
   deps.persist = async (record): Promise<void> => {
@@ -514,8 +521,21 @@ export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRec
         base.log(`⚠️ in-process initiator recovery NEEDS ATTENTION for ${rec.hashHex.slice(0, 12)}…: competing Base ${rec.competingResolution.outcome} ${rec.competingResolution.eventTxid}; record KEPT, NOT re-armed`)
         continue
       }
-      if (isTerminal(rec.state)) {
-        const key = watchtowerRecordKey(rec)
+      const key = watchtowerRecordKey(rec)
+      const prior = armed.get(key)
+      let recoveryRecord = rec
+      if (rec.role === 'initiator' && rec.state === 'settled' && hasPersistedBsvClaimArtifact(rec)) {
+        const priorHistory = rec.history.slice(0, -1)
+        if (priorHistory[priorHistory.length - 1]?.state === 'revealed') {
+          // The buyer can deliver after one confirmation, while this retained tombstone must still re-broadcast the
+          // exact claim through finality. An already-armed revealed watcher keeps running; a restart reconstructs only
+          // that non-terminal watcher view without changing the durable settled tombstone. A watcher armed before the
+          // reveal (e.g. base-locked) is superseded below, so the claim re-broadcast watcher always takes over.
+          if (prior?.state === 'revealed') continue
+          recoveryRecord = { ...rec, state: 'revealed', history: priorHistory }
+        }
+      }
+      if (isTerminal(recoveryRecord.state)) {
         const current = armed.get(key)
         cancelRecord(rec, `fresh record is terminal (${rec.state})`)
         if (!current?.terminalClearAttempted) {
@@ -524,21 +544,19 @@ export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRec
         }
         continue
       }
-      const key = watchtowerRecordKey(rec)
-      const prior = armed.get(key)
       const recordToken = JSON.stringify(rec)
       if (prior?.state === rec.state && prior.recordToken === recordToken) continue
       if (prior) {
         prior.active = false
         base.log(`in-process initiator recovery SUPERSEDED for ${rec.hashHex.slice(0, 12)}… (${prior.state} → ${rec.state}); re-arming from fresh state`)
       }
-      const run: ArmedRecovery = { hashHex: rec.hashHex, state: rec.state, recordToken, active: true }
+      const run: ArmedRecovery = { hashHex: rec.hashHex, state: recoveryRecord.state, recordToken, active: true }
       armed.set(key, run)
       superviseBaseInitiatorRecovery({
         ...base,
         evm: base.evmProvider?.() ?? base.evm,
         evmRefund: base.evmRefundProvider?.() ?? base.evmRefund,
-        session: SettlementSession.fromRecord(rec),
+        session: SettlementSession.fromRecord(recoveryRecord),
         recordPath: base.recordPathFor(rec.hashHex, rec),
         shouldContinue: () => run.active,
         beforeSend: () => runSupersedeSafeSendFence(() => run.active, base.beforeSend),
