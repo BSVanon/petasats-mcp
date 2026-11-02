@@ -10,6 +10,7 @@ import { extractBridgeCovenantSecret } from '../settlement/htlc/bridge-covenant'
 import { assertSameWatchtowerRecordIdentity } from './watchtower-record-identity'
 import { persistWatchtowerAdapterRecord } from './watchtower-record-persistence'
 import { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
+import type { BsvClaimProof } from './bsv-claim-proof'
 /** DRY sentinel for the receive-leg claim — nothing sent (used by the reveal backstop in dry mode). */
 const DRY_RECEIVE_CLAIM = 'dry-receive-claim-not-sent'
 /** DRY sentinel for the responder BSV refund — a NON-txid string so runWatchtower's isRealRefundTxid gate treats it
@@ -46,6 +47,8 @@ export interface BsvWatchtowerOpts {
   bsvConfirmations?: (txid: string) => Promise<number>
   
   bsvFinality?: (txid: string, minimumConfirmations: number) => Promise<boolean>
+  
+  bsvClaimProof?: (txid: string) => Promise<BsvClaimProof | undefined>
   /** Best-effort BSV reveal detection — default is the built-in lock-spender scan (needs resolveSpender+fetchTx). */
   checkReveal?: (rec: SettlementRecord) => Promise<string | null>
   /** BSV discovery for the post-refund REVEAL backstop: which txid spent the lock outpoint, and fetch it to extract
@@ -55,7 +58,6 @@ export interface BsvWatchtowerOpts {
   
   evm?: RecoveryClaimEvm
 }
-
 /**
  * The MINIMAL EVM surface an in-process recovery needs, PER ROLE: `claim` for the RESPONDER claim-backstop (doc 25
  * E4 — recovers the USDC receive leg after a counterparty reveal wins the post-refund race), `refund` for the
@@ -226,6 +228,7 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
         ? opts.bsvFinality(claimTxid, DEFAULT_BSV_FINALITY_CONFIRMATIONS)
         : false
     },
+    claimMinedProof: opts.bsvClaimProof ? async (_rec, claimTxid) => opts.bsvClaimProof!(claimTxid) : undefined,
     minimumClaimConfs: DEFAULT_BSV_FINALITY_CONFIRMATIONS,
 
     checkReveal: opts.checkReveal ?? (async (rec: SettlementRecord): Promise<string | null> => {

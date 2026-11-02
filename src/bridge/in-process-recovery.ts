@@ -8,6 +8,7 @@ import type { Erc20SwapEvmClient } from './evm/client'
 import { watchtowerRecordKey } from './watchtower-record-identity'
 import { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
 import type { BsvHeightPurpose } from '../wallet/bsv-height'
+import { proveBsvClaim } from './bsv-claim-proof'
 export { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
 export interface RecoveryBsvRails {
   chainHeight: () => Promise<number>
@@ -42,21 +43,10 @@ async function finalityHeight(rails: RecoveryBsvRails): Promise<number> {
 export function makeValidatedBsvFinality(rails: RecoveryBsvRails): ((txid: string, minimumConfirmations: number) => Promise<boolean>) | undefined {
   if (!rails.chainTracker || !rails.fetchBeef) return undefined
   return async (txid: string, minimumConfirmations: number): Promise<boolean> => {
-    const proved = await rails.fetchBeef!(txid)
-    if (!proved || proved.id('hex').toLowerCase() !== txid.toLowerCase() || !proved.merklePath) return false
-    try {
-      if (!await proved.merklePath.verify(txid, rails.chainTracker!)) return false
-    } catch (e) {
-      // A discovery source can deliver a proof before the independent tracker has that block's header. Keep the
-      // recovery armed in that case; a caught-up tracker that throws remains fail-closed as before.
-      let trackerTip: number
-      try { trackerTip = await rails.chainTracker!.currentHeight() }
-      catch { return false }
-      if (trackerTip < proved.merklePath.blockHeight) return false
-      throw e
-    }
+    const proved = await proveBsvClaim(txid, { fetchBeef: rails.fetchBeef!, chainTracker: rails.chainTracker! })
+    if (!proved) return false
     const tip = await finalityHeight(rails)
-    const confirmations = tip - proved.merklePath.blockHeight + 1
+    const confirmations = tip - proved.height + 1
     return Number.isSafeInteger(confirmations) && confirmations >= minimumConfirmations
   }
 }
@@ -84,6 +74,9 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
     broadcastBsv: (rawHex, beefHex) => bsvRails.broadcast(rawHex, beefHex),
     bsvConfirmations: (txid) => bsvRails.txConfirmations(txid),
     bsvFinality: makeValidatedBsvFinality(bsvRails),
+    bsvClaimProof: bsvRails.chainTracker && bsvRails.fetchBeef
+      ? (txid) => proveBsvClaim(txid, { fetchBeef: bsvRails.fetchBeef!, chainTracker: bsvRails.chainTracker! })
+      : undefined,
     resolveSpender: (txid, vout) => bsvRails.resolveSpender(txid, vout),
     fetchTx: (txid) => bsvRails.fetchTx(txid),
     beforeSend: opts.beforeSend,

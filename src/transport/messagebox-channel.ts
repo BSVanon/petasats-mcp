@@ -57,6 +57,8 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
   const now = opts.now ?? (() => Date.now())
   const log = opts.log ?? (() => {})
+  let consecutiveListFailures = 0
+  let lastPollError: string | undefined
 
   // Pinned peer identity (lowercased). undefined ⇒ capture from the first authenticated inbound.
   let peer: string | undefined
@@ -90,7 +92,20 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
    */
   const takeOne = async <T>(kind: string, validate?: (value: unknown) => value is T): Promise<T | null> => {
     const box = boxFor(kind)
-    const msgs: PeerMessage[] = await comms.listMessages({ messageBox: box })
+    let msgs: PeerMessage[]
+    try {
+      msgs = await comms.listMessages({ messageBox: box })
+      consecutiveListFailures = 0
+      lastPollError = undefined
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      lastPollError = message
+      consecutiveListFailures++
+      if (consecutiveListFailures === 1 || consecutiveListFailures % 30 === 0) {
+        log('mb', `list failed for ${kind} (${consecutiveListFailures} consecutive): ${message}`)
+      }
+      return null
+    }
     const foreignMessageIds: string[] = []
     const peerMessages: PeerMessage[] = []
     for (const m of msgs) {
@@ -119,7 +134,11 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
       // Accepted (authenticated peer). Ack/drop oversized bodies so one peer
       // cannot pin this namespace's poll forever. Base64 is checked before
       // decoding so JSON.parse never sees an unbounded attacker body.
-      await comms.acknowledgeMessage({ messageIds: [m.messageId] })
+      try {
+        await comms.acknowledgeMessage({ messageIds: [m.messageId] })
+      } catch (e) {
+        log('mb', `failed to acknowledge peer ${kind} message: ${e instanceof Error ? e.message : String(e)}`)
+      }
       if (Buffer.byteLength(m.body, 'utf8') > maxBodyBytes) {
         log('mb', `drop ${kind}: oversized peer body`)
         continue
@@ -152,7 +171,8 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
       const got = await takeOne<T>(kind, validate)
       if (got !== null) return got
       if (now() - start > timeoutMs || ++polls > maxPolls) {
-        throw new Error(`messagebox-channel: timed out waiting for '${kind}' (${timeoutMs}ms / ${maxPolls} polls)`)
+        const detail = lastPollError === undefined ? '' : `; last poll error: ${lastPollError.slice(0, 200)}`
+        throw new Error(`messagebox-channel: timed out waiting for '${kind}' (${timeoutMs}ms / ${maxPolls} polls)${detail}`)
       }
       await sleep(pollMs)
     }

@@ -35,6 +35,7 @@ export interface MessageBoxRequestReplyRequesterOpts<Request, Reply> {
   now?: () => number
   onRequestSent?: (swapId: string) => void
   onReplyReceived?: (swapId: string, reply: Reply) => void
+  onPollError?: (error: unknown) => void
 }
 
 /** Build a requester which only accepts an authenticated reply from its configured peer. */
@@ -58,12 +59,24 @@ export function makeMessageBoxRequestReplyRequester<Request, Reply>(opts: Messag
     const responseBox = `${opts.boxPrefix}:res:${swapId}`
     const start = now()
     for (;;) {
-      const messages: PeerMessage[] = await opts.comms.listMessages({ messageBox: responseBox })
+      let messages: PeerMessage[]
+      try {
+        messages = await opts.comms.listMessages({ messageBox: responseBox })
+      } catch (error) {
+        opts.onPollError?.(error)
+        if (now() - start > timeoutMs) throw opts.timeoutError(swapId, timeoutMs)
+        await sleep(pollMs)
+        continue
+      }
       const reply = messages.find((message) => (message.sender ?? '').toLowerCase() === peer)
       if (reply) {
         // Acknowledge the selected authenticated reply before decoding it.  This
         // intentionally preserves the existing fail-closed malformed-reply path.
-        await opts.comms.acknowledgeMessage({ messageIds: [reply.messageId] })
+        try {
+          await opts.comms.acknowledgeMessage({ messageIds: [reply.messageId] })
+        } catch (error) {
+          opts.onPollError?.(error)
+        }
         let decoded: Reply
         try {
           decoded = opts.decodeReply(reply.body)

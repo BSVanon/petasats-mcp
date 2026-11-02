@@ -1,4 +1,5 @@
-import { SettlementSession, type CompetingResolution, type SettlementRecord, type SettlementState, type SwapRole } from './settlement-session'
+import { SettlementSession, validateSettlementRecord, type CompetingResolution, type SettlementRecord, type SettlementState, type SwapRole } from './settlement-session'
+import type { BsvClaimProof } from './bsv-claim-proof'
 export type WatchAction =
   | 'idle' // nothing locked yet
   | 'wait' // locked, refund timelock not yet matured (heartbeat)
@@ -233,6 +234,8 @@ export interface WatchtowerDeps {
   claimArtifactTxid?: (rec: SettlementRecord) => Promise<string>
   /** Reorg-safe BSV Merkle/depth proof for the already-bound claim artifact. */
   claimFinality?: (rec: SettlementRecord, claimTxid: string, confirmations: number) => Promise<boolean>
+  /** Evidence-only header proof collected before the existing burial target is reached. */
+  claimMinedProof?: (rec: SettlementRecord, claimTxid: string) => Promise<BsvClaimProof | undefined>
   /** Non-lowerable BSV claim burial floor (default six). */
   minimumClaimConfs?: number
   /** Three-way finalized event outcome for the narrow mined-revert/already-resolved convergence path. */
@@ -488,6 +491,25 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
         if (!validNonNegInt(claimConfs)) {
           emit('wait', `malformed claim confirmation count (${claimConfs}) — treating as a read failure, will retry`, { gate: decision.gate })
           await maybeSleep(); continue
+        }
+        if (claimConfs > 0 && claimConfs < claimTarget && deps.claimMinedProof) {
+          try {
+            const proof = await deps.claimMinedProof(rec, artifactTxid)
+            if (proof && typeof proof.root === 'string' &&
+                (rec.bsvClaimProvenHeight !== proof.height || rec.bsvClaimProvenRoot !== proof.root)) {
+              const candidate = { ...session.toRecord(), bsvClaimProvenHeight: proof.height, bsvClaimProvenRoot: proof.root }
+              try {
+                validateSettlementRecord(candidate)
+                await deps.persist(candidate)
+                session.recordBsvClaimProof(proof.height, proof.root)
+              } catch (e) {
+                // Evidence is advisory to recovery, but a failed durable write must be audible.
+                emit('wait', `BSV claim ${artifactTxid} proof evidence could not be persisted (will retry): ${msg(e)}`, { gate: decision.gate, confirmations: claimConfs })
+              }
+            }
+          } catch {
+            // Doubtful proof is deliberately non-destructive: keep any prior evidence and retry later.
+          }
         }
         if (claimConfs >= claimTarget) {
           if (!deps.claimFinality) {

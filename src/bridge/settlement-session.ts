@@ -141,6 +141,9 @@ export interface SettlementRecord extends SettlementParams {
   /** BR-H3: the initiator's already-broadcast BSV claim txid. The raw transaction is persisted below so a
    *  restarted watcher can submit the exact same spend again after a mempool eviction. */
   bsvClaimTxid?: string
+  /** Header-validated mined-claim evidence for monitoring only; never a recovery decision input. */
+  bsvClaimProvenHeight?: number
+  bsvClaimProvenRoot?: string
   /** BR-H3: the bare claim transaction. This is the fallback for rails that do not accept Atomic BEEF. */
   bsvClaimTxHex?: string
   /** BR-H3: the self-contained Atomic BEEF originally submitted to the SPV rail (preferred on re-broadcast). */
@@ -352,6 +355,12 @@ export function validateSettlementRecord(rec: SettlementRecord): void {
     throw new Error('SettlementRecord: bsvRefundTxHex must be non-empty byte-aligned hex when set')
   }
   validateOptionalClaimArtifactHex(rec)
+  const proofPresent = rec.bsvClaimProvenHeight !== undefined || rec.bsvClaimProvenRoot !== undefined
+  if (proofPresent && (rec.role !== 'initiator' || !rec.bsvClaimTxid ||
+      !Number.isSafeInteger(rec.bsvClaimProvenHeight) || rec.bsvClaimProvenHeight! <= 0 ||
+      typeof rec.bsvClaimProvenRoot !== 'string' || !/^[0-9a-f]{64}$/.test(rec.bsvClaimProvenRoot))) {
+    throw new Error('SettlementRecord: BSV claim proof requires an initiator bsvClaimTxid, positive height, and lowercase 32-byte root')
+  }
   for (const [name, value] of [
     ['claimConfirmationTarget', rec.claimConfirmationTarget],
     ['refundConfirmationTarget', rec.refundConfirmationTarget],
@@ -406,6 +415,12 @@ export class SettlementSession {
 
   toRecord(): SettlementRecord {
     return { ...this.rec, history: [...this.rec.history] }
+  }
+
+  /** Evidence-only metadata. It intentionally does not alter the settlement state or any watch decision. */
+  recordBsvClaimProof(height: number, root: string): void {
+    this.rec.bsvClaimProvenHeight = height
+    this.rec.bsvClaimProvenRoot = root
   }
 
   get state(): SettlementState {
