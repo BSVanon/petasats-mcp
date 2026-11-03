@@ -7,7 +7,7 @@ import { assertTokenAllowedAndDecimals } from './evm/token-allowlist'
 import { preimageHashOf, type Erc20SwapParams } from './evm/erc20swap'
 import type { BridgeIntent, BridgeQuote } from './settlement-types'
 import { assertLockSafeForZeroConf, assertLockSafeForZeroConfMultiArc, watchRevealThroughClaim, watchRevealThroughClaimMultiArc, coverageLabel, type FetchTxStatus, type FetchArcStatuses } from './mainnet-zeroconf'
-import { ARC_PROVIDERS, classifyArcStatus, classifyMultiArc, watchLockThroughClaim } from './zeroconf-monitor'
+import { ARC_PROVIDERS, CLAIM_WATCH_RESEND_MS, classifyArcStatus, classifyMultiArc, DEFAULT_CLAIM_WATCH_MAX_BLOCKS, watchLockThroughClaim } from './zeroconf-monitor'
 import { DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
 import { makePreRevealHeightRead } from './pre-reveal-height'
 /** The concrete swap the initiator runs: deliver an allowlisted ERC-20, receive BSV. */
@@ -748,6 +748,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           }
         }
         const claimRawHex = claimTx.toHex()
+        let claimAtomicBeefHex: string | undefined
         let bsvClaimTxid: string | undefined
         // Keep an immutable pre-reveal gate subject. The live session becomes `revealed` at the write-ahead point
         // before the first broadcast, but every later retry must still re-evaluate the height margin.
@@ -765,7 +766,6 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           await freshDsRecheckBeforeBroadcast() // OUTSIDE the try: a DS/visibility-loss throw ABORTS, never a retryable broadcast error
           let revealIntentFailure = false
           try {
-            let atomicBeefHex: string | undefined
             if (useZeroConfFastPath) {
               // LEVER B #3/#2: the 0-conf lock is UNMINED — no merkle proof exists (fetchBeef is mined-only → 404).
               // Attach the already-verified lock (its vout-0 script+sats checked above) as the claim input's ancestor.
@@ -773,12 +773,12 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
               // `claimTx.toAtomicBEEF()` here emits a COMPLETE chain — claim → lock(unmined) → parents(merkle-proven) —
               // that the SPV node accepts (the proven parents anchor the ancestry; only the lock tx itself is unconfirmed).
               if (htlcInIdx >= 0) claimTx.inputs[htlcInIdx].sourceTransaction = lockTx
-              atomicBeefHex = Utils.toHex(claimTx.toAtomicBEEF())
+              claimAtomicBeefHex = Utils.toHex(claimTx.toAtomicBEEF())
             } else if (bsv.fetchBeef) {
               const lockWithProof = await bsv.fetchBeef(bsvLocked.bsvLockTxid)
               if (!lockWithProof || lockWithProof.id('hex') !== bsvLocked.bsvLockTxid) throw new Error(`lock merkle proof (BEEF) not yet servable for ${bsvLocked.bsvLockTxid}`)
               if (htlcInIdx >= 0) claimTx.inputs[htlcInIdx].sourceTransaction = lockWithProof
-              atomicBeefHex = Utils.toHex(claimTx.toAtomicBEEF())
+              claimAtomicBeefHex = Utils.toHex(claimTx.toAtomicBEEF())
             }
             // The signer decision is deliberately taken at the write-ahead boundary, not at entry to this retry
             // loop.  /beef indexing is routinely transient; if it never becomes available, no irreversible choice
@@ -799,10 +799,10 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             // state are durable before bytes leave this process. A crash or ambiguous broadcaster response can only
             // resume the BSV-claim path; it can never resurrect the Base-refund path.
             if (session.state !== 'revealed') session.observeReveal(Utils.toHex(secret), now())
-            session.recordClaimBroadcast(claimTxid, claimRawHex, atomicBeefHex, claimConfs)
+            session.recordClaimBroadcast(claimTxid, claimRawHex, claimAtomicBeefHex, claimConfs)
             deps.persist?.(session.toRecord())
             durableClaimTxid = claimTxid
-            const submittedTxid = await bsv.broadcast(claimRawHex, atomicBeefHex) // ladder: raw + BEEF → Anvil→ARC→WoC→Bitails
+            const submittedTxid = await bsv.broadcast(claimRawHex, claimAtomicBeefHex) // ladder: raw + BEEF → Anvil→ARC→WoC→Bitails
             // Production broadcasters return the deterministic raw-tx id. Retain the returned identity for legacy
             // injected rails/tests; durable recovery always derives and validates identity from the persisted bytes.
             bsvClaimTxid = submittedTxid
@@ -832,7 +832,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // or resurface a Base refund. The confirmed path skips this (its lock was already ≥1-conf + merkle-proven).
         if (useZeroConfFastPath && deps.zeroConfStatus) {
           try {
-            const claimMaxBlocks = cfg.zeroConfClaimMaxBlocks ?? 3
+            const claimMaxBlocks = cfg.zeroConfClaimMaxBlocks ?? DEFAULT_CLAIM_WATCH_MAX_BLOCKS
             const watchOpts = {
               // Block-cadence (BSVanon 2026-09-09): give up only after the chain advances `maxBlocks` REAL blocks; the
               // maxPolls cap is the absolute failsafe (stalled chain), NOT the give-up — so a slow BSV block extends
@@ -840,6 +840,11 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
               maxPolls: cfg.zeroConfClaimMaxPolls ?? 4320, sleepMs: cfg.zeroConfSleepMs ?? 5_000, sleep,
               chainHeight: recoveryHeight, maxBlocks: claimMaxBlocks,
               onPoll: ({ blocksElapsed }: { poll: number; blocksElapsed: number }) => { if (blocksElapsed > 0) log('bsv', `0-conf claim-watch: ${blocksElapsed}/${claimMaxBlocks} new block(s) elapsed, claim ${bsvClaimTxid.slice(0, 12)}… not yet buried…`) },
+              resendEveryMs: CLAIM_WATCH_RESEND_MS,
+              onResend: async ({ blocksElapsed, reason }: { poll: number; blocksElapsed: number; reason: 'new-block' | 'interval' }) => {
+                log('bsv', `0-conf claim-watch: re-broadcasting claim ${bsvClaimTxid.slice(0, 12)}… ${reason === 'new-block' ? `after ${blocksElapsed} new block(s)` : `(4-minute re-send, ${blocksElapsed} new block(s) so far)`}`)
+                await bsv.broadcast(claimRawHex, claimAtomicBeefHex)
+              },
             }
             // CRITICAL (2026-09-10 red-team): the post-reveal §12.12 lock-DS watch must ALSO use the minArc≥2 quorum, not
             // a single vantage — else the whole post-reveal loss-detection window trusts Anvil alone (the exact blind spot).
@@ -869,7 +874,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           // as the 0-conf path, via the shared watchLockThroughClaim primitive. The lock is already mined+proven (B#1) so
           // lockStatus is a no-op 'accepted' (no funding-DS watch). A valid claim proof ⇒ buried; a proof that FAILS
           // verification THROWS (fail-closed, record kept); `zeroConfClaimMaxPolls` is only the absolute failsafe cap.
-          const claimMaxBlocks = cfg.zeroConfClaimMaxBlocks ?? 3
+          const claimMaxBlocks = cfg.zeroConfClaimMaxBlocks ?? DEFAULT_CLAIM_WATCH_MAX_BLOCKS
           const proveClaimByMerkle = !!deps.chainTracker && typeof bsv.fetchBeef === 'function'
           const claimBuriedCheck = async (): Promise<boolean> => {
             if (proveClaimByMerkle) {
@@ -891,6 +896,11 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
                 maxPolls: cfg.zeroConfClaimMaxPolls ?? 4320, sleepMs: cfg.zeroConfSleepMs ?? 5_000, sleep,
                 chainHeight: recoveryHeight, maxBlocks: claimMaxBlocks,
                 onPoll: ({ blocksElapsed }) => log('bsv', `confirmed-path: awaiting claim ${bsvClaimTxid.slice(0, 12)}… ${proveClaimByMerkle ? 'merkle proof' : 'burial'} (${blocksElapsed}/${claimMaxBlocks} new block(s))…`),
+                resendEveryMs: CLAIM_WATCH_RESEND_MS,
+                onResend: async ({ blocksElapsed, reason }) => {
+                  log('bsv', `confirmed-path: re-broadcasting claim ${bsvClaimTxid.slice(0, 12)}… ${reason === 'new-block' ? `after ${blocksElapsed} new block(s)` : `(4-minute re-send, ${blocksElapsed} new block(s) so far)`}`)
+                  await bsv.broadcast(claimRawHex, claimAtomicBeefHex)
+                },
               },
             )
           } catch (e) {

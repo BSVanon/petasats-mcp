@@ -19,6 +19,10 @@
 
 export type ZeroConfVerdict = 'accepted' | 'double-spend' | 'unknown'
 
+/** Default post-reveal claim-watch budget, measured in new BSV blocks. */
+export const DEFAULT_CLAIM_WATCH_MAX_BLOCKS = 12
+
+export const CLAIM_WATCH_RESEND_MS = 240_000
 /** Map an ARC/Anvil tx-status string to a 0-conf verdict. Fail-closed: anything unclear → 'unknown'. */
 export function classifyTxStatus(status: string | undefined): ZeroConfVerdict {
   const s = (status ?? '').toUpperCase()
@@ -127,7 +131,7 @@ export interface WatchThroughClaimOpts {
    * Omit ⇒ legacy wall-clock poll-count behaviour (unchanged; kept for the pure primitive tests + non-mainnet rails).
    */
   chainHeight?: () => Promise<number>
-  /** New-block budget for block-cadence mode (integer ≥ 1, default 3). Ignored without `chainHeight`. */
+  /** New-block budget for block-cadence mode (integer ≥ 1, default 12). Ignored without `chainHeight`. */
   maxBlocks?: number
   /** Consecutive bad `chainHeight` reads tolerated in block-cadence mode (integer ≥ 0, default 60). D2 showed that
    * a single Anvil height-read blip must not abandon a post-reveal claim; bad reads never count as block progress and
@@ -135,6 +139,14 @@ export interface WatchThroughClaimOpts {
   maxHeightFailures?: number
   /** Optional per-poll progress hook (poll index + new blocks elapsed since watch start) — for operator logging. */
   onPoll?: (info: { poll: number; blocksElapsed: number }) => void
+  /** Optional best-effort re-send while the post-reveal watch waits: once per newly measured block and, with
+   *  `resendEveryMs`, also whenever that much time has elapsed since the last re-send (height-read failures included).
+   *  A throw or rejection is logged and never ends or changes the watch. */
+  onResend?: (info: { poll: number; blocksElapsed: number; reason: 'new-block' | 'interval' }) => void | Promise<void>
+  /** Elapsed milliseconds between interval re-sends (finite, > 0). Omit ⇒ re-send on new blocks only. */
+  resendEveryMs?: number
+  /** Injectable clock for the interval re-send (tests). Default Date.now. */
+  now?: () => number
 }
 
 /**
@@ -162,10 +174,12 @@ export async function watchLockThroughClaim(
   const sleep = opts.sleep ?? realSleep
   const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
   const useBlocks = typeof opts.chainHeight === 'function'
-  const maxBlocks = opts.maxBlocks ?? 3
+  const maxBlocks = opts.maxBlocks ?? DEFAULT_CLAIM_WATCH_MAX_BLOCKS
   if (useBlocks && (!Number.isInteger(maxBlocks) || maxBlocks < 1)) throw new Error('watchLockThroughClaim: maxBlocks must be an integer ≥ 1')
   const maxHeightFailures = opts.maxHeightFailures ?? 60
   if (useBlocks && (!Number.isInteger(maxHeightFailures) || maxHeightFailures < 0)) throw new Error('watchLockThroughClaim: maxHeightFailures must be an integer ≥ 0')
+  if (opts.resendEveryMs !== undefined && (!Number.isFinite(opts.resendEveryMs) || opts.resendEveryMs <= 0)) throw new Error('watchLockThroughClaim: resendEveryMs must be a finite number > 0')
+  const now = opts.now ?? Date.now
   // BLOCK-CADENCE (BSVanon's fix): anchor the give-up budget to CHAIN PROGRESS, not wall-clock — the budget is measured
   // in NEW blocks since the FIRST unburied poll, so a slow-but-normal block extends the wait instead of false-failing an
   // honest claim. review 099868d1: (MEDIUM) the height rail is consulted ONLY AFTER an unburied claim result — never
@@ -177,6 +191,19 @@ export async function watchLockThroughClaim(
   let startHeight: number | undefined
   let lastHeight = -1
   let blocksElapsed = 0
+  let lastHookBlocksElapsed = 0
+  let lastResendAt = now() // the caller broadcast the claim just before the watch started
+  const resend = async (poll: number, newBlock: boolean): Promise<void> => {
+    const at = now()
+    const intervalDue = opts.resendEveryMs !== undefined && at - lastResendAt >= opts.resendEveryMs
+    if (!newBlock && !intervalDue) return
+    lastResendAt = at
+    try {
+      await opts.onResend?.({ poll, blocksElapsed, reason: newBlock ? 'new-block' : 'interval' })
+    } catch (e) {
+      console.error(`0-conf claim-watch: re-send hook failed (continuing watch) — ${msg(e)}`)
+    }
+  }
   let consecutiveHeightFailures = 0
   const readValidHeight = async (): Promise<{ height?: number; failure?: string }> => {
     let h: number
@@ -212,6 +239,7 @@ export async function watchLockThroughClaim(
           throw new Error(`${heightRead.failure} after ${consecutiveHeightFailures} consecutive bad read(s)`)
         }
         opts.onPoll?.({ poll: i, blocksElapsed })
+        await resend(i, false)
         if (i < opts.maxPolls - 1) await sleep(opts.sleepMs)
         continue
       }
@@ -220,11 +248,15 @@ export async function watchLockThroughClaim(
       if (startHeight === undefined) startHeight = h // anchor the budget on the FIRST unburied poll
       blocksElapsed = h - startHeight // ≥ 0: readValidHeight rejects any regression below the anchor
       opts.onPoll?.({ poll: i, blocksElapsed })
+      const newBlock = blocksElapsed > lastHookBlocksElapsed
+      if (newBlock) lastHookBlocksElapsed = blocksElapsed
+      await resend(i, newBlock)
       if (blocksElapsed >= maxBlocks) {
         throw new Error(`0-conf claim-watch: initiator BSV claim did not bury within ${maxBlocks} new block(s) (fail-closed) — do NOT declare complete`)
       }
     } else {
       opts.onPoll?.({ poll: i, blocksElapsed: 0 })
+      await resend(i, false)
     }
     if (i < opts.maxPolls - 1) await sleep(opts.sleepMs)
   }
