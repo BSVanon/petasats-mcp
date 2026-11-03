@@ -13,11 +13,11 @@ PetaSats supports USDC on Base to BSV only. Keys are made and kept on your machi
 3. The kit verifies the lock against a merkle proof and block headers, then claims BSV and reveals the secret.
 4. The market maker uses that secret to claim USDC.
 
-Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a shared daily total also applies. They usually take 15 to 25 minutes.
+Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a shared daily total also applies. They usually take about an hour.
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.9` is recommended.
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.10` is recommended.
 
 ```sh
 claude mcp add petasats -- npx -y petasats-mcp

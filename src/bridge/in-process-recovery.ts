@@ -10,9 +10,10 @@ import { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
 import type { BsvHeightPurpose } from '../wallet/bsv-height'
 import { proveBsvClaim } from './bsv-claim-proof'
 export { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
-const emitInitiatorWatchtowerProgress = (s: WatchtowerStatus): void => console.error(
-  `  [wt] ${s.action} · ${s.note}${s.gate ? ` (${s.gate.chain} gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`,
-)
+/** The initiator watchtower's progress line; the default emitter writes it unchanged to stderr. */
+export const formatInitiatorWatchtowerProgress = (s: WatchtowerStatus): string =>
+  `  [wt] ${s.action} · ${s.note}${s.gate ? ` (${s.gate.chain} gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`
+const emitInitiatorWatchtowerProgress = (s: WatchtowerStatus): void => console.error(formatInitiatorWatchtowerProgress(s))
 
 export interface RecoveryBsvRails {
   chainHeight: () => Promise<number>
@@ -66,6 +67,7 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
   bsvRails: RecoveryBsvRails
   beforeSend?: () => void | Promise<void>
   strictPersistedRecordTrust?: boolean
+  emitProgress?: (s: WatchtowerStatus) => void
 }): WatchtowerDeps {
   const { bsvRails } = opts
   return makeBsvWatchtowerDeps(session, {
@@ -85,7 +87,7 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
     fetchTx: (txid) => bsvRails.fetchTx(txid),
     beforeSend: opts.beforeSend,
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
-    emit: emitInitiatorWatchtowerProgress,
+    emit: opts.emitProgress ?? emitInitiatorWatchtowerProgress,
   })
 }
 
@@ -310,6 +312,8 @@ export function makeRecoverySupervisor(base: Omit<SuperviseRecoveryOpts, 'sessio
 
 export interface SuperviseInitiatorRecoveryOpts {
   session: SettlementSession
+  /** Watchtower progress lines; absent, each is written unchanged to stderr (formatInitiatorWatchtowerProgress). */
+  emitProgress?: (s: WatchtowerStatus) => void
   /** The record's persistence file (the restock-store path) — the watchtower writes the refund txid + terminal state here. */
   recordPath: string
   /** Keyless-safe EVM reads (current block / tx confirmations / canonical isSwapLocked state) driving the height-gated
@@ -411,6 +415,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
       bsvRails: opts.bsvRails,
       beforeSend: opts.beforeSend,
       strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
+      emitProgress: opts.emitProgress,
     })
     const persist = deps.persist
     deps.persist = async (record): Promise<void> => {
@@ -469,7 +474,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
     assertInitiatorRefundSafe: (record) => assertInitiatorRefundSafeOnBsv(record, opts.bsvRails),
     onInitiatorRefundSafetyResult: opts.onRefundSafetyResult,
-    emit: emitInitiatorWatchtowerProgress,
+    emit: opts.emitProgress ?? emitInitiatorWatchtowerProgress,
   })
   const persist = deps.persist
   deps.persist = async (record): Promise<void> => {

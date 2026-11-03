@@ -231,7 +231,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     // Background lifecycle failures are represented durably by `run`; this final catch is only a belt-and-suspenders
     // guard against an unexpected implementation bug and must never become an unhandled rejection.
     void run(record).catch((error) => log(`background swap ${record.swapId} escaped lifecycle handling: ${error instanceof Error ? error.message : String(error)}`))
-    return { swapId: record.swapId, stage: 'quoted', expectedMinutes: 20 }
+    return { swapId: record.swapId, stage: 'quoted', expectedMinutes: 60 }
   }
 
   return {

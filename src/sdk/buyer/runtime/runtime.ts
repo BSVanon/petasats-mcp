@@ -18,6 +18,7 @@ import { acquireBuyerHomeLock } from './home-lock'
 import { readBuyerLimits } from '../limits'
 import { readSpendingStop, stopSpending } from '../stop'
 import { makeBuyerWithdrawalIntents } from '../withdrawal-intent'
+import { makeThrottledLog } from './log-throttle'
 
 export interface BuyerRuntime {
   kit: BuyerKit
@@ -51,6 +52,9 @@ const standardFactories: BuyerRuntimeFactories = {
   makeBuyerEvmRails, makeBuyerBsvRails, makeBuyerEngine, buildSweepTx,
 }
 
+export const makeRuntimeLog = (log?: (message: string) => void): ((message: string) => void) =>
+  log ?? makeThrottledLog((message: string) => console.error(`buyer-runtime: ${message}`))
+
 function assertReady(paths: BuyerHome): void {
   if (!existsSync(paths.home) || !existsSync(paths.keysPath) || !existsSync(paths.configPath)) {
     throw new Error('buyer home is not initialised; run `petasats-mcp init` first')
@@ -81,7 +85,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
   assertConfig(config)
   const keys = readBuyerKeys(paths)
   const f = { ...standardFactories, ...options.factories }
-  const log = options.log ?? ((message: string) => console.error(`buyer-runtime: ${message}`))
+  const log = makeRuntimeLog(options.log)
   const identity = f.makeIdentityOnlyWallet(PrivateKey.fromWif(keys.identityWif))
   const comms = f.makeAnvilMessageBoxComms({ wallet: identity, host: config.anvilHost })
   const door = f.makeMessageBoxDoorClient({ comms, doorIdentity: config.doorIdentity })

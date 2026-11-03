@@ -20,7 +20,7 @@ STEPS
 2. get_quote. It shows the exact BSV for an exact USDC amount, the rate and the costs. A quote lasts about 60 seconds.
 3. If a person is directing you, show them the quote and get a clear yes. This is the only time to ask. If they already gave you an amount and a limit, that is the yes.
 4. swap_asset_to_bsv with quote_id (or min_bsv_out). If the quote has expired, the kit gets a new one and goes ahead only if it pays at least min_bsv_out, or 99% of the old quote.
-5. wait_for_swap until done is true (each call waits up to about 50 seconds). A swap usually takes 15 to 25 minutes, mostly waiting for one BSV block.
+5. wait_for_swap until done is true (each call waits up to about 50 seconds). A swap usually takes about an hour: the market maker waits for the Base lock to be final, then the BSV claim and the delivery each wait for a BSV block.
 6. Results: delivered or settled = BSV received; refunded = the USDC came back to the kit; failed = nothing was locked.
 
 REPORTING

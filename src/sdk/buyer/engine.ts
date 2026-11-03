@@ -1,7 +1,7 @@
 import { Transaction, type ChainTracker, type CommsLayer, type PublicKey } from '@bsv/sdk'
 import { makeBridgeInitiatorExecutor, type BridgeInitiatorBsvRails, type BridgeInitiatorEvmRails } from '../../bridge/initiator-executor'
 import { defaultInitiatorTimelocks } from '../../bridge/initiator-timelocks'
-import { makeInitiatorRecoverySupervisor, makeValidatedBsvFinality, type RecoveryBsvRails } from '../../bridge/in-process-recovery'
+import { formatInitiatorWatchtowerProgress, makeInitiatorRecoverySupervisor, makeValidatedBsvFinality, type RecoveryBsvRails } from '../../bridge/in-process-recovery'
 import type { RecoveryClaimEvm } from '../../bridge/watchtower-adapters'
 import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, hasPersistedBsvClaimArtifact } from '../../bridge/watchtower'
 import type { Erc20SwapEvmClient } from '../../bridge/evm/client'
@@ -104,6 +104,8 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     evmRefund: deps.evm,
     bsvRails: deps.bsv,
     log: deps.log,
+    // The kit's progress lines go through its own log, so the default sink can throttle the repeating wait lines.
+    emitProgress: (s) => deps.log(formatInitiatorWatchtowerProgress(s).trimStart()),
     clearRecord: (hashHex, expected) => {
       if (expected) mark(hashHex, expected.state)
       // Buyer terminal records are acknowledgement tombstones.  Do not discard the only durable result before the

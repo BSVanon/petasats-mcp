@@ -12,6 +12,13 @@ const stages: Record<string, { label: string; step: number | null }> = {
 }
 const bsv = (id?: string): string | undefined => id ? `https://whatsonchain.com/tx/${id}` : undefined
 const base = (id?: string): string | undefined => id ? `https://basescan.org/tx/${id}` : undefined
+const etaMinutes = (stage: string): number => {
+  if (['quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock'].includes(stage)) return 45
+  if (stage === 'claiming' || stage === 'claimed') return 20
+  if (stage === 'settled' || stage === 'sweeping') return 10
+  if (stage === 'delivered' || stage === 'refunded' || stage === 'failed') return 0
+  return 15
+}
 
 export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown> {
   const info = stages[record.stage] ?? { label: 'Older or unknown record', step: null }
@@ -30,7 +37,7 @@ export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown
     ...(record.bsvClaimPayoutSats === undefined ? {} : ['settled', 'sweeping', 'delivered'].includes(record.stage)
       ? { bsv_received: record.bsvClaimPayoutSats.toString() } : { bsv_claim_payout_sats: record.bsvClaimPayoutSats.toString() }),
     ...(record.stage === 'delivered' && record.sweepOutbox?.sats !== undefined ? { bsv_delivered_sats: record.sweepOutbox.sats } : {}),
-    deliver_to: record.deliverTo, eta_minutes: terminal ? 0 : 15, eta_note: 'BSV block times vary.', check_again_in_seconds: terminal ? null : 30,
+    deliver_to: record.deliverTo, eta_minutes: terminal ? 0 : etaMinutes(record.stage), eta_note: 'BSV block times vary.', check_again_in_seconds: terminal ? null : 30,
     deadlines: {
       claim_bsv_by: record.bsvRefundLocktime === undefined ? undefined : { bsv_block: record.bsvRefundLocktime - MIN_REVEAL_CONFIRM_BUDGET_BLOCKS },
       usdc_refund_after: record.baseTimelockBlock === undefined ? undefined : { base_block: record.baseTimelockBlock },
