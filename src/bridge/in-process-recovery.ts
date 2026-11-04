@@ -478,6 +478,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
   })
   const persist = deps.persist
   deps.persist = async (record): Promise<void> => {
+    if (opts.shouldContinue && !opts.shouldContinue()) return
     await persist(record)
     opts.onPersist?.(record)
   }

@@ -1,11 +1,12 @@
 import { PublicKey, Utils, type Transaction, type ChainTracker, type MerklePath } from '@bsv/sdk'
 import { isAddress } from 'viem'
 import { newHtlcSecret, type BsvHtlcUtxo } from '../settlement/htlc'
-import { SettlementSession, DEFAULT_COVENANT_FEE_BUDGET_SATS, type SettlementParams, type SettlementRecord, type ObservedBaseLock, type BsvHtlcKind } from './settlement-session'
+import { SettlementSession, DEFAULT_COVENANT_FEE_BUDGET_SATS, fastAtomicEligible, type SettlementParams, type SettlementRecord, type ObservedBaseLock, type BsvHtlcKind, type SettlementMode, type SettlementModeUsed } from './settlement-session'
+import { isPublicDoorQuoteId, publicSettlementModeAndCapAreConsistent } from './settlement-mode'
 import { buildBridgeCovenantClaimTx, sizeCovenantFeeBudgetSats, type BridgeCovenantTerms } from '../settlement/htlc/bridge-covenant'
 import { assertTokenAllowedAndDecimals } from './evm/token-allowlist'
 import { preimageHashOf, type Erc20SwapParams } from './evm/erc20swap'
-import type { BridgeIntent, BridgeQuote } from './settlement-types'
+import type { BridgeIntent, BridgeIntentV2, BridgeQuote, BridgeQuoteV2 } from './settlement-types'
 import { assertLockSafeForZeroConf, assertLockSafeForZeroConfMultiArc, watchRevealThroughClaim, watchRevealThroughClaimMultiArc, coverageLabel, type FetchTxStatus, type FetchArcStatuses } from './mainnet-zeroconf'
 import { ARC_PROVIDERS, CLAIM_WATCH_RESEND_MS, classifyArcStatus, classifyMultiArc, DEFAULT_CLAIM_WATCH_MAX_BLOCKS, watchLockThroughClaim } from './zeroconf-monitor'
 import { DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
@@ -32,6 +33,8 @@ export interface BridgeInitiatorResult {
    *  soon as the secret/hashlock is generated). Lets a signer-routed caller release that binding at completion
    *  (review 220d1ef7 MED). Absent only if the swap never got as far as generating a secret. */
   hashHex?: `0x${string}`
+  settlementModeUsed?: SettlementModeUsed
+  settlementModeDowngradeReason?: string
 }
 
 /** SentTx-shaped subset the initiator needs from `Erc20SwapEvmClient`. */
@@ -125,6 +128,11 @@ export interface BridgeInitiatorConfig {
    *  waits ≥1 conf + SPV-verifies (the current safe posture). Above 0 REQUIRES `deps.zeroConfStatus` (else construction
    *  throws). Raised deliberately only after the red-team blesses the 1/3/6 set (B#4). */
   zeroConfCapUsd?: number
+  /** Explicit public-door v2 terms. Missing preserves every legacy/restock caller. */
+  doorProtocolVersion?: 2
+  doorQuoteId?: string
+  agreedSettlementMode?: SettlementMode
+  fastCapUsdcBaseUnits?: string
   /** LEVER B #3 — the pre-reveal ARC double-spend watch (assertLockSafeForZeroConf): how many status polls / the gap
    *  between them. The lock must stay ARC-accepted with NO double-spend across the whole window. Defaults 4 polls / 5s. */
   zeroConfPolls?: number
@@ -219,6 +227,8 @@ export const ZEROCONF_HARD_CEILING_USD = 35
 
 /** Build the SettlementParams both sessions agree on (identical to the responder's — describes the swap). */
 function paramsFrom(intent: BridgeIntent, quote: BridgeQuote, decimals: number, cfg: BridgeInitiatorConfig, now: number): SettlementParams {
+  const v2Quote = quote as BridgeQuoteV2
+  const v2 = cfg.doorProtocolVersion === 2
   return {
     hashHex: intent.hashHex,
     amountUsdc: intent.usdcAmount,
@@ -239,13 +249,14 @@ function paramsFrom(intent: BridgeIntent, quote: BridgeQuote, decimals: number, 
     baseClaimAddress: quote.responderEvmAddr, // the responder claims USDC
     baseRefundAddress: intent.machineEvmAddr, // the initiator refunds USDC
     capUsdPerSwap: cfg.capUsdPerSwap ?? 50,
-    zeroConfCapUsd: cfg.zeroConfCapUsd ?? 0, // review 578efb16 LOW: default 0 (0-conf DISABLED) — the recorded cap must
+    zeroConfCapUsd: v2 ? (v2Quote.settlementMode === 'fast' ? Number(BigInt(v2Quote.fastCapUsdcBaseUnits)) / 1_000_000 : 0) : cfg.zeroConfCapUsd ?? 0, // review 578efb16 LOW: default 0 (0-conf DISABLED) — the recorded cap must
     // match the executor runtime (which also defaults 0), else a persisted record misreports the 0-conf posture.
     
     // then verifies the on-chain lock matches, so a lying quote fails-closed). No per-leg local-config divergence.
     htlcKind: quote.htlcKind,
     bsvClaimFeeBudgetSats: quote.bsvClaimFeeBudgetSats,
     bsvRefundFeeBudgetSats: quote.bsvRefundFeeBudgetSats,
+    ...(v2 ? { doorProtocolVersion: 2 as const, doorQuoteId: v2Quote.doorQuoteId, agreedSettlementMode: v2Quote.settlementMode, fastCapUsdcBaseUnits: v2Quote.fastCapUsdcBaseUnits } : {}),
   }
 }
 
@@ -327,10 +338,17 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
   if (cfg.lockTxFetchRetryMs !== undefined && !(Number.isSafeInteger(cfg.lockTxFetchRetryMs) && cfg.lockTxFetchRetryMs >= 1 && cfg.lockTxFetchRetryMs <= 60_000)) {
     throw new Error(`initiator-executor: lockTxFetchRetryMs must be an integer in [1, 60000] (got ${cfg.lockTxFetchRetryMs})`)
   }
+  if (cfg.doorProtocolVersion === 2) {
+    if (!isPublicDoorQuoteId(cfg.doorQuoteId) || !publicSettlementModeAndCapAreConsistent(cfg.agreedSettlementMode, cfg.fastCapUsdcBaseUnits)) {
+      throw new Error('initiator-executor: incomplete or contradictory public-door v2 settlement terms')
+    }
+  } else if (cfg.doorQuoteId !== undefined || cfg.agreedSettlementMode !== undefined || cfg.fastCapUsdcBaseUnits !== undefined) {
+    throw new Error('initiator-executor: v2 settlement terms require doorProtocolVersion=2')
+  }
   // LEVER B #3: enabling 0-conf (zeroConfCapUsd > 0) is a money-safety decision — the swap reveals against an
   // UNCONFIRMED lock, so it MUST have the ARC double-spend rail + sane watch knobs. Fail-closed at construction (never
   // discover a missing DS monitor on the first sub-cap swap, AFTER the USDC is locked).
-  const zeroConfCap = cfg.zeroConfCapUsd ?? 0
+  const zeroConfCap = cfg.doorProtocolVersion === 2 ? (cfg.agreedSettlementMode === 'fast' && cfg.fastCapUsdcBaseUnits ? Number(BigInt(cfg.fastCapUsdcBaseUnits)) / 1_000_000 : 0) : cfg.zeroConfCapUsd ?? 0
   if (!(Number.isFinite(zeroConfCap) && zeroConfCap >= 0)) throw new Error(`initiator-executor: zeroConfCapUsd must be a finite number ≥ 0 (got ${cfg.zeroConfCapUsd})`)
   if (zeroConfCap > ZEROCONF_HARD_CEILING_USD) throw new Error(`initiator-executor: zeroConfCapUsd=${zeroConfCap} exceeds the 0-conf hard ceiling $${ZEROCONF_HARD_CEILING_USD} — refusing (a fat-fingered cap must never enable 0-conf above the ceiling; keep it ≤ $${ZEROCONF_HARD_CEILING_USD})`)
   if (zeroConfCap > 0) {
@@ -364,6 +382,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
       // Set at the durable write-ahead point before the first BSV claim attempt. From then on the raw claim may have
       // escaped, so every failure result carries it and no caller can mistake an ambiguous attempt for a refund path.
       let durableClaimTxid: string | undefined
+      let liveSession: SettlementSession | undefined
       try {
         // 1. Allowlist + LIVE decimals cross-check on the token we're about to lock (fail-closed).
         const token = await assertTokenAllowedAndDecimals(cfg.baseChainId, spec.erc20TokenAddress, (a) => evm.tokenDecimals(a), true) // LEVER-B HIGH-1: bridge = $1-pegged only
@@ -378,7 +397,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // 3. On-chain timelock heights (block-native, both legs) from the negotiated deltas.
         const baseNow = Number(await evm.currentBlockNumber())
         const bsvNow = await bsv.chainHeight()
-        const intent: BridgeIntent = {
+        const legacyIntent: BridgeIntent = {
           hashHex,
           usdcAmount: spec.deliverAmount.toString(),
           bsvAmount: Number(spec.receiveBsvSats),
@@ -390,11 +409,25 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           usdcTokenAddress: spec.erc20TokenAddress,
           baseChainId: cfg.baseChainId,
         }
+        const intent: BridgeIntent | BridgeIntentV2 = cfg.doorProtocolVersion === 2 ? {
+          v: 2,
+          ...legacyIntent,
+          doorQuoteId: cfg.doorQuoteId!,
+          settlementMode: cfg.agreedSettlementMode!,
+          fastCapUsdcBaseUnits: cfg.fastCapUsdcBaseUnits!,
+        } : legacyIntent
 
         // 4. Publish the intent; receive the responder's bridge addresses; build the initiator session.
         await coord.sendIntent(intent)
         const quote = await coord.recvQuote()
         validateResponderQuote(quote)
+        if (cfg.doorProtocolVersion === 2) {
+          const q = quote as BridgeQuoteV2
+          if (q.v !== 2 || q.doorQuoteId !== cfg.doorQuoteId) throw new Error('v2 BridgeQuote did not echo the durable door quote id')
+          if (cfg.agreedSettlementMode === 'confirmed' && q.settlementMode === 'fast') throw new Error('v2 BridgeQuote attempted to upgrade confirmed settlement to fast')
+          if (q.settlementMode === 'fast' && (cfg.agreedSettlementMode !== 'fast' || q.fastCapUsdcBaseUnits !== cfg.fastCapUsdcBaseUnits)) throw new Error('v2 BridgeQuote fast mode/cap differs from durable admission')
+          if (q.settlementMode === 'confirmed' && q.fastCapUsdcBaseUnits !== '0') throw new Error('v2 confirmed BridgeQuote must echo cap 0')
+        }
         // COVENANT-ONLY (Step E): the taker refuses any non-covenant quote. The responder's BSV refund is MM-alone +
         // committed in-script (no 2-of-2 round-trip), so a legacy/undefined quote can never originate a swap here.
         if (quote.htlcKind !== 'covenant') throw new Error(`initiator-executor is COVENANT-ONLY — quote.htlcKind=${quote.htlcKind ?? 'legacy(default)'} refused (Step E)`)
@@ -419,6 +452,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           throw new Error(`quote bsvClaimFeeBudgetSats=${quoteClaimBudget} outside [${sizedClaimBudget}, ${maxClaimBudget}] (the taker's own sized claim fee … ${MAX_QUOTE_FEE_BUDGET_HEADROOM}× it) — refusing: a budget BELOW the floor starves the covenant claim (it may never confirm before T_bsv → both-leg loss); ABOVE the ceiling shrinks the FORCED payout to the taker (LEVER-B HIGH-2, symmetric bound)`)
         }
         const session = SettlementSession.create(paramsFrom(intent, quote, token.decimals, cfg, now()), 'initiator', now())
+        liveSession = session
         session.holdSecret(Utils.toHex(secret))
         const revealHeight = makePreRevealHeightRead({ read: () => bsv.chainHeight(), revealed: () => session.state === 'revealed', sleep, log: (m) => log('bsv', m) })
 
@@ -552,7 +586,9 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // (reveal against an UNCONFIRMED lock, gated by the ARC double-spend monitor); everything else waits ≥1 conf +
         // SPV-verifies (B#1). zeroConfCap=0 ⇒ ALWAYS the confirmed path — the current safe posture (0-conf DORMANT).
         const amountUsd = Number(spec.deliverAmount) / 10 ** token.decimals
-        const zeroConfEligible = zeroConfCap > 0 && Number.isFinite(amountUsd) && amountUsd > 0 && amountUsd <= zeroConfCap
+        const zeroConfEligible = cfg.doorProtocolVersion === 2
+          ? (quote as BridgeQuoteV2).settlementMode === 'fast' && fastAtomicEligible(spec.deliverAmount, (quote as BridgeQuoteV2).fastCapUsdcBaseUnits)
+          : zeroConfCap > 0 && Number.isFinite(amountUsd) && amountUsd > 0 && amountUsd <= zeroConfCap
         // This may switch to false when an otherwise-safe 0-conf gate cannot decide. Keep it separate from
         // eligibility: the latter is the amount policy, while this controls the path actually taken below.
         let useZeroConfFastPath = zeroConfEligible
@@ -600,10 +636,12 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             if (!proven) throw new Error(`LEVER B #1: no servable merkle proof for the responder's BSV lock ${bsvLocked.bsvLockTxid} after ${maxTries} tries — refusing to reveal (fail-closed)`)
           }
         }
+        let settlementModeDowngradeReason: string | undefined
         const fallBackToConfirmedPath = (reason: unknown): void => {
           const detail = reason instanceof Error ? reason.message : String(reason)
           log('bsv', `0-conf fallback: ${detail} — waiting for a confirmed BSV lock instead`)
           useZeroConfFastPath = false
+          settlementModeDowngradeReason = detail
         }
         if (useZeroConfFastPath) {
           // §12.11 pre-reveal gate: the lock must be ARC-ACCEPTED with NO double-spend across the whole watch. A
@@ -798,7 +836,10 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             // WRITE-AHEAD: the exact raw claim (and BEEF when available), its deterministic txid, and `revealed`
             // state are durable before bytes leave this process. A crash or ambiguous broadcaster response can only
             // resume the BSV-claim path; it can never resurrect the Base-refund path.
-            if (session.state !== 'revealed') session.observeReveal(Utils.toHex(secret), now())
+            if (session.state !== 'revealed') {
+              session.recordSettlementModeUsed(useZeroConfFastPath ? 'fast' : 'confirmed', settlementModeDowngradeReason)
+              session.observeReveal(Utils.toHex(secret), now())
+            }
             session.recordClaimBroadcast(claimTxid, claimRawHex, claimAtomicBeefHex, claimConfs)
             deps.persist?.(session.toRecord())
             durableClaimTxid = claimTxid
@@ -855,7 +896,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             log('bsv', `0-conf reveal WON — claim ${bsvClaimTxid.slice(0, 12)}… buried, no lock double-spend (coverage ${coverageLabel(cov)})`)
           } catch (e) {
             log('alert', `0-conf reveal UNDER ATTACK — s is public, claim ${bsvClaimTxid.slice(0, 12)}… did NOT cleanly bury: ${e instanceof Error ? e.message : String(e)}`)
-            return { ok: false, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, reason: `0-conf claim-watch failed after reveal (≤$${zeroConfCap} at risk, s public, record kept for watchtower): ${e instanceof Error ? e.message : String(e)}` }
+            return { ok: false, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: 'fast' as const, settlementModeDowngradeReason } : {}), reason: `0-conf claim-watch failed after reveal (≤$${zeroConfCap} at risk, s public, record kept for watchtower): ${e instanceof Error ? e.message : String(e)}` }
           }
         } else {
           // CONFIRMED-PATH claim-burial watch (re-red-team 2026-09-05 + review f2ed788b MED). The lock was mined +
@@ -905,18 +946,18 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             )
           } catch (e) {
             log('alert', `confirmed-path: claim ${bsvClaimTxid.slice(0, 12)}… NOT provably mined within the block-cadence window — s public, BSV unclaimed; record KEPT for watchtower/re-broadcast (do NOT refund): ${e instanceof Error ? e.message : String(e)}`)
-            return { ok: false, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, reason: `confirmed-path claim ${bsvClaimTxid.slice(0, 12)}… not provably mined within the burial window (s public, record kept for recovery — re-broadcast the claim, do NOT refund): ${e instanceof Error ? e.message : String(e)}` }
+            return { ok: false, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: 'confirmed' as const, settlementModeDowngradeReason } : {}), reason: `confirmed-path claim ${bsvClaimTxid.slice(0, 12)}… not provably mined within the burial window (s public, record kept for recovery — re-broadcast the claim, do NOT refund): ${e instanceof Error ? e.message : String(e)}` }
           }
           log('bsv', `confirmed-path: claim ${bsvClaimTxid.slice(0, 12)}… ${proveClaimByMerkle ? 'merkle-proven mined' : 'buried'} ✅`)
         }
         session.markSettled(now())
         deps.clearRecord?.(hashHex) // M-4: settled → DROP the at-risk record (was re-persisting it → stale masks accumulate)
         log('done', `BSV CLAIMED ${bsvClaimTxid.slice(0, 12)}… — s revealed on-chain, swap settled ✅`)
-        return { ok: true, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash }
+        return { ok: true, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: useZeroConfFastPath ? 'fast' as const : 'confirmed' as const, settlementModeDowngradeReason } : {}) }
       } catch (e) {
         // Before write-ahead, failure remains Base-refund eligible. At/after write-ahead the exact claim may have
         // escaped even when every broadcaster response was an error, so return its id and keep claim recovery alive.
-        return { ok: false, baseLockTxid, bsvClaimTxid: durableClaimTxid, hashHex: evmPreimageHash, reason: e instanceof Error ? e.message : String(e) }
+        return { ok: false, baseLockTxid, bsvClaimTxid: durableClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: durableClaimTxid ? undefined : 'not_revealed' as const } : {}), reason: e instanceof Error ? e.message : String(e) }
       }
     },
   }

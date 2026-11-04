@@ -3,15 +3,17 @@ import { makeBridgeInitiatorExecutor, type BridgeInitiatorBsvRails, type BridgeI
 import { defaultInitiatorTimelocks } from '../../bridge/initiator-timelocks'
 import { formatInitiatorWatchtowerProgress, makeInitiatorRecoverySupervisor, makeValidatedBsvFinality, type RecoveryBsvRails } from '../../bridge/in-process-recovery'
 import type { RecoveryClaimEvm } from '../../bridge/watchtower-adapters'
-import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, hasPersistedBsvClaimArtifact } from '../../bridge/watchtower'
+import { DEFAULT_BSV_FINALITY_CONFIRMATIONS } from '../../bridge/watchtower'
 import type { Erc20SwapEvmClient } from '../../bridge/evm/client'
 import type { SettlementRecord, SettlementState } from '../../bridge/settlement-session'
 import { makeFileSwapRecordStore } from '../../market-maker/swap-record-store'
 import { DEFAULT_BSV_FEE_RATE_SAT_PER_KB } from '../../settlement/htlc/bridge-covenant'
 import { sizeCovenantFeeBudgetSats } from '../../settlement/htlc/bridge-covenant'
 import { makeMessageBoxInitiatorCoordinator } from '../../transport/messagebox-coordinator'
+import type { FetchArcStatuses, FetchTxStatus } from '../../bridge/mainnet-zeroconf'
 import type { BuyerExecutor, BuyerQuote, BuyerRecoveryOutcome, BuyerSwapRecord, BuyerSwapStage } from './types'
 import { resolveUnlandedLock, UNLANDED_LOCK_ABORT_REASON, type BuyerUnlandedLockRails } from './unlanded-lock'
+import { makeTerminalAcknowledgement } from './terminal-ack'
 
 export const BUYER_RECOVERY_POLL_MS = 15_000
 
@@ -72,7 +74,10 @@ export interface BuyerEngineDeps {
   comms: CommsLayer
   doorIdentity: string
   evm: BridgeInitiatorEvmRails & Pick<RecoveryClaimEvm, 'refund'> & Partial<BuyerUnlandedLockRails>
-  bsv: BridgeInitiatorBsvRails & RecoveryBsvRails & Partial<{
+  bsv: BridgeInitiatorBsvRails & RecoveryBsvRails & {
+    zeroConfStatus?: FetchTxStatus
+    zeroConfArcStatuses?: FetchArcStatuses
+  } & Partial<{
     txConfirmationsStrict: RecoveryBsvRails['txConfirmations']
     fetchTxStrict: RecoveryBsvRails['fetchTx']
     fetchBeefStrict: NonNullable<RecoveryBsvRails['fetchBeef']>
@@ -97,6 +102,7 @@ export interface BuyerEngineDeps {
  * injected; this factory deliberately has no live-runtime assembly.
  */
 export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recoverAll(records: BuyerSwapRecord[]): Promise<Map<string, BuyerRecoveryOutcome>> } {
+  const lifecycle = new AbortController()
   const records = makeFileSwapRecordStore(deps.settlementDir, { censusGroupRead: false, recordMode: 0o600 })
   // The executor must retain the legacy lenient reads: an indexer outage while
   // its funded lock is confirming cannot abort the live swap. Recovery needs
@@ -115,11 +121,6 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
   const executorClears = new Map<string, { state: SettlementState; reason?: string }>()
   const lastUnlandedLockCheck = new Map<string, number>()
   const executingHashes = new Set<string>()
-  // A validated terminal generation may survive a best-effort compare-and-clear
-  // failure. Remember it for this process so later passes retry deletion without
-  // re-running its chain watcher or weakening the proof that preceded deletion.
-  const acknowledgedTerminalTokens = new Map<string, string>()
-  const terminalAcknowledgements = new Map<string, Promise<boolean>>()
   const mark = (hashHex: string, state: SettlementState): void => {
     for (const [swapId, current] of known) if (current.hashHex === hashHex) known.set(swapId, { hashHex, state })
   }
@@ -142,57 +143,13 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     refundConfs: 1,
     onPersist: (record) => mark(record.hashHex, record.state),
   })
-  const terminalArtifactsMatch = (buyer: BuyerSwapRecord, settlement: SettlementRecord): boolean =>
-    settlement.state === buyer.settlementState &&
-    settlement.baseLockTxHash === buyer.baseLockTxid &&
-    settlement.refundTxid === buyer.baseRefundTxid &&
-    settlement.bsvClaimTxid === buyer.bsvClaimTxid
-  const acknowledgeTerminalRecord = async (buyer: BuyerSwapRecord): Promise<boolean> => {
-    if (!buyer.settlementHashHex || !buyer.settlementState || !terminalSettlement(buyer.settlementState)) return false
-    const inflightKey = buyer.settlementHashHex.toLowerCase()
-    const inflight = terminalAcknowledgements.get(inflightKey)
-    if (inflight) return inflight
-    const task = (async (): Promise<boolean> => {
-      const listed = records.list()
-      const settlement = listed.records.find((item) => item.hashHex.toLowerCase() === inflightKey)
-      if (!settlement || !terminalArtifactsMatch(buyer, settlement)) return false
-      // A never-landed lock's tombstone stays on disk: it keeps the exact tuple, so a lock that still landed after the
-      if (settlement.abortReason === UNLANDED_LOCK_ABORT_REASON) return false
-      const token = JSON.stringify(settlement)
-      if (acknowledgedTerminalTokens.get(inflightKey) !== token) {
-        // The executor considers one SPV-proven confirmation sufficient for delivery, but the raw/BEEF claim is still
-        // the reorg/re-broadcast backstop until the recovery finality depth. Keep that artifact durable across restarts.
-        if (settlement.state === 'settled' && hasPersistedBsvClaimArtifact(settlement)) {
-          if (!claimIsBuried || !settlement.bsvClaimTxid) return false
-          try { if (!await claimIsBuried(settlement.bsvClaimTxid, DEFAULT_BSV_FINALITY_CONFIRMATIONS)) return false } catch { return false }
-        }
-        acknowledgedTerminalTokens.set(inflightKey, token)
-      }
-      // Fence a watcher that was armed by an earlier/concurrent pass before its
-      // old revealed snapshot can recreate the acknowledged terminal file.
-      recovery.cancelRecord?.(settlement, 'buyer terminal row acknowledged')
-      const latest = records.list().records.find((item) => item.hashHex.toLowerCase() === inflightKey)
-      if (!latest) return true
-      if (!terminalArtifactsMatch(buyer, latest)) return false
-      const latestToken = JSON.stringify(latest)
-      // A watcher may have refreshed only the terminal history while the proof
-      // read was in flight. The exact terminal artifacts remain the proof subject.
-      if (latest.bsvClaimTxid !== settlement.bsvClaimTxid || latest.state !== settlement.state) return false
-      acknowledgedTerminalTokens.set(inflightKey, latestToken)
-      records.clear(latest.hashHex, latest)
-      return true
-    })()
-    terminalAcknowledgements.set(inflightKey, task)
-    try { return await task } finally {
-      if (terminalAcknowledgements.get(inflightKey) === task) terminalAcknowledgements.delete(inflightKey)
-    }
-  }
-  const remember = (swapId: string, record: SettlementRecord, notify?: (r: { hashHex: string; state: SettlementState }) => void): void => {
+  const { acknowledgeTerminalRecord, acknowledgedTerminalTokens } = makeTerminalAcknowledgement({ records, recovery, claimIsBuried })
+  const remember = (swapId: string, record: SettlementRecord, notify?: (r: { hashHex: string; state: SettlementState; settlementModeUsed?: import('./types').SettlementModeUsed; settlementModeDowngradeReason?: string }) => void): void => {
     const seen = { hashHex: record.hashHex, state: record.state }
     known.set(swapId, seen)
     // This runs in the executor's synchronous write-ahead callback, after the settlement record is durable and before
     // `evm.lock`.  The kit callback starts its own durable update without allowing a UI-write problem to strand value.
-    notify?.(seen)
+    notify?.({ ...seen, settlementModeUsed: record.settlementModeUsed, settlementModeDowngradeReason: record.settlementModeDowngradeReason })
   }
   /** The initiator's two direct clear sites are terminal hand-offs, not deletion. */
   const writeExecutorTombstone = (hashHex: string, abortReason = 'the USDC lock reverted; nothing was locked'): SettlementState | undefined => {
@@ -275,7 +232,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       // The admission deadline gates only the intent (below). Later BSV-lock replies keep the channel's
       // default wait: capping them at the short admission window would strand a locked USDC leg until the timelock.
       const messageBox = makeMessageBoxInitiatorCoordinator({
-        comms: deps.comms, namespace: input.swapNamespace, peerIdentityPubKeyHex: deps.doorIdentity,
+        comms: deps.comms, namespace: input.swapNamespace, peerIdentityPubKeyHex: deps.doorIdentity, settlementProtocolVersion: input.quote.doorProtocolVersion === 2 ? 2 : 1, signal: lifecycle.signal,
       })
       // Admission is a short-lived reservation at the public door. Refuse before emitting the first settlement message
       // when it has expired, rather than allowing an old admission to create a fresh on-chain lock.
@@ -287,8 +244,11 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         },
       }
       const times = defaultInitiatorTimelocks()
+      const agreedMode = input.agreedSettlementMode ?? 'confirmed'
+      const fastCap = agreedMode === 'fast' ? input.fastCapUsdcBaseUnits ?? '0' : '0'
       const executor = makeBridgeInitiatorExecutor({
         bsvReservePub: deps.bsvReservePub, evm: deps.evm, bsv: deps.bsv, coordinator, chainTracker: deps.chainTracker,
+        zeroConfStatus: deps.bsv.zeroConfStatus, zeroConfArcStatuses: deps.bsv.zeroConfArcStatuses,
         now: () => Math.floor(deps.now() / 1000), nowMs: deps.now, sleep: deps.sleep,
         persist: (record) => {
           executingHash = record.hashHex
@@ -308,7 +268,9 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           erc20SwapAddress: deps.evm.swapAddress as `0x${string}`, baseChainId: deps.evm.chainId,
           baseTimelockBlocks: times.baseTimelockBlocks, bsvRefundBlocks: times.bsvRefundBlocks,
           claimBudgetBaseBlocks: times.claimBudgetBaseBlocks, bsvFeeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB, bsvConfirmations: 1, // both sides size the covenant fee budget identically
-          capUsdPerSwap: deps.capUsdPerSwap, zeroConfCapUsd: 0, requireLockMerkleProof: true, htlcKind: 'covenant',
+          capUsdPerSwap: deps.capUsdPerSwap, zeroConfCapUsd: agreedMode === 'fast' ? Number(BigInt(fastCap)) / 1_000_000 : 0, requireLockMerkleProof: true, htlcKind: 'covenant',
+          zeroConfMinArcProviders: 2,
+          ...(input.quote.doorProtocolVersion === 2 ? { doorProtocolVersion: 2 as const, doorQuoteId: input.quote.doorQuoteId, agreedSettlementMode: agreedMode, fastCapUsdcBaseUnits: fastCap } : {}),
           approveOnlyBelowAllowance: true, recordLockAttempts: true,
         },
       })
@@ -317,12 +279,15 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         const seen = known.get(input.swapId)
         const cleared = executorClears.get(input.swapId)
         executorClears.delete(input.swapId)
+        if (!result.ok && !seen && !result.baseLockTxid && !result.bsvClaimTxid) {
+          return { ...result, nothingLocked: true, settlementModeUsed: 'not_revealed' }
+        }
         if (!result.ok && (cleared?.state === 'created' || cleared?.state === 'base-locked')) {
           return { ok: false, reason: cleared.reason ?? 'the USDC lock reverted; nothing was locked', nothingLocked: true }
         }
         if (result.ok && seen) known.set(input.swapId, { hashHex: seen.hashHex, state: 'settled' })
         const settlement = seen ? records.list().records.find((entry) => entry.hashHex === seen.hashHex) : undefined
-        return { ...result, bsvClaimPayoutSats: settlement ? claimPayoutSats(settlement) : undefined, revealed: seen?.state === 'revealed' || !!result.bsvClaimTxid }
+        return { ...result, bsvClaimPayoutSats: settlement ? claimPayoutSats(settlement) : undefined, revealed: seen?.state === 'revealed' || !!result.bsvClaimTxid, settlementModeUsed: result.settlementModeUsed ?? settlement?.settlementModeUsed, settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? settlement?.settlementModeDowngradeReason }
       } catch (error) {
         const cleared = executorClears.get(input.swapId)
         executorClears.delete(input.swapId)
@@ -361,7 +326,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       }
       known.set(record.swapId, { hashHex, state: settlement.state })
       recovery.ensure([settlement])
-      return { stage: stageForRecord(record, settlement.state), baseLockTxid: settlement.baseLockTxHash, baseRefundTxid: settlement.refundTxid, bsvClaimTxid: settlement.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(settlement), bsvLockOutpoint: settlement.bsvLockOutpoint, bsvRefundLocktime: settlement.bsvRefundLocktime, baseTimelockBlock: settlement.baseTimelockBlock, settlementState: settlementStateForRecord(record, settlement.state) }
+      return { stage: stageForRecord(record, settlement.state), baseLockTxid: settlement.baseLockTxHash, baseRefundTxid: settlement.refundTxid, bsvClaimTxid: settlement.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(settlement), bsvLockOutpoint: settlement.bsvLockOutpoint, bsvRefundLocktime: settlement.bsvRefundLocktime, baseTimelockBlock: settlement.baseTimelockBlock, settlementState: settlementStateForRecord(record, settlement.state), settlementModeUsed: settlement.settlementModeUsed, settlementModeDowngradeReason: settlement.settlementModeDowngradeReason }
     },
     async readSettlement(record) {
       if (!record.settlementHashHex) return undefined
@@ -407,7 +372,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         // Track live records so the supervisor's terminal clear (refunded/settled) is visible to this swap.
         if (item) known.set(buyer.swapId, { hashHex, state: item.state })
         stages.set(buyer.swapId, item
-          ? { stage: stageForRecord(buyer, item.state), settlementState: settlementStateForRecord(buyer, item.state), baseLockTxid: item.baseLockTxHash, baseRefundTxid: item.refundTxid, bsvClaimTxid: item.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(item), bsvLockOutpoint: item.bsvLockOutpoint, bsvRefundLocktime: item.bsvRefundLocktime, baseTimelockBlock: item.baseTimelockBlock, reason: item.abortReason }
+          ? { stage: stageForRecord(buyer, item.state), settlementState: settlementStateForRecord(buyer, item.state), baseLockTxid: item.baseLockTxHash, baseRefundTxid: item.refundTxid, bsvClaimTxid: item.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(item), bsvLockOutpoint: item.bsvLockOutpoint, bsvRefundLocktime: item.bsvRefundLocktime, baseTimelockBlock: item.baseTimelockBlock, reason: item.abortReason, settlementModeUsed: item.settlementModeUsed, settlementModeDowngradeReason: item.settlementModeDowngradeReason }
           : !buyer.settlementRecordCreated && buyer.handshakeDeadlineMs !== undefined && deps.now() >= buyer.handshakeDeadlineMs
             ? { stage: 'failed', reason: 'handshake expired before a settlement checkpoint was created; nothing was locked' }
             : await absentOutcome(buyer))
@@ -416,6 +381,10 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     },
     async acknowledgeTerminal(buyer) {
       await acknowledgeTerminalRecord(buyer)
+    },
+    close() {
+      lifecycle.abort()
+      recovery.cancelAll('buyer runtime closed')
     },
   }
 }

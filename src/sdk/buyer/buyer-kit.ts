@@ -7,6 +7,7 @@ import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
 import { assertBaseDestination, assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
 import { makeBuyerDelivery } from './delivery'
+import { createInitialSettlementRecord, executeNegotiatedSettlement, makeSettlementAttachment, negotiateSettlementMode, requestedSettlementSpeed } from './settlement-mode'
 const HARD_CAP_USD = 1000
 const DEFAULT_CAP_USD = 100
 const active = new Set<BuyerSwapStage>(['quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'sweeping', 'refund_waiting', 'needs_attention'])
@@ -35,6 +36,12 @@ function nextEvent(stage: BuyerSwapStage | string): string {
     sweeping: 'Sweeping confirmed BSV to the requested address.', delivered: 'BSV was delivered.', refund_waiting: 'Waiting for the Base timelock before refunding USDC.', refunded: 'USDC was refunded.', failed: 'No money-moving step was accepted.', needs_attention: 'Recovery needs attention; settlement evidence could not be read.',
   }
   return words[stage]
+}
+
+function fastNegotiationFailureReason(record: BuyerSwapRecord, reason: string): string {
+  if (record.requestedSpeed !== 'fast' || record.quote.doorProtocolVersion !== 2 || (record.agreedSettlementMode !== 'pending' && record.agreedSettlementMode !== 'fast')) return reason
+  const nothingLocked = /nothing was locked/i.test(reason) ? reason : `${reason}; nothing was locked`
+  return `${nothingLocked}; start a new swap, for example with speed standard`
 }
 
 /**
@@ -125,56 +132,52 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
   const writeRecovery = async (record: BuyerSwapRecord, outcome: import('./types').BuyerRecoveryOutcome): Promise<BuyerSwapRecord> => {
     return updateRow(record, (current) => {
       const guarded = guardRecovery(current, outcome)
-      return { ...record, ...current, ...guarded, stage: guarded.stage, updatedAtMs: now() }
+      return {
+        ...record, ...current, ...guarded,
+        settlementModeUsed: guarded.settlementModeUsed ?? current.settlementModeUsed,
+        settlementModeDowngradeReason: guarded.settlementModeDowngradeReason ?? current.settlementModeDowngradeReason,
+        stage: guarded.stage, updatedAtMs: now(),
+      }
     })
   }
   const issuedQuotes = new Map<string, BuyerQuote>()
-  const quote = async (amountIn: bigint): Promise<BuyerQuote> => {
+  const quote = async (amountIn: bigint, forceLegacy = false): Promise<BuyerQuote> => {
     const amountUsd = asUsd(amountIn)
     if (amountIn > BigInt(Math.floor(capUsdPerSwap * 1e6))) throw new Error(`amount exceeds this kit’s $${capUsdPerSwap} per-swap cap`)
-    const reply = await deps.door.quote(amountIn, requestId())
+    const reply = await deps.door.quote(amountIn, requestId(), forceLegacy)
     const units = BigInt(reply.usdcBaseUnits)
     if (units !== amountIn) throw new Error('market maker quote does not bind the exact USDC atomic amount requested')
     if (!Number.isSafeInteger(reply.bsvSats) || reply.bsvSats < 1 || reply.expiresAtMs <= now()) throw new Error('market maker returned an invalid or expired quote')
-    const value = { from: 'USDC' as const, to: 'BSV' as const, route: 'bridge' as const, amountIn, amountOut: BigInt(reply.bsvSats), expiry: Math.floor(reply.expiresAtMs / 1000), quoteId: reply.quoteId, doorQuoteId: reply.quoteId, usdcBaseUnits: units, bsvSats: BigInt(reply.bsvSats), midUsdPerBsv: reply.midUsdPerBsv, claimFeeBudgetSats: buyerClaimFeeBudgetSats() }
+    const fastCap = BigInt(reply.fastCapUsdcBaseUnits ?? '0')
+    const value = { from: 'USDC' as const, to: 'BSV' as const, route: 'bridge' as const, amountIn, amountOut: BigInt(reply.bsvSats), expiry: Math.floor(reply.expiresAtMs / 1000), quoteId: reply.quoteId, doorQuoteId: reply.quoteId, usdcBaseUnits: units, bsvSats: BigInt(reply.bsvSats), midUsdPerBsv: reply.midUsdPerBsv, claimFeeBudgetSats: buyerClaimFeeBudgetSats(), doorProtocolVersion: reply.doorProtocolVersion ?? 1, fastOffered: reply.fastOffered ?? false, fastCapUsdcBaseUnits: fastCap }
     issuedQuotes.set(value.quoteId, value)
     for (const [id, saved] of issuedQuotes) if (saved.expiry * 1000 + 300_000 < now()) issuedQuotes.delete(id)
     return value
   }
   const run = async (record: BuyerSwapRecord): Promise<void> => {
     let settlementAttached = !!record.settlementHashHex
-    const attachSettlement = (settlement: { hashHex: string; state: import('../../bridge/settlement-session').SettlementState }): void => {
-      settlementAttached = true
-      // The initiator invokes this immediately after its durable write-ahead record and before `evm.lock`.  Do not
-      // await here: its callback is synchronous by design, and a cosmetic kit-store error must never reject the
-      // money path.  The settlement record remains the crash-recovery source of truth.
-      record = { ...record, settlementHashHex: settlement.hashHex, settlementState: settlement.state, settlementRecordCreated: true }
-      void write(record, buyerStageForSettlement(settlement.state), { settlementHashHex: settlement.hashHex, settlementState: settlement.state, settlementRecordCreated: true })
-        .then((saved) => { record = saved })
-        .catch((error) => log(`could not persist settlement link for ${record.swapId}; recovery remains in the settlement store: ${error instanceof Error ? error.message : String(error)}`))
-    }
+    const attachSettlement = makeSettlementAttachment({ getRecord: () => record, setRecord: (saved) => { record = saved; settlementAttached = true }, write, stageForSettlement: buyerStageForSettlement, log })
     try {
-      // The admission request is intentionally persisted before the executor can lock USDC. Retrying uses this requestId.
-      const admission = await deps.door.admit(record.quote.doorQuoteId, BigInt(record.amountIn), record.requestId)
-      if (admission.handshakeDeadlineMs <= now()) throw new Error('market maker admission expired before the handshake began')
-      record = await write(record, 'admitted', { swapNamespace: admission.swapNamespace, handshakeDeadlineMs: admission.handshakeDeadlineMs })
-      const result = await deps.executor.execute({
-        swapId: record.swapId, quote: record.quote, swapNamespace: admission.swapNamespace, handshakeDeadlineMs: admission.handshakeDeadlineMs,
-        // This is deliberately awaited by the initiator before it creates its settlement record.  A restart can now
-        // distinguish a linked-but-not-created checkpoint from an unlinked pre-admission row.
-        onSettlementLink: async (hashHex) => { record = await write(record, 'admitted', { settlementHashHex: hashHex, settlementRecordCreated: false }) },
-        onSettlement: attachSettlement,
-      })
+      const negotiation = await negotiateSettlementMode(record, { door: deps.door, now, write })
+      if (!negotiation) return
+      const { admittedMode, downgradeReason } = negotiation
+      record = negotiation.record
+      const executed = await executeNegotiatedSettlement(record, negotiation, { executor: deps.executor, write, setRecord: (saved) => { record = saved }, onSettlement: attachSettlement })
+      record = executed.record
+      const result = executed.result
       if (!result.ok) {
         // A settlement record, not a returned txid, is the at-risk boundary.  `evm.lock` can throw before returning a
         // txid, while its write-ahead record still makes a later Base refund necessary.
         // Legacy injected executors may only be able to report a landed lock txid.  The real engine always supplies
         // the stronger settlement-record signal, but a reported lock is still at-risk and must retain the old safe
         // refund behavior for embedders.
-        await write(record, result.nothingLocked ? 'failed' : result.revealed ? 'claiming' : settlementAttached || !!result.baseLockTxid ? 'refund_waiting' : 'failed', { baseLockTxid: result.baseLockTxid, bsvClaimTxid: result.bsvClaimTxid, bsvClaimPayoutSats: result.bsvClaimPayoutSats, reason: result.reason ?? 'swap did not complete' })
+        const reason = result.nothingLocked
+          ? fastNegotiationFailureReason(record, result.reason ?? 'v2 settlement handshake failed')
+          : result.reason ?? 'swap did not complete'
+        await write(record, result.nothingLocked ? 'failed' : result.revealed ? 'claiming' : settlementAttached || !!result.baseLockTxid ? 'refund_waiting' : 'failed', { baseLockTxid: result.baseLockTxid, bsvClaimTxid: result.bsvClaimTxid, bsvClaimPayoutSats: result.bsvClaimPayoutSats, reason, settlementModeUsed: result.settlementModeUsed ?? (result.revealed ? admittedMode : 'not_revealed'), settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? downgradeReason })
         return
       }
-      record = await write(record, 'claimed', { baseLockTxid: result.baseLockTxid, bsvClaimTxid: result.bsvClaimTxid, bsvClaimPayoutSats: result.bsvClaimPayoutSats, settlementState: 'settled' })
+      record = await write(record, 'claimed', { baseLockTxid: result.baseLockTxid, bsvClaimTxid: result.bsvClaimTxid, bsvClaimPayoutSats: result.bsvClaimPayoutSats, settlementState: 'settled', settlementModeUsed: result.settlementModeUsed ?? admittedMode, settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? downgradeReason })
       // The engine may now compare-and-clear its terminal tombstone: this exact buyer row is durable.
       await deps.executor.acknowledgeTerminal?.(record)
       // Delivery is recovery-only: it waits for the claimed kit coin to have a
@@ -184,21 +187,19 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       // Never decide that USDC was not locked from `baseLockTxid`: the executor intentionally writes an actionable
       // placeholder record before calling `evm.lock`, and that call can throw without a txid.
       try {
-        const reason = error instanceof Error ? error.message : String(error)
+        let reason = error instanceof Error ? error.message : String(error)
+        if (!settlementAttached && !record.settlementHashHex) reason = fastNegotiationFailureReason(record, reason)
         // The engine only emits this after the reverted receipt's exact tuple has been proven absent and its pre-lock
         // checkpoint cleared.  It is the one exception to the normal "a checkpoint means refund" rule.
-        await write(record, reason === 'the USDC lock reverted; nothing was locked' ? 'failed' : record.settlementState === 'revealed' ? 'claiming' : settlementAttached || record.settlementHashHex ? 'refund_waiting' : 'failed', { reason })
+        await write(record, reason === 'the USDC lock reverted; nothing was locked' ? 'failed' : record.settlementState === 'revealed' ? 'claiming' : settlementAttached || record.settlementHashHex ? 'refund_waiting' : 'failed', { reason, settlementModeUsed: record.settlementState === 'revealed' ? record.settlementModeUsed ?? (record.agreedSettlementMode === 'fast' ? 'fast' : 'confirmed') : record.settlementModeUsed === 'fast' || record.settlementModeUsed === 'confirmed' ? record.settlementModeUsed : 'not_revealed' })
       } catch (writeError) {
         log(`could not persist swap failure for ${record.swapId}; settlement recovery remains armed: ${writeError instanceof Error ? writeError.message : String(writeError)}`)
       }
     }
   }
 
-  const startSwap = async (input: StartSwapRequest): Promise<{ swapId: string; stage: BuyerSwapStage; expectedMinutes: number }> => {
-    // An explicitly undefined floor counts as absent (the MCP server always passes the key).
-    if (input.minBsvOut !== undefined && (typeof input.minBsvOut !== 'bigint' || input.minBsvOut <= 0n)) {
-      throw new Error('min_bsv_out must be a positive number of satoshis; nothing was locked')
-    }
+  const startSwap = async (input: StartSwapRequest): Promise<{ swapId: string; stage: BuyerSwapStage; expectedMinutes: number; requestedSpeed: import('./types').SettlementSpeed; agreedSettlementMode: import('./types').AgreedSettlementMode; settlementModeUsed: import('./types').SettlementModeUsed }> => {
+    const requestedSpeed = requestedSettlementSpeed(input)
     const record = await serializeMoney(async () => {
       const { snapshot: activeLimits } = await prepareNewBaseSpend()
       if (!input.quote && input.minBsvOut === undefined) throw new Error('a quote or min_bsv_out is required; nothing was locked')
@@ -220,9 +221,8 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       if (input.quote && !retained && input.minBsvOut === undefined) throw new Error('quote_id is unknown; get a new quote or provide min_bsv_out')
       const q = retained && retained.expiry * 1000 > now() ? retained : await quote(input.amountIn)
       if (q.amountIn !== input.amountIn || q.usdcBaseUnits !== input.amountIn) throw new Error('quote is not bound to this exact amount')
-      const floor = input.minBsvOut ?? (retained ? retained.bsvSats * 99n / 100n : undefined)
-      if (floor !== undefined && q.bsvSats < floor) throw new Error('price moved below the permitted BSV amount; nothing was locked')
-      const next: BuyerSwapRecord = { schemaVersion: 2, swapId: swapId(), requestId: requestId(), stage: 'quoted', amountIn: input.amountIn.toString(), quote: q, deliverTo: input.deliverTo, createdAtMs: now(), updatedAtMs: now() }
+      const fastSettlementAllowedSnapshot = activeLimits?.allowFastSettlement !== false
+      const next = createInitialSettlementRecord({ request: input, retained, quote: q, requestedSpeed, fastSettlementAllowedSnapshot, now: now(), swapId: swapId(), requestId: requestId() })
       // STOP linearizes with the first durable swap row, not just earlier planning.
       assertNotStopped()
       await deps.store.put(next) // durable BEFORE admission/lock
@@ -231,7 +231,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     // Background lifecycle failures are represented durably by `run`; this final catch is only a belt-and-suspenders
     // guard against an unexpected implementation bug and must never become an unhandled rejection.
     void run(record).catch((error) => log(`background swap ${record.swapId} escaped lifecycle handling: ${error instanceof Error ? error.message : String(error)}`))
-    return { swapId: record.swapId, stage: 'quoted', expectedMinutes: 60 }
+    return { swapId: record.swapId, stage: 'quoted', expectedMinutes: record.requestedSpeed === 'fast' ? 10 : 60, requestedSpeed: record.requestedSpeed ?? 'standard', agreedSettlementMode: record.agreedSettlementMode ?? 'confirmed', settlementModeUsed: record.settlementModeUsed ?? 'pending' }
   }
 
   return {
@@ -287,7 +287,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
           if (saved.settlementState === 'settled' || saved.settlementState === 'refunded' || saved.settlementState === 'aborted') await deps.executor.acknowledgeTerminal?.(saved)
         }
       }
-      await delivery.recover()
+      await delivery.recover({ deferNewEarlyBroadcast: all !== undefined })
       return deps.store.list()
     },
     withdrawBsv: async (address) => serializeMoney(async () => {

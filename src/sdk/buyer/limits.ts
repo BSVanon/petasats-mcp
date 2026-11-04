@@ -9,9 +9,10 @@ export interface BuyerLimits {
   bsvDestinations?: string[]
   baseDestinations?: string[]
   maxSwapUsdPerDay?: number
+  allowFastSettlement?: boolean
 }
 
-const allowed = new Set(['format', 'bsvDestinations', 'baseDestinations', 'maxSwapUsdPerDay'])
+const allowed = new Set(['format', 'bsvDestinations', 'baseDestinations', 'maxSwapUsdPerDay', 'allowFastSettlement'])
 export function readBuyerLimits(paths: BuyerHome): BuyerLimits | undefined {
   try {
     const stat = lstatSync(paths.limitsPath)
@@ -42,7 +43,8 @@ export function readBuyerLimits(paths: BuyerHome): BuyerLimits | undefined {
   }
   const cap = source.maxSwapUsdPerDay
   if (cap !== undefined && (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0)) throw invalid('maxSwapUsdPerDay must be a finite number greater than zero')
-  return { format: 'petasats.limits/1', ...(checkAddresses('bsvDestinations') !== undefined ? { bsvDestinations: checkAddresses('bsvDestinations') } : {}), ...(checkAddresses('baseDestinations') !== undefined ? { baseDestinations: checkAddresses('baseDestinations') } : {}), ...(cap !== undefined ? { maxSwapUsdPerDay: cap } : {}) }
+  if (source.allowFastSettlement !== undefined && typeof source.allowFastSettlement !== 'boolean') throw invalid('allowFastSettlement must be a boolean')
+  return { format: 'petasats.limits/1', ...(checkAddresses('bsvDestinations') !== undefined ? { bsvDestinations: checkAddresses('bsvDestinations') } : {}), ...(checkAddresses('baseDestinations') !== undefined ? { baseDestinations: checkAddresses('baseDestinations') } : {}), ...(cap !== undefined ? { maxSwapUsdPerDay: cap } : {}), ...(source.allowFastSettlement !== undefined ? { allowFastSettlement: source.allowFastSettlement } : {}) }
 }
 function invalid(message: string): Error { return new Error(`refused by your limits file: ${message}; fix limits.json at the terminal; nothing was sent`) }
 

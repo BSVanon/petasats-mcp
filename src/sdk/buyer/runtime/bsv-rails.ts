@@ -5,7 +5,7 @@ import { makeAnvilChaintracks } from '../../../wallet/anvil-chaintracks'
 import { makeWocChaintracks } from '../../../wallet/woc-chaintracks'
 import { makeQuorumChainTracker } from '../../../wallet/quorum-chaintracks'
 import { makeBsvHeightReader } from '../../../wallet/bsv-height'
-import { broadcast, clearTaalApiKey, setAnvilNode } from '../../../wallet/broadcast'
+import { broadcast, clearTaalApiKey, getMultiArcTxStatuses, getTxStatus, setAnvilNode } from '../../../wallet/broadcast'
 import { fetchBeefForTxid, fetchTxHexForTxid } from '../../../wallet/fetch-beef'
 import { makeMultiSourceUnspentFetcher } from '../../../wallet/address-utxo-sources'
 import type { WocUtxo } from '../../../wallet/reserve-basket-sweep'
@@ -29,7 +29,7 @@ export interface BuyerStrictRecoveryBsvReads {
 }
 export type BuyerBsvRails = Pick<BridgeInitiatorBsvRails, 'broadcast' | 'chainHeight' | 'readBsvHeight' | 'txConfirmations' | 'fetchTx' | 'fetchBeef'> &
   Pick<RecoveryBsvRails, 'resolveSpender'> & BuyerStrictRecoveryBsvReads &
-  { chainTracker: ChainTracker; unspentFor(address: string): Promise<BuyerUnspent[]> }
+  { chainTracker: ChainTracker; zeroConfStatus: typeof getTxStatus; zeroConfArcStatuses: typeof getMultiArcTxStatuses; unspentFor(address: string): Promise<BuyerUnspent[]> }
 
 /**
  * Provider-keyless BSV reads and broadcasts.  Existing process-global
@@ -73,6 +73,8 @@ export function makeBuyerBsvRails(opts: BuyerBsvRailsOptions = {}): BuyerBsvRail
   }
   return {
     chainTracker,
+    zeroConfStatus: getTxStatus,
+    zeroConfArcStatuses: getMultiArcTxStatuses,
     // ARC understands ordinary BEEF but not Atomic BEEF. Keep Atomic BEEF for
     // Anvil (which needs the BRC-95 subject) and opt in to ARC's BRC-62 wire.
     broadcast: async (rawTx: string, atomicBeefHex?: string): Promise<string> => (await broadcast(rawTx, atomicBeefHex, { taalApiKey: null, anvilNodeUrl: anvilBaseUrl, anvilAuthToken: null, arcAtomicBeefAsBeef: true })).txid,

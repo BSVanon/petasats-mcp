@@ -28,6 +28,7 @@ export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown
   const lockTxid = record.bsvLockOutpoint?.split('_')[0] ?? record.bsvLockTxid
   return {
     swap_id: record.swapId, stage: unknown ? 'needs_attention' : record.stage, stage_label: info.label,
+    requested_speed: record.requestedSpeed ?? 'standard', agreed_settlement_mode: record.agreedSettlementMode ?? 'confirmed', settlement_mode_used: record.settlementModeUsed ?? 'pending', settlement_mode_downgrade_reason: record.settlementModeDowngradeReason ?? null,
     step: info.step, steps_total: delivery ? 8 : 7, done: terminal,
     outcome: record.stage === 'delivered' ? 'delivered' : record.stage === 'settled' ? 'settled' : record.stage === 'refunded' ? 'refunded' : record.stage === 'failed' ? 'failed' : null,
     needs_attention: unknown || record.stage === 'needs_attention',

@@ -22,12 +22,13 @@ export function makeBuyerDelivery({ deps, now, log, updateRow, write }: {
   }
   return {
     hasDurableSweep,
-    recover: async (): Promise<void> => {
+    recover: async (options: { deferNewEarlyBroadcast?: boolean } = {}): Promise<void> => {
       // A revealed claim's Atomic BEEF is enough to build its child without waiting
       // for the UTXO indexer. The settlement checkpoint is the irreversible gate.
       for (const record of await deps.store.list()) {
         if (!record.deliverTo || record.stage !== 'claiming') continue
         try {
+          const hadOutbox = !!record.sweepOutbox
           let outbox = record.sweepOutbox
           if (!outbox && deps.executor.readSettlement && deps.wallet.buildEarlySweep) {
             const settlement = await deps.executor.readSettlement(record)
@@ -36,7 +37,7 @@ export function makeBuyerDelivery({ deps, now, log, updateRow, write }: {
               let claim: Transaction | undefined
               try { claim = Transaction.fromAtomicBEEF(Utils.toArray(settlement.bsvClaimBeefHex, 'hex') as number[]) } catch { /* silently retain the confirmed path */ }
               if (claim && claim.id('hex').toLowerCase() === claimTxid.toLowerCase()) {
-                const built = await deps.wallet.buildEarlySweep(record.deliverTo, { claim, claimTxid })
+                const built = await deps.wallet.buildEarlySweep(record.deliverTo, { claim, claimTxid, settlementModeUsed: record.settlementModeUsed === 'fast' ? 'fast' : 'confirmed' })
                 const candidate = { ...built, sats: built.sats.toString() }
                 const saved = await updateRow(record, (current) => {
                   if (current.sweepOutbox || current.stage !== 'claiming') return current
@@ -46,7 +47,9 @@ export function makeBuyerDelivery({ deps, now, log, updateRow, write }: {
               }
             }
           }
-          if (outbox && deps.wallet.broadcastSweep) {
+          // When this recovery pass also re-broadcast the parent claim, leave a newly built child durable and send it
+          // on the next pass. This preserves parent-before-child relay ordering; a crash still resumes the exact outbox.
+          if (outbox && deps.wallet.broadcastSweep && (hadOutbox || !options.deferNewEarlyBroadcast)) {
             try {
               await broadcastSweep(outbox)
             } catch (error) {
@@ -71,6 +74,10 @@ export function makeBuyerDelivery({ deps, now, log, updateRow, write }: {
             })
             // A concurrent recovery may have won with another candidate. Never send ours.
             outbox = saved.sweepOutbox
+          }
+          if (outbox && record.stage === 'settled') {
+            const saved = await updateRow(record, (current) => current.stage === 'settled' ? { ...current, stage: 'sweeping', updatedAtMs: now() } : current)
+            if (saved.stage !== 'sweeping') continue
           }
           if (outbox && deps.wallet.broadcastSweep && deps.wallet.isSweepConfirmed) {
             // Check before re-sending: a relay can reject a mined sweep (its input is spent), which must not hide delivery.

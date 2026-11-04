@@ -131,24 +131,65 @@ export function makeFileBuyerStore(paths: BuyerHome): BuyerStore {
       if (typeof quote[key] !== 'string' || !/^\d+$/.test(quote[key] as string)) throw new Error(`invalid buyer swap quote field ${key}`)
       quote[key] = BigInt(quote[key] as string)
     }
+    if (quote.fastCapUsdcBaseUnits !== undefined) {
+      if (typeof quote.fastCapUsdcBaseUnits !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(quote.fastCapUsdcBaseUnits)) throw new Error('invalid buyer swap quote field fastCapUsdcBaseUnits')
+      quote.fastCapUsdcBaseUnits = BigInt(quote.fastCapUsdcBaseUnits)
+    }
+    if ((record.schemaVersion ?? 0) <= 2) {
+      record.requestedSpeed = 'standard'; record.agreedSettlementMode = 'confirmed'; record.settlementModeUsed = 'confirmed'
+      record.fastSettlementAllowedSnapshot = false
+      quote.doorProtocolVersion = 1; quote.fastOffered = false; quote.fastCapUsdcBaseUnits = 0n
+      record.schemaVersion = 3
+    } else {
+      const validRequested = record.requestedSpeed === 'standard' || record.requestedSpeed === 'fast'
+      const validAgreed = record.agreedSettlementMode === 'pending' || record.agreedSettlementMode === 'confirmed' || record.agreedSettlementMode === 'fast'
+      const validUsed = record.settlementModeUsed === 'pending' || record.settlementModeUsed === 'not_revealed' || record.settlementModeUsed === 'confirmed' || record.settlementModeUsed === 'fast'
+      const cap = typeof quote.fastCapUsdcBaseUnits === 'bigint' ? quote.fastCapUsdcBaseUnits : 0n
+      const agreedCapText = record.agreedFastCapUsdcBaseUnits
+      const agreedCapValid = agreedCapText === undefined || /^(?:0|[1-9][0-9]*)$/.test(agreedCapText)
+      const agreedCap = agreedCapValid && agreedCapText !== undefined ? BigInt(agreedCapText) : 0n
+      const quoteMetadataValid = (quote.doorProtocolVersion === 1 && quote.fastOffered === false && cap === 0n) || (quote.doorProtocolVersion === 2 && cap <= 25_000_000n && quote.fastOffered === (cap > 0n && BigInt(record.amountIn) <= cap))
+      const contradiction = !validRequested || !validAgreed || !validUsed || !agreedCapValid || !quoteMetadataValid || agreedCap > 25_000_000n ||
+        (record.agreedSettlementMode === 'fast' && (!(record.requestedSpeed === 'fast' && quote.doorProtocolVersion === 2 && quote.fastOffered === true) || agreedCap <= 0n || BigInt(record.amountIn) > agreedCap)) ||
+        (record.agreedSettlementMode === 'confirmed' && agreedCap > 0n) || (record.requestedSpeed === 'standard' && record.agreedSettlementMode === 'fast') ||
+        (record.agreedSettlementMode === 'confirmed' && record.settlementModeUsed === 'fast')
+      if (contradiction) {
+        record.stage = 'needs_attention'; record.reason = 'contradictory v3 settlement-mode record; fast recovery is disabled'; record.agreedSettlementMode = 'confirmed'; record.settlementModeUsed = 'not_revealed'
+      }
+    }
+    delete (record as BuyerSwapRecord & { minBsvOut?: string }).minBsvOut
+    delete (record as BuyerSwapRecord & { confirmedRetryAttempted?: boolean }).confirmedRetryAttempted
     return record
   }
   const encode = (record: BuyerSwapRecord): string => JSON.stringify(record, (_key, value) => typeof value === 'bigint' ? value.toString() : value)
+  const prepareForWrite = (record: BuyerSwapRecord): BuyerSwapRecord => {
+    delete (record as BuyerSwapRecord & { minBsvOut?: string }).minBsvOut
+    delete (record as BuyerSwapRecord & { confirmedRetryAttempted?: boolean }).confirmedRetryAttempted
+    if ((record.schemaVersion ?? 0) <= 2) {
+      record.requestedSpeed = 'standard'
+      record.agreedSettlementMode = 'confirmed'
+      record.settlementModeUsed = 'confirmed'
+      record.fastSettlementAllowedSnapshot = false
+      record.quote.doorProtocolVersion = 1
+      record.quote.fastOffered = false
+      record.quote.fastCapUsdcBaseUnits = 0n
+    }
+    record.schemaVersion = 3
+    return record
+  }
   return {
     async list() { return fs.readdirSync(paths.swapsDir).filter((x) => x.endsWith('.json')).map((x) => decode(secureFileText(join(paths.swapsDir, x)))) },
     async get(id) { const path = file(id); return fs.existsSync(path) ? decode(secureFileText(path)) : undefined },
     async put(record) {
       const path = file(record.swapId)
-      record.schemaVersion = 2
-      writeSettlementRecordAtomically(path, encode(record), 0o600)
+      writeSettlementRecordAtomically(path, encode(prepareForWrite(record)), 0o600)
     },
     async update(id, derive) {
       const path = file(id)
       const current = fs.existsSync(path) ? decode(secureFileText(path)) : undefined
       const next = derive(current)
       if (next.swapId !== id) throw new Error('buyer swap update changed its id')
-      next.schemaVersion = 2
-      writeSettlementRecordAtomically(path, encode(next), 0o600)
+      writeSettlementRecordAtomically(path, encode(prepareForWrite(next)), 0o600)
       return next
     },
   }

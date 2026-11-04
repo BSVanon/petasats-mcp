@@ -1,7 +1,9 @@
 /** Runtime schemas for the JSON settlement handshake.  Keep this separate from the
  * coordinator so TypeScript's wire types never become a trust boundary. */
-import type { BridgeIntent, BridgeQuote } from '../bridge/settlement-types'
+import type { BridgeIntent, BridgeIntentV2, BridgeQuote, BridgeQuoteV2 } from '../bridge/settlement-types'
+import { DOOR_REQUEST_ID_RE } from './door-protocol'
 import type { BsvHtlcUtxo } from '../settlement/htlc'
+import { fastAtomicEligible, isCanonicalFastCap, isPublicDoorQuoteId, isPublicSettlementMode, publicSettlementModeAndCapAreConsistent } from '../bridge/settlement-mode'
 
 const own = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 const exact = (v: unknown, keys: readonly string[]): v is Record<string, unknown> => own(v) && Object.keys(v).length === keys.length && keys.every((k) => Object.hasOwn(v, k))
@@ -18,6 +20,12 @@ export function isBridgeIntent(v: unknown): v is BridgeIntent {
   return hex(v.hashHex, 32) && amount(v.usdcAmount) && n(v.bsvAmount) && n(v.baseTimelockBlock) && n(v.bsvRefundLocktime) && address(v.machineEvmAddr) && pubkey(v.machineBsvPubKeyHex) && address(v.erc20SwapAddress) && address(v.usdcTokenAddress) && n(v.baseChainId)
 }
 
+export function isBridgeIntentV2(v: unknown): v is BridgeIntentV2 {
+  if (!exact(v, ['v', 'hashHex', 'usdcAmount', 'bsvAmount', 'baseTimelockBlock', 'bsvRefundLocktime', 'machineEvmAddr', 'machineBsvPubKeyHex', 'erc20SwapAddress', 'usdcTokenAddress', 'baseChainId', 'doorQuoteId', 'settlementMode', 'fastCapUsdcBaseUnits'])) return false
+  if (v.v !== 2 || !hex(v.hashHex, 32) || !amount(v.usdcAmount) || !n(v.bsvAmount) || !n(v.baseTimelockBlock) || !n(v.bsvRefundLocktime) || !address(v.machineEvmAddr) || !pubkey(v.machineBsvPubKeyHex) || !address(v.erc20SwapAddress) || !address(v.usdcTokenAddress) || !n(v.baseChainId) || !isPublicDoorQuoteId(v.doorQuoteId) || !DOOR_REQUEST_ID_RE.test(v.doorQuoteId) || !isPublicSettlementMode(v.settlementMode) || !isCanonicalFastCap(v.fastCapUsdcBaseUnits)) return false
+  return publicSettlementModeAndCapAreConsistent(v.settlementMode, v.fastCapUsdcBaseUnits) && (v.settlementMode !== 'fast' || fastAtomicEligible(v.usdcAmount, v.fastCapUsdcBaseUnits))
+}
+
 export function isBridgeQuote(v: unknown): v is BridgeQuote {
   if (!own(v)) return false
   const keys = Object.keys(v)
@@ -29,6 +37,11 @@ export function isBridgeQuote(v: unknown): v is BridgeQuote {
   if (v.htlcKind !== undefined && v.htlcKind !== 'covenant') return false
   if ((v.bsvClaimFeeBudgetSats !== undefined && !n(v.bsvClaimFeeBudgetSats)) || (v.bsvRefundFeeBudgetSats !== undefined && !n(v.bsvRefundFeeBudgetSats))) return false
   return true
+}
+
+export function isBridgeQuoteV2(v: unknown): v is BridgeQuoteV2 {
+  if (!exact(v, ['v', 'responderEvmAddr', 'responderBsvPubKeyHex', 'responderBsvAddress', 'htlcKind', 'bsvClaimFeeBudgetSats', 'bsvRefundFeeBudgetSats', 'doorQuoteId', 'settlementMode', 'fastCapUsdcBaseUnits'])) return false
+  return v.v === 2 && address(v.responderEvmAddr) && pubkey(v.responderBsvPubKeyHex) && typeof v.responderBsvAddress === 'string' && v.responderBsvAddress.length >= 1 && v.responderBsvAddress.length <= 128 && v.htlcKind === 'covenant' && n(v.bsvClaimFeeBudgetSats) && n(v.bsvRefundFeeBudgetSats) && isPublicDoorQuoteId(v.doorQuoteId) && DOOR_REQUEST_ID_RE.test(v.doorQuoteId) && publicSettlementModeAndCapAreConsistent(v.settlementMode, v.fastCapUsdcBaseUnits)
 }
 
 export const isBaseLocked = (v: unknown): v is { txHash: `0x${string}`; blockNumber: number } => exact(v, ['txHash', 'blockNumber']) && hex(v.txHash, 32, true) && n(v.blockNumber)

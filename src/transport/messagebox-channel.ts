@@ -21,6 +21,8 @@ export interface MessageBoxChannelOpts {
   sleep?: (ms: number) => Promise<void>
   /** Injectable clock → ms (tests). */
   now?: () => number
+  /** Optional lifecycle signal; aborting it cancels an in-flight receive and its poll timer. */
+  signal?: AbortSignal
   log?: (tag: string, msg: string) => void
 }
 
@@ -54,7 +56,13 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_CHANNEL_MAX_BODY_BYTES
   if (!Number.isInteger(maxPerPoll) || maxPerPoll < 1) throw new Error('messagebox-channel: maxPerPoll must be a positive integer')
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes < 1) throw new Error('messagebox-channel: maxBodyBytes must be a positive integer')
-  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const onAbort = (): void => { if (timer) clearTimeout(timer); reject(new Error('messagebox-channel: receive cancelled')) }
+    if (opts.signal?.aborted) return onAbort()
+    timer = setTimeout(() => { opts.signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+    opts.signal?.addEventListener('abort', onAbort, { once: true })
+  }))
   const now = opts.now ?? (() => Date.now())
   const log = opts.log ?? (() => {})
   let consecutiveListFailures = 0
@@ -91,6 +99,7 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
    * a protocol violation → throw (fail-closed): the swap aborts rather than proceed on garbage.
    */
   const takeOne = async <T>(kind: string, validate?: (value: unknown) => value is T): Promise<T | null> => {
+    if (opts.signal?.aborted) throw new Error('messagebox-channel: receive cancelled')
     const box = boxFor(kind)
     let msgs: PeerMessage[]
     try {
@@ -168,6 +177,7 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
     let polls = 0
     const maxPolls = Math.max(1, Math.ceil(timeoutMs / Math.max(1, pollMs))) + 2
     for (;;) {
+      if (opts.signal?.aborted) throw new Error('messagebox-channel: receive cancelled')
       const got = await takeOne<T>(kind, validate)
       if (got !== null) return got
       if (now() - start > timeoutMs || ++polls > maxPolls) {
@@ -175,6 +185,7 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
         throw new Error(`messagebox-channel: timed out waiting for '${kind}' (${timeoutMs}ms / ${maxPolls} polls)${detail}`)
       }
       await sleep(pollMs)
+      if (opts.signal?.aborted) throw new Error('messagebox-channel: receive cancelled')
     }
   }
 

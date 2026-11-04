@@ -2,6 +2,11 @@ import type { ConvertRequest, PetaSats, Quote, SwapResult } from '../convert'
 import type { SettlementState } from '../../bridge/settlement-session'
 import type { Transaction } from '@bsv/sdk'
 
+export type SettlementSpeed = 'standard' | 'fast'
+export type SettlementMode = 'confirmed' | 'fast'
+export type AgreedSettlementMode = 'pending' | SettlementMode
+export type SettlementModeUsed = 'pending' | 'not_revealed' | SettlementMode
+
 /** Public lifecycle states.  They are deliberately words a UI can display. */
 export type BuyerSwapStage =
   | 'quoted' | 'admitted' | 'usdc_locked' | 'waiting_bsv_lock' | 'bsv_lock_confirming'
@@ -13,6 +18,9 @@ export interface BuyerQuote extends Quote {
   bsvSats: bigint
   midUsdPerBsv?: number
   claimFeeBudgetSats?: number
+  doorProtocolVersion?: 1 | 2
+  fastOffered?: boolean
+  fastCapUsdcBaseUnits?: bigint
 }
 
 export interface BuyerSwapRecord {
@@ -26,6 +34,13 @@ export interface BuyerSwapRecord {
   deliverTo?: string
   createdAtMs: number
   updatedAtMs: number
+  requestedSpeed?: SettlementSpeed
+  agreedSettlementMode?: AgreedSettlementMode
+  settlementModeUsed?: SettlementModeUsed
+  settlementModeDowngradeReason?: string
+  agreedFastCapUsdcBaseUnits?: string
+  /** Snapshot taken before the first durable row; recovery never rereads limits for this decision. */
+  fastSettlementAllowedSnapshot?: boolean
   swapNamespace?: string
   handshakeDeadlineMs?: number
   baseLockTxid?: string
@@ -57,16 +72,20 @@ export interface DoorQuoteSuccess {
   usdcBaseUnits: string
   expiresAtMs: number
   midUsdPerBsv?: number
+  /** Optional so existing injected v1 clients remain source-compatible. */
+  doorProtocolVersion?: 1 | 2
+  fastOffered?: boolean
+  fastCapUsdcBaseUnits?: string
 }
 
 export interface DoorClient {
-  quote(usdcBaseUnits: bigint, requestId: string): Promise<DoorQuoteSuccess>
-  admit(quoteId: string, usdcBaseUnits: bigint, requestId: string): Promise<{ swapNamespace: string; handshakeDeadlineMs: number }>
+  quote(usdcBaseUnits: bigint, requestId: string, forceLegacy?: boolean): Promise<DoorQuoteSuccess>
+  admit(quoteId: string, usdcBaseUnits: bigint, requestId: string, requestedSettlementMode?: SettlementMode, forceLegacy?: boolean): Promise<{ swapNamespace: string; handshakeDeadlineMs: number; doorProtocolVersion?: 1 | 2; settlementMode?: SettlementMode; fastCapUsdcBaseUnits?: string }>
 }
 
 /** The executor is intentionally injected: unit tests never need an RPC or a real key. */
 export interface BuyerExecutor {
-  execute(input: { swapId: string; quote: BuyerQuote; swapNamespace: string; handshakeDeadlineMs: number; onSettlementLink?: (hashHex: string) => Promise<void>; onSettlement?: (record: { hashHex: string; state: SettlementState }) => void }): Promise<{
+  execute(input: { swapId: string; quote: BuyerQuote; swapNamespace: string; handshakeDeadlineMs: number; agreedSettlementMode?: SettlementMode; fastCapUsdcBaseUnits?: string; onSettlementLink?: (hashHex: string) => Promise<void>; onSettlement?: (record: { hashHex: string; state: SettlementState; settlementModeUsed?: SettlementModeUsed; settlementModeDowngradeReason?: string }) => void }): Promise<{
     ok: boolean
     baseLockTxid?: string
     bsvClaimTxid?: string
@@ -76,6 +95,8 @@ export interface BuyerExecutor {
     revealed?: boolean
     /** The executor proved its pre-lock USDC checkpoint was cleared after the exact lock tuple was absent. */
     nothingLocked?: boolean
+    settlementModeUsed?: SettlementModeUsed
+    settlementModeDowngradeReason?: string
   }>
   recover?(record: BuyerSwapRecord): Promise<BuyerRecoveryOutcome | undefined>
   /** Arm every durable settlement record; engines may return the current derived stage for linked kit swaps. */
@@ -84,6 +105,8 @@ export interface BuyerExecutor {
   readSettlement?(record: BuyerSwapRecord): Promise<{ state: SettlementState; bsvClaimTxid?: string; bsvClaimBeefHex?: string } | undefined>
   /** Clear an engine terminal tombstone only after this exact durable buyer row is written. */
   acknowledgeTerminal?(record: BuyerSwapRecord): Promise<void> | void
+  /** Stop background recovery owned by this executor. */
+  close?(): void
 }
 
 /** A recovery result is persisted by the kit, including a terminal settlement state after its source record is cleared. */
@@ -99,6 +122,8 @@ export interface BuyerRecoveryOutcome {
   bsvLockOutpoint?: string
   bsvRefundLocktime?: number
   baseTimelockBlock?: number
+  settlementModeUsed?: SettlementModeUsed
+  settlementModeDowngradeReason?: string
 }
 
 export interface BuyerStore {
@@ -118,7 +143,7 @@ export interface BuyerWallet {
   withdrawBsv?(address: string, opts?: { onlyTxid?: string; beforeBroadcast?: () => void | Promise<void> }): Promise<{ txid?: string; sats: bigint; reason?: string }>
   buildSweep?(address: string, opts: { onlyTxid: string }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
   /** Build a child of a persisted, unconfirmed covenant claim without consulting the UTXO indexer. */
-  buildEarlySweep?(address: string, opts: { claim: Transaction; claimTxid: string }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
+  buildEarlySweep?(address: string, opts: { claim: Transaction; claimTxid: string; settlementModeUsed: SettlementMode }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
   broadcastSweep?(outbox: { rawTx: string; atomicBeefHex?: string; txid: string; sats: string }): Promise<void>
   /** Must validate the same confirmation threshold as the claim path. */
   isSweepConfirmed?(txid: string, address: string): Promise<boolean>
@@ -183,10 +208,11 @@ export interface StartSwapRequest {
   /** Either this quote's id or minBsvOut is required.  Other quote fields are
    * compared to the locally retained quote before a door request is sent. */
   quote?: BuyerQuote
+  speed?: SettlementSpeed
 }
 
 export interface BuyerKit extends PetaSats {
-  startSwap(request: StartSwapRequest): Promise<{ swapId: string; stage: BuyerSwapStage; expectedMinutes: number }>
+  startSwap(request: StartSwapRequest): Promise<{ swapId: string; stage: BuyerSwapStage; expectedMinutes: number; requestedSpeed: SettlementSpeed; agreedSettlementMode: AgreedSettlementMode; settlementModeUsed: SettlementModeUsed }>
   status(swapId?: string): Promise<BuyerSwapRecord[]>
   recover(): Promise<BuyerSwapRecord[]>
   withdrawBsv(address: string): Promise<{ txid?: string; sats: bigint; reason?: string }>

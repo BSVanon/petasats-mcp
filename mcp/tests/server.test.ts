@@ -18,7 +18,7 @@ function fakePetasats(sink: { last?: StartSwapRequest } = {}): BuyerKit {
   return {
     quote: async (req) => ({ from: req.from, to: req.to, route: 'bridge', amountIn: req.amountIn, amountOut: req.amountIn * 2n, expiry: 9_999_999_999, quoteId: 'q1' }),
     convert: async (req) => ({ ok: true, route: 'bridge', status: 'pending', txids: { x: 'tx1' } }),
-    startSwap: async (request) => { sink.last = request; return { swapId: 'a'.repeat(32), stage: 'quoted', expectedMinutes: 20 } },
+    startSwap: async (request) => { sink.last = request; return { swapId: 'a'.repeat(32), stage: 'quoted', expectedMinutes: 20, requestedSpeed: request.speed ?? 'standard', agreedSettlementMode: request.speed === 'fast' ? 'pending' : 'confirmed', settlementModeUsed: 'pending' } },
     status: async () => [], recover: async () => [], withdrawBsv: async () => ({ sats: 0n }), withdrawBase: async () => ({ asset: 'USDC', amount: 1n, to: '0x1111111111111111111111111111111111111111', txid: '0xtx', status: 'success' }),
     walletInfo: async () => ({ baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, capUsdPerSwap: 100 }),
   }
@@ -52,6 +52,22 @@ test('swap_asset_to_bsv accepts only the phase-1 USDC source', async () => {
   assert.equal(p.stage, 'quoted')
   assert.equal(sink.last?.amountIn, 5000n)
   assert.equal(sink.last?.deliverTo, '1BsvAddr')
+  assert.equal(sink.last?.speed, 'standard')
+  assert.deepEqual(p, { swap_id: 'a'.repeat(32), stage: 'quoted', expected_minutes: 20, requested_speed: 'standard', agreed_settlement_mode: 'confirmed', settlement_mode_used: 'pending' })
+})
+
+test('fast speed is an explicit optional buyer choice, preserves v2 offer metadata, and the tool carries the full risk warning', async () => {
+  const sink: { last?: StartSwapRequest } = {}
+  const quote = { from: 'USDC' as const, to: 'BSV' as const, route: 'bridge' as const, amountIn: 25_000_000n, amountOut: 50_000n, expiry: 9_999_999_999, quoteId: 'q-fast', doorQuoteId: 'q-fast', usdcBaseUnits: 25_000_000n, bsvSats: 50_000n, doorProtocolVersion: 2 as const, fastOffered: true, fastCapUsdcBaseUnits: 25_000_000n }
+  const kit = { ...fakePetasats(sink), quote: async () => quote }
+  const wire = payload(await handleToolCall(kit, 'get_quote', { from_asset: 'USDC', to_asset: 'BSV', amount_in: '25000000' }))
+  assert.deepEqual({ version: wire.door_protocol_version, offered: wire.fast_offered, cap: wire.fast_cap_usdc_base_units }, { version: 2, offered: true, cap: '25000000' })
+  const started = payload(await handleToolCall(kit, 'swap_asset_to_bsv', { from_asset: 'USDC', amount_in: '25000000', quote: wire, speed: 'fast' }))
+  assert.equal(sink.last?.speed, 'fast'); assert.equal((sink.last?.quote as any)?.fastOffered, true); assert.equal(started.requested_speed, 'fast'); assert.equal(started.settlement_mode_used, 'pending')
+  const tool = TOOLS.find((item) => item.name === 'swap_asset_to_bsv')!
+  assert.equal((tool.inputSchema.required as readonly string[]).includes('speed'), false)
+  assert.match(tool.description, /Fast mode makes the kit reveal its secret against an unconfirmed BSV lock\. If the market maker double-spends that lock, you can lose the swap amount\./)
+  assert.match(tool.description, /both sides agree.*at most \$25.*one BSV confirmation/i)
 })
 
 test('swap_asset_to_bsv binds a supplied quote (reconstructed to the SDK Quote)', async () => {
@@ -66,8 +82,8 @@ test('swap_asset_to_bsv binds a supplied quote (reconstructed to the SDK Quote)'
 test('buyer-kit adapter starts in background and exposes status without secrets', async () => {
   const fake = {
     ...fakePetasats(),
-    startSwap: async () => ({ swapId: 'a'.repeat(32), stage: 'quoted' as const, expectedMinutes: 20 }),
-    status: async () => [{ swapId: 'a'.repeat(32), requestId: 'r1', stage: 'waiting_bsv_lock' as const, amountIn: '1000000', quote: {} as any, createdAtMs: 1, updatedAtMs: 1 }],
+    startSwap: async () => ({ swapId: 'a'.repeat(32), stage: 'quoted' as const, expectedMinutes: 20, requestedSpeed: 'standard' as const, agreedSettlementMode: 'confirmed' as const, settlementModeUsed: 'pending' as const }),
+    status: async () => [{ swapId: 'a'.repeat(32), requestId: 'r1', stage: 'waiting_bsv_lock' as const, amountIn: '1000000', quote: {} as any, requestedSpeed: 'fast' as const, agreedSettlementMode: 'fast' as const, settlementModeUsed: 'confirmed' as const, settlementModeDowngradeReason: 'ARC quorum undecided', createdAtMs: 1, updatedAtMs: 1 }],
     walletInfo: async () => ({ baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, capUsdPerSwap: 100 }),
     withdrawBsv: async () => ({ sats: 1n }), withdrawBase: async () => ({ asset: 'USDC' as const, amount: 1n, to: '0x1111111111111111111111111111111111111111', txid: '0xtx', status: 'success' }), recover: async () => [],
   }
@@ -75,6 +91,7 @@ test('buyer-kit adapter starts in background and exposes status without secrets'
   assert.equal(started.stage, 'quoted')
   const status = payload(await handleToolCall(fake, 'swap_status', { swap_id: 'a'.repeat(32) }))
   assert.equal(status.swaps[0].stage, 'waiting_bsv_lock')
+  assert.deepEqual({ requested: status.swaps[0].requested_speed, agreed: status.swaps[0].agreed_settlement_mode, used: status.swaps[0].settlement_mode_used, reason: status.swaps[0].settlement_mode_downgrade_reason }, { requested: 'fast', agreed: 'fast', used: 'confirmed', reason: 'ARC quorum undecided' })
   assert.equal(JSON.stringify(status).includes('secret'), false)
 })
 

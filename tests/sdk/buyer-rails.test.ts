@@ -298,6 +298,31 @@ describe('buyer runtime rails', () => {
     expect(decoded.inputs[0].sourceTransaction?.inputs[0].sourceTransaction?.merklePath).not.eq(undefined)
   })
 
+  it('fault row deliver_to fast recovery: a fast chain with mined grandparents builds one Atomic BEEF', async () => {
+    const key = PrivateKey.fromRandom(); const kit = key.toPublicKey().toAddress(); const to = PrivateKey.fromRandom().toPublicKey().toAddress()
+    const parent = new Transaction(); parent.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 40_000 }); parent.merklePath = new MerklePath(800_000, [[{ offset: 0, hash: parent.id('hex'), txid: true }, { offset: 1, duplicate: true }]])
+    const lock = new Transaction(); lock.addInput({ sourceTransaction: parent, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); lock.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 30_000 })
+    const claim = new Transaction(); claim.addInput({ sourceTransaction: lock, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 20_000 })
+    const built = await buildEarlySweepTx({ claim, claimTxid: claim.id('hex') as string, toAddress: to, key, feeRate: 100, settlementModeUsed: 'fast', chainTracker: { currentHeight: async () => 800_000, isValidRootForHeight: async () => true } as any })
+    const decoded = Transaction.fromAtomicBEEF(Array.from(Buffer.from(built.atomicBeefHex, 'hex')))
+    expect(decoded.inputs[0].sourceTransaction?.inputs[0].sourceTransaction?.inputs[0].sourceTransaction?.merklePath).not.eq(undefined)
+  })
+
+  it('fault row deliver_to fast recovery: a fast lock with an unproven parent is refused', async () => {
+    const key = PrivateKey.fromRandom(); const kit = key.toPublicKey().toAddress(); const to = PrivateKey.fromRandom().toPublicKey().toAddress()
+    const parent = new Transaction(); parent.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 40_000 })
+    const lock = new Transaction(); lock.addInput({ sourceTransaction: parent, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); lock.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 30_000 })
+    const claim = new Transaction(); claim.addInput({ sourceTransaction: lock, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 20_000 })
+    await rejects(() => buildEarlySweepTx({ claim, claimTxid: claim.id('hex') as string, toAddress: to, key, feeRate: 100, settlementModeUsed: 'fast', chainTracker: {} as any }), /no proven parent/)
+  })
+
+  it('fault row deliver_to confirmed recovery: an unmined lock is still refused', async () => {
+    const key = PrivateKey.fromRandom(); const kit = key.toPublicKey().toAddress(); const to = PrivateKey.fromRandom().toPublicKey().toAddress()
+    const lock = new Transaction(); lock.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 30_000 })
+    const claim = new Transaction(); claim.addInput({ sourceTransaction: lock, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 20_000 })
+    await rejects(() => buildEarlySweepTx({ claim, claimTxid: claim.id('hex') as string, toAddress: to, key, feeRate: 100, settlementModeUsed: 'confirmed', chainTracker: {} as any }), /claim lock has no merkle proof/)
+  })
+
   it('never includes a private key or WIF in buyer-rail errors', async () => {
     const key = PrivateKey.fromRandom(); const wif = key.toWif(); const hex = key.toString('hex')
     let error: unknown

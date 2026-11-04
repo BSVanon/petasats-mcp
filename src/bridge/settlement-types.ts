@@ -8,6 +8,8 @@
 import type { BsvHtlcUtxo } from '../settlement/htlc'
 import type { BsvHtlcKind, SettlementRecord } from './settlement-session'
 
+export type SettlementMode = 'confirmed' | 'fast'
+
 /** The taker's bridge negotiation payload, handed over AFTER it selects the MM's RFQ quote. */
 export interface BridgeIntent {
   hashHex: string
@@ -22,6 +24,13 @@ export interface BridgeIntent {
   baseChainId: number
 }
 
+export interface BridgeIntentV2 extends BridgeIntent {
+  v: 2
+  doorQuoteId: string
+  settlementMode: SettlementMode
+  fastCapUsdcBaseUnits: string
+}
+
 /** The responder's bridge-level reply — the market maker's receiving addresses (NOT the signed RFQ quote). */
 export interface BridgeQuote {
   responderEvmAddr: `0x${string}`
@@ -34,6 +43,13 @@ export interface BridgeQuote {
   htlcKind?: BsvHtlcKind
   bsvClaimFeeBudgetSats?: number
   bsvRefundFeeBudgetSats?: number
+}
+
+export interface BridgeQuoteV2 extends BridgeQuote {
+  v: 2
+  doorQuoteId: string
+  settlementMode: SettlementMode
+  fastCapUsdcBaseUnits: string
 }
 
 /**

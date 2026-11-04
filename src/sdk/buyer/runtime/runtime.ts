@@ -24,6 +24,7 @@ export interface BuyerRuntime {
   kit: BuyerKit
   paths: BuyerHome
   config: BuyerDiskConfig
+  close(): void
 }
 
 /** Test seams keep runtime-assembly tests entirely local; production uses all defaults. */
@@ -142,9 +143,9 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
       const built = await f.buildSweepTx({ coins, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB })
       return { rawTx: built.rawTx, atomicBeefHex: built.atomicBeefHex, txid: built.tx.id('hex') as string, sats: BigInt(built.outputSatoshis) }
     },
-    buildEarlySweep: async (address: string, opts: { claim: import('@bsv/sdk').Transaction; claimTxid: string }) => {
+    buildEarlySweep: async (address: string, opts: { claim: import('@bsv/sdk').Transaction; claimTxid: string; settlementModeUsed: 'confirmed' | 'fast' }) => {
       assertBuyerMainnetP2pkhAddress(address, 'address')
-      const built = await buildEarlySweepTx({ claim: opts.claim, claimTxid: opts.claimTxid, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB, chainTracker: bsv.chainTracker })
+      const built = await buildEarlySweepTx({ claim: opts.claim, claimTxid: opts.claimTxid, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB, chainTracker: bsv.chainTracker, settlementModeUsed: opts.settlementModeUsed })
       return { rawTx: built.rawTx, atomicBeefHex: built.atomicBeefHex, txid: built.tx.id('hex') as string, sats: BigInt(built.outputSatoshis) }
     },
     broadcastSweep: async (outbox: { rawTx: string; atomicBeefHex?: string; txid: string }) => {
@@ -174,5 +175,5 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     beforeNewSwap: async () => { await evmRails.assertSafeForNewLock() }, limits: () => readBuyerLimits(paths), spendingStopped: () => readSpendingStop(paths), withdrawalIntents,
     stopSpending: (reason) => stopSpending(paths, reason), log,
   })
-  return { kit, paths, config }
+  return { kit, paths, config, close: () => engine.close?.() }
 }

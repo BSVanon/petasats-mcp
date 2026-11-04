@@ -13,11 +13,11 @@ PetaSats supports USDC on Base to BSV only. Keys are made and kept on your machi
 3. The kit verifies the lock against a merkle proof and block headers, then claims BSV and reveals the secret.
 4. The market maker uses that secret to claim USDC.
 
-Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a shared daily total also applies. They usually take about an hour.
+Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a shared daily total also applies. Standard speed is the default and waits for one BSV confirmation. An explicit `speed: "fast"` request can reduce that wait for at most $25 only when both sides agree.
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.12` is recommended.
+Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.13` is recommended.
 
 ```sh
 claude mcp add petasats -- npx -y petasats-mcp
@@ -73,13 +73,16 @@ You can create `~/.petasats/limits.json` to restrict where an AI may send funds 
   "format": "petasats.limits/1",
   "bsvDestinations": ["1BoatSLRHtKNngkdXEeobR76b53LETtpyT"],
   "baseDestinations": ["0x1111111111111111111111111111111111111111"],
-  "maxSwapUsdPerDay": 50
+  "maxSwapUsdPerDay": 50,
+  "allowFastSettlement": false
 }
 ```
 
 Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp limits` to inspect it.
 
 `stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp resume`; recovery for swaps already started keeps working.
+
+`allowFastSettlement: false` forbids fast settlement for new swaps. If the field is missing, an explicitly requested fast swap is permitted to negotiate it; standard remains the default.
 
 These controls protect against an AI that can only use the kit's tools. An AI app that can run shell commands or edit files as you can also edit `limits.json` or `STOP`.
 
@@ -90,6 +93,8 @@ The server gives the AI an operating guide. With a person watching, it reports o
 ## Safety model
 
 Funds can go only to the swap contract on Base, the kit’s own addresses, or an address you provide. The kit verifies before reveal. The market maker’s BSV can return about four hours (24 blocks) after lock; your USDC refunds after about 16 hours if the swap does not finish. Recovery resumes after restart. Run one swap at a time and keep the server running during a swap.
+
+Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation. Fast is the buyer’s explicit choice; omitting `speed` uses standard settlement.
 
 ## Costs
 

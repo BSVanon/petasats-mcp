@@ -5,6 +5,8 @@ import { CLTV_TIMESTAMP_THRESHOLD, type BsvHtlcUtxo } from '../settlement/htlc'
 // signature). Recovery of any pre-existing legacy lock lives in the narrow standalone surface (`scripts/recover-bsv-2of2-refund.ts`
 // + `assertRefundArtifactValid`), NOT here. The `htlcKind` field is retained (vestigial, always covenant) until E-3.
 import { buildBridgeCovenantScript, bridgeCovenantRefundSats, extractBridgeCovenantSecret, type BridgeCovenantTerms } from '../settlement/htlc/bridge-covenant'
+import { fastAtomicEligible, isCanonicalFastCap, isPublicDoorQuoteId, isPublicSettlementMode, publicSettlementModeAndCapAreConsistent } from './settlement-mode'
+export { fastAtomicEligible } from './settlement-mode'
 import {
   MIN_REVEAL_CONFIRM_BUDGET_BLOCKS,
   checkResponderRunwayAndOrdering,
@@ -37,6 +39,8 @@ export type BsvHtlcKind = 'legacy2of2' | 'covenant'
 export const DEFAULT_COVENANT_FEE_BUDGET_SATS = 1000
 
 export type SwapRole = 'initiator' | 'responder'
+export type SettlementMode = 'confirmed' | 'fast'
+export type SettlementModeUsed = 'pending' | 'not_revealed' | SettlementMode
 
 export type SettlementState =
   | 'created' // params set, nothing locked yet
@@ -112,6 +116,11 @@ export interface SettlementParams {
    * swap must be worth less than the cost of attacking it. Above it → require a confirmation.
    */
   zeroConfCapUsd: number
+  /** Present only on the explicit public-door v2 path. Legacy/restock callers keep their existing semantics. */
+  doorProtocolVersion?: 2
+  doorQuoteId?: string
+  agreedSettlementMode?: SettlementMode
+  fastCapUsdcBaseUnits?: string
 }
 
 export interface SettlementRecord extends SettlementParams {
@@ -169,6 +178,8 @@ export interface SettlementRecord extends SettlementParams {
   abortReason?: string
   /** Transition log (`at` from the injected clock). */
   history: Array<{ state: SettlementState; at: number }>
+  settlementModeUsed?: SettlementModeUsed
+  settlementModeDowngradeReason?: string
 }
 
 export interface CompetingResolution {
@@ -268,6 +279,10 @@ function validateCompetingResolution(rec: SettlementRecord): void {
  */
 export function validateSettlementRecord(rec: SettlementRecord): void {
   validateParams(rec)
+  if (rec.settlementModeUsed !== undefined && rec.settlementModeUsed !== 'pending' && rec.settlementModeUsed !== 'not_revealed' && rec.settlementModeUsed !== 'confirmed' && rec.settlementModeUsed !== 'fast') throw new Error('SettlementRecord: invalid settlementModeUsed')
+  if (rec.agreedSettlementMode === 'confirmed' && rec.settlementModeUsed === 'fast') throw new Error('SettlementRecord: confirmed agreement cannot have fast mode used')
+  if (rec.doorProtocolVersion === 2 && rec.settlementModeUsed === 'fast' && rec.agreedSettlementMode !== 'fast') throw new Error('SettlementRecord: fast mode used without a fast v2 agreement')
+  if (rec.settlementModeDowngradeReason !== undefined && typeof rec.settlementModeDowngradeReason !== 'string') throw new Error('SettlementRecord: settlementModeDowngradeReason must be a string')
   if (rec.role !== 'initiator' && rec.role !== 'responder') throw new Error(`SettlementRecord: invalid role '${String(rec.role)}'`)
   if (!SETTLEMENT_STATES.has(rec.state)) throw new Error(`SettlementRecord: invalid state '${String(rec.state)}'`)
   if (rec.bsvClaimWriteAhead !== undefined && rec.bsvClaimWriteAhead !== true) {
@@ -399,6 +414,7 @@ export class SettlementSession {
       role,
       state: 'created',
       bsvClaimWriteAhead: true,
+      ...(params.doorProtocolVersion === 2 ? { settlementModeUsed: 'pending' as const } : {}),
       history: [{ state: 'created', at: now }],
     })
   }
@@ -415,6 +431,17 @@ export class SettlementSession {
 
   toRecord(): SettlementRecord {
     return { ...this.rec, history: [...this.rec.history] }
+  }
+
+  /** Persist the actual reveal path before the irreversible claim broadcast. */
+  recordSettlementModeUsed(mode: 'confirmed' | 'fast', downgradeReason?: string): void {
+    if (this.rec.agreedSettlementMode === 'confirmed' && mode === 'fast') throw new Error('SettlementSession: confirmed agreement cannot be upgraded to fast')
+    this.rec.settlementModeUsed = mode
+    if (downgradeReason) this.rec.settlementModeDowngradeReason = downgradeReason
+  }
+
+  recordNoReveal(): void {
+    if (this.rec.settlementModeUsed !== 'fast' && this.rec.settlementModeUsed !== 'confirmed') this.rec.settlementModeUsed = 'not_revealed'
   }
 
   /** Evidence-only metadata. It intentionally does not alter the settlement state or any watch decision. */
@@ -938,5 +965,17 @@ function validateParams(p: SettlementParams, now?: number): void {
   // over-cap value would silently make a FULL-cap swap 0-conf-eligible on the irreversible path.
   if (!Number.isFinite(p.zeroConfCapUsd) || p.zeroConfCapUsd < 0 || p.zeroConfCapUsd > p.capUsdPerSwap) {
     throw new Error(`SettlementParams: zeroConfCapUsd must be finite and in [0, capUsdPerSwap=${p.capUsdPerSwap}] (§12.11; 0 disables the 0-conf fast-path)`)
+  }
+  const hasV2 = p.doorProtocolVersion !== undefined || p.doorQuoteId !== undefined || p.agreedSettlementMode !== undefined || p.fastCapUsdcBaseUnits !== undefined
+  if (hasV2) {
+    if (p.doorProtocolVersion !== 2 || !isPublicDoorQuoteId(p.doorQuoteId) || !isPublicSettlementMode(p.agreedSettlementMode) || !isCanonicalFastCap(p.fastCapUsdcBaseUnits)) {
+      throw new Error('SettlementParams: incomplete or invalid public-door v2 settlement terms')
+    }
+    if (p.usdcDecimals !== 6) throw new Error('SettlementParams: public-door v2 fast terms require 6-decimal USDC')
+    if (p.agreedSettlementMode === 'confirmed') {
+      if (!publicSettlementModeAndCapAreConsistent(p.agreedSettlementMode, p.fastCapUsdcBaseUnits) || p.zeroConfCapUsd !== 0) throw new Error('SettlementParams: confirmed v2 settlement requires cap 0')
+    } else if (!publicSettlementModeAndCapAreConsistent(p.agreedSettlementMode, p.fastCapUsdcBaseUnits) || !fastAtomicEligible(p.amountUsdc, p.fastCapUsdcBaseUnits) || p.zeroConfCapUsd <= 0 || p.zeroConfCapUsd > 25) {
+      throw new Error('SettlementParams: fast v2 settlement amount/cap is ineligible')
+    }
   }
 }

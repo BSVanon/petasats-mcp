@@ -35,6 +35,7 @@ export interface BuildEarlySweepTxOptions {
   key: PrivateKey
   feeRate: number
   chainTracker: ChainTracker
+  settlementModeUsed?: 'confirmed' | 'fast'
 }
 
 /** Build one signed P2PKH output from exactly the caller-specified coins. */
@@ -74,7 +75,7 @@ export async function buildSweepTx(opts: BuildSweepTxOptions): Promise<BuiltBuye
   return { rawTx: tx.toHex(), atomicBeefHex: Utils.toHex(beef.toBinaryAtomic(txid)), tx, fee, outputSatoshis }
 }
 
-/** Build a child of the persisted claim, retaining its merkle-proven lock ancestor in Atomic BEEF. */
+/** Build a child of the persisted claim, retaining its independently proven ancestry in Atomic BEEF. */
 export async function buildEarlySweepTx(opts: BuildEarlySweepTxOptions): Promise<BuiltBuyerSweep> {
   if (opts.claim.id('hex').toLowerCase() !== opts.claimTxid.toLowerCase()) throw new Error('buyer early sweep: claim transaction mismatch')
   if (!Number.isFinite(opts.feeRate) || opts.feeRate <= 0) throw new Error('buyer early sweep: feeRate must be positive')
@@ -82,10 +83,23 @@ export async function buildEarlySweepTx(opts: BuildEarlySweepTxOptions): Promise
     throw new Error('buyer early sweep: toAddress is not a valid BSV P2PKH mainnet Base58Check address')
   }
   const lock = opts.claim.inputs[0]?.sourceTransaction
-  if (!lock?.merklePath) throw new Error('buyer early sweep: claim lock has no merkle proof')
-  let lockProven = false
-  try { lockProven = await lock.merklePath.verify(lock.id('hex'), opts.chainTracker) } catch { /* fail closed below */ }
-  if (!lockProven) throw new Error('buyer early sweep: claim lock merkle proof failed')
+  if (!lock) throw new Error('buyer early sweep: claim lock is missing')
+  if (opts.settlementModeUsed === 'fast') {
+    if (!lock.inputs.length) throw new Error('buyer early sweep: fast claim lock has no inputs')
+    for (let vin = 0; vin < lock.inputs.length; vin++) {
+      const input = lock.inputs[vin]
+      const parent = input.sourceTransaction
+      if (!parent || (input.sourceTXID && parent.id('hex').toLowerCase() !== input.sourceTXID.toLowerCase()) || !parent.merklePath) throw new Error(`buyer early sweep: fast claim lock input ${vin} has no proven parent`)
+      let proven = false
+      try { proven = await parent.merklePath.verify(parent.id('hex'), opts.chainTracker) } catch { /* fail closed below */ }
+      if (!proven) throw new Error(`buyer early sweep: fast claim lock input ${vin} parent merkle proof failed`)
+    }
+  } else {
+    if (!lock.merklePath) throw new Error('buyer early sweep: claim lock has no merkle proof')
+    let lockProven = false
+    try { lockProven = await lock.merklePath.verify(lock.id('hex'), opts.chainTracker) } catch { /* fail closed below */ }
+    if (!lockProven) throw new Error('buyer early sweep: claim lock merkle proof failed')
+  }
   const kitLockHex = new P2PKH().lock(opts.key.toPublicKey().toAddress()).toHex()
   const coins = opts.claim.outputs.flatMap((output, index) => output.lockingScript.toHex() === kitLockHex ? [{ output, index }] : [])
   if (!coins.length) throw new Error('buyer early sweep: claim has no kit P2PKH outputs')

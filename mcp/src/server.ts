@@ -29,6 +29,7 @@ REPORTING
 - Never pause, slow down or ask anything once a swap has started. Reporting never holds up the swap.
 
 SAFETY
+- Standard speed is the default. Fast mode is the buyer's explicit choice and both sides must agree; otherwise the swap waits for one BSV confirmation. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.
 - Keep this MCP server running until the swap is done. If it stops, the swap resumes safely when it starts again. If it stays stopped for more than about 3 hours after the USDC lock, the swap cannot finish; the kit then refunds the USDC the next time it runs after the Base timelock ends (about 16 hours after the lock).
 - The kit refuses a new swap or a withdrawal while a swap is in progress.
 - stop_spending stops new swaps and withdrawals until the user runs \`npx petasats-mcp resume\` in a terminal. Limits in limits.json can also refuse destinations and daily spending.
@@ -51,7 +52,7 @@ const TOOLS = [
   },
   {
     name: 'swap_asset_to_bsv',
-    title: 'Start USDC to BSV swap', description: 'Starts a funds-moving USDC on Base to BSV swap. Amounts are atomic strings; returns the local swap id.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    title: 'Start USDC to BSV swap', description: 'Starts a funds-moving USDC on Base to BSV swap. speed is the buyer’s explicit choice; standard is the default. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -61,6 +62,7 @@ const TOOLS = [
         min_bsv_out: { type: 'string', description: 'Optional minimum BSV output in sats.' },
         quote_id: { type: 'string', description: 'Quote id returned by get_quote.' },
         quote: { type: 'object', description: 'Optional: a quote object returned by get_quote, to lock its terms (bound to route + pair + amount_in).' },
+        speed: { type: 'string', enum: ['standard', 'fast'], description: 'Optional buyer choice. standard (default) waits for one BSV confirmation. fast permits an unconfirmed-lock reveal only when both sides agree and the amount is at most $25.' },
       },
       required: ['from_asset', 'amount_in'],
     },
@@ -122,7 +124,7 @@ function toQuoteWire(q: Quote): Record<string, unknown> {
     usdc_in: { atomic: q.amountIn.toString(), display: usdcDisplay }, bsv_out: { sats: bsv.toString(), display: bsvDisplay }, est_bsv_claim_fee_sats: claimFee.toString(), est_bsv_received_sats: (bsv - claimFee).toString(), rate_usd_per_bsv: rate, market_mid_usd_per_bsv: mid ?? null, price_vs_mid_percent: mid ? Number((((rate - mid) / mid) * 100).toFixed(2)) : null,
     costs: { base_gas: 'approve and lock on Base, paid in ETH by this kit', bsv_claim_fee_sats: claimFee.toString(), bsv_delivery_fee_note: 'with deliver_to, one more small BSV fee (about 400 sats)' }, fee_note: "PetaSats adds no separate fee; the market maker's price is the rate above", limits: { min_usd_note: 'about $5; smaller swaps are declined', max_usd_per_swap: 100, per_buyer_per_day: '3 swaps and $200', shared_daily_total_note: 'shared daily total may make the service busy' }, next: 'swap_asset_to_bsv with this quote_id; quotes last about 60 seconds',
     from: formatAsset(q.from), to: formatAsset(q.to), route: q.route, amount_in: q.amountIn.toString(), amount_out: q.amountOut.toString(), expiry: q.expiry,
-    ...(buyerQuote.doorQuoteId ? { door_quote_id: buyerQuote.doorQuoteId, usdc_base_units: buyerQuote.usdcBaseUnits?.toString(), bsv_sats: buyerQuote.bsvSats?.toString() } : {}),
+    ...(buyerQuote.doorQuoteId ? { door_quote_id: buyerQuote.doorQuoteId, usdc_base_units: buyerQuote.usdcBaseUnits?.toString(), bsv_sats: buyerQuote.bsvSats?.toString(), door_protocol_version: buyerQuote.doorProtocolVersion ?? 1, fast_offered: buyerQuote.fastOffered ?? false, fast_cap_usdc_base_units: (buyerQuote.fastCapUsdcBaseUnits ?? 0n).toString() } : {}),
   }
 }
 
@@ -145,7 +147,11 @@ function fromQuoteWire(o: Record<string, unknown>): Quote {
   if (!Number.isFinite(expiry)) throw new ToolInputError('quote.expiry must be a number')
   const quote: Quote = { from, to, route: route as Route, amountIn, amountOut, expiry, quoteId: String(o.quote_id ?? '') }
   if (typeof o.door_quote_id === 'string' && typeof o.usdc_base_units === 'string' && typeof o.bsv_sats === 'string' && /^\d+$/.test(o.usdc_base_units) && /^\d+$/.test(o.bsv_sats)) {
-    return { ...quote, doorQuoteId: o.door_quote_id, usdcBaseUnits: BigInt(o.usdc_base_units), bsvSats: BigInt(o.bsv_sats) } as BuyerQuote
+    const version = o.door_protocol_version === 2 ? 2 : 1
+    const fastOffered = o.fast_offered === true
+    const cap = typeof o.fast_cap_usdc_base_units === 'string' && /^(?:0|[1-9]\d*)$/.test(o.fast_cap_usdc_base_units) ? BigInt(o.fast_cap_usdc_base_units) : 0n
+    if ((version !== 2 || !fastOffered) && cap !== 0n) throw new ToolInputError('quote fast metadata is contradictory')
+    return { ...quote, doorQuoteId: o.door_quote_id, usdcBaseUnits: BigInt(o.usdc_base_units), bsvSats: BigInt(o.bsv_sats), doorProtocolVersion: version, fastOffered, fastCapUsdcBaseUnits: cap } as BuyerQuote
   }
   return quote
 }
@@ -185,12 +191,14 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
         const quote = quoteObj ? fromQuoteWire(quoteObj) : undefined
         const quoteId = optionalString(a, 'quote_id')
         const min = optionalString(a, 'min_bsv_out')
+        const speed = optionalString(a, 'speed') ?? 'standard'
+        if (speed !== 'standard' && speed !== 'fast') throw new ToolInputError('speed must be standard or fast')
         if (min !== undefined && !/^\d{1,16}$/.test(min)) throw new ToolInputError('min_bsv_out must be a positive bounded sats integer string')
         const minBsvOut = min === undefined ? undefined : BigInt(min)
         if (minBsvOut !== undefined && (minBsvOut < 1n || minBsvOut > MAX_BSV_SATS)) throw new ToolInputError('min_bsv_out must be a positive bounded sats integer string')
         if (!quoteId && !quote && minBsvOut === undefined) throw new ToolInputError('pass quote_id or min_bsv_out')
-        const started = await petasats.startSwap({ amountIn, deliverTo, minBsvOut, quote: (quote ?? (quoteId ? { quoteId } : undefined)) as BuyerQuote | undefined })
-        return success({ swap_id: started.swapId, stage: started.stage, expected_minutes: started.expectedMinutes })
+        const started = await petasats.startSwap({ amountIn, deliverTo, minBsvOut, quote: (quote ?? (quoteId ? { quoteId } : undefined)) as BuyerQuote | undefined, speed })
+        return success({ swap_id: started.swapId, stage: started.stage, expected_minutes: started.expectedMinutes, requested_speed: started.requestedSpeed, agreed_settlement_mode: started.agreedSettlementMode, settlement_mode_used: started.settlementModeUsed })
       }
 
       case 'swap_status': {
