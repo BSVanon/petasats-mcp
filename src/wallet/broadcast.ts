@@ -10,6 +10,15 @@ export interface BroadcastOptions {
   taalApiKey?: string | null
   anvilNodeUrl?: string | null
   anvilAuthToken?: string | null
+  /**
+   * Convert a supplied BRC-95 Atomic BEEF to ordinary BEEF for ARC's
+   * `rawTx` field. ARC recognises the BRC-62 BEEF marker (`0100beef`), not
+   * Atomic BEEF's subject-prefixed marker (`01010101`).
+   *
+   * This is deliberately opt-in: established market-maker/supplier callers
+   * retain their exact request bytes.
+   */
+  arcAtomicBeefAsBeef?: boolean
 }
 
 export interface TxStatus {
@@ -196,6 +205,7 @@ async function broadcastViaArc(
   rawTx: string,
   atomicBeefHex?: string,
   callTaalApiKey = taalApiKey,
+  atomicBeefAsBeef = false,
 ): Promise<BroadcastResult> {
   const providers = [
     { url: 'https://arc.gorillapool.io', name: 'GorillaPool', apiKey: undefined as string | undefined },
@@ -209,14 +219,20 @@ async function broadcastViaArc(
       const h: Record<string, string> = { 'Content-Type': 'application/json' }
       if (provider.apiKey) h['Authorization'] = `Bearer ${provider.apiKey}`
 
-      // ARC's rawTx field accepts raw hex, extended format, OR BEEF
-      // (auto-detected). Send Atomic BEEF when supplied so a tx spending
-      // a 0-conf parent validates against the ancestry carried in the
-      // BEEF rather than being rejected for unknown inputs.
+      // ARC's rawTx field accepts raw hex, extended format, or BRC-62 BEEF.
+      // It does not recognise BRC-95 Atomic BEEF's 01010101 subject prefix;
+      // the buyer kit opts into reserializing its Atomic BEEF as ordinary
+      // BEEF, retaining the exact ancestry while giving ARC its documented
+      // marker. Existing callers retain their byte-for-byte Atomic BEEF wire.
+      const arcTx = atomicBeefHex == null
+        ? rawTx
+        : atomicBeefAsBeef
+          ? Transaction.fromHexBEEF(atomicBeefHex).toHexBEEF()
+          : atomicBeefHex
       const res = await fetch(`${provider.url}/v1/tx`, {
         method: 'POST',
         headers: h,
-        body: JSON.stringify({ rawTx: atomicBeefHex ?? rawTx }),
+        body: JSON.stringify({ rawTx: arcTx }),
         signal: AbortSignal.timeout(30_000),
       })
 
@@ -395,12 +411,13 @@ export async function broadcast(
   const callAnvilNodeUrl = options && 'anvilNodeUrl' in options ? options.anvilNodeUrl ?? null : anvilNodeUrl
   const callTaalApiKey = options && 'taalApiKey' in options ? options.taalApiKey ?? null : taalApiKey
   const callAnvilAuthToken = options && 'anvilAuthToken' in options ? options.anvilAuthToken ?? null : anvilAuthToken
+  const callArcAtomicBeefAsBeef = options?.arcAtomicBeefAsBeef === true
   const anvilResult = await broadcastViaAnvil(rawTx, atomicBeefHex, callAnvilNodeUrl, callAnvilAuthToken)
   if (anvilResult) return anvilResult
   let arcMsg = ''
   let wocMsg = ''
   try {
-    return await broadcastViaArc(rawTx, atomicBeefHex, callTaalApiKey)
+    return await broadcastViaArc(rawTx, atomicBeefHex, callTaalApiKey, callArcAtomicBeefAsBeef)
   } catch (arcErr) {
     if (arcErr instanceof FatalBroadcastError) throw arcErr
     arcMsg = (arcErr as Error).message

@@ -13,6 +13,8 @@ import { makeMessageBoxInitiatorCoordinator } from '../../transport/messagebox-c
 import type { BuyerExecutor, BuyerQuote, BuyerRecoveryOutcome, BuyerSwapRecord, BuyerSwapStage } from './types'
 import { resolveUnlandedLock, UNLANDED_LOCK_ABORT_REASON, type BuyerUnlandedLockRails } from './unlanded-lock'
 
+export const BUYER_RECOVERY_POLL_MS = 15_000
+
 const knownBuyerStage = (stage: string): stage is BuyerSwapStage => new Set<BuyerSwapStage>([
   'quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'claimed',
   'settled', 'sweeping', 'delivered', 'refund_waiting', 'refunded', 'failed', 'needs_attention',
@@ -70,7 +72,12 @@ export interface BuyerEngineDeps {
   comms: CommsLayer
   doorIdentity: string
   evm: BridgeInitiatorEvmRails & Pick<RecoveryClaimEvm, 'refund'> & Partial<BuyerUnlandedLockRails>
-  bsv: BridgeInitiatorBsvRails & RecoveryBsvRails
+  bsv: BridgeInitiatorBsvRails & RecoveryBsvRails & Partial<{
+    txConfirmationsStrict: RecoveryBsvRails['txConfirmations']
+    fetchTxStrict: RecoveryBsvRails['fetchTx']
+    fetchBeefStrict: NonNullable<RecoveryBsvRails['fetchBeef']>
+    resolveSpenderStrict: RecoveryBsvRails['resolveSpender']
+  }>
   chainTracker: ChainTracker
   bsvReservePub: PublicKey
   settlementDir: string
@@ -91,18 +98,35 @@ export interface BuyerEngineDeps {
  */
 export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recoverAll(records: BuyerSwapRecord[]): Promise<Map<string, BuyerRecoveryOutcome>> } {
   const records = makeFileSwapRecordStore(deps.settlementDir, { censusGroupRead: false, recordMode: 0o600 })
-  const claimIsBuried = makeValidatedBsvFinality({ ...deps.bsv, chainTracker: deps.chainTracker } as RecoveryBsvRails)
+  // The executor must retain the legacy lenient reads: an indexer outage while
+  // its funded lock is confirming cannot abort the live swap. Recovery needs
+  // the opposite distinction so an unknown read cannot authorize a transition
+  // or re-broadcast. Remap strict siblings only in this recovery-only view.
+  const recoveryBsvRails: RecoveryBsvRails = {
+    ...deps.bsv,
+    chainTracker: deps.chainTracker,
+    txConfirmations: deps.bsv.txConfirmationsStrict ?? deps.bsv.txConfirmations,
+    fetchTx: deps.bsv.fetchTxStrict ?? deps.bsv.fetchTx,
+    fetchBeef: deps.bsv.fetchBeefStrict ?? deps.bsv.fetchBeef,
+    resolveSpender: deps.bsv.resolveSpenderStrict ?? deps.bsv.resolveSpender,
+  }
+  const claimIsBuried = makeValidatedBsvFinality(recoveryBsvRails)
   const known = new Map<string, { hashHex: string; state: SettlementState }>()
   const executorClears = new Map<string, { state: SettlementState; reason?: string }>()
   const lastUnlandedLockCheck = new Map<string, number>()
   const executingHashes = new Set<string>()
+  // A validated terminal generation may survive a best-effort compare-and-clear
+  // failure. Remember it for this process so later passes retry deletion without
+  // re-running its chain watcher or weakening the proof that preceded deletion.
+  const acknowledgedTerminalTokens = new Map<string, string>()
+  const terminalAcknowledgements = new Map<string, Promise<boolean>>()
   const mark = (hashHex: string, state: SettlementState): void => {
     for (const [swapId, current] of known) if (current.hashHex === hashHex) known.set(swapId, { hashHex, state })
   }
   const recovery = makeInitiatorRecoverySupervisor({
     evm: deps.evm as unknown as Erc20SwapEvmClient,
     evmRefund: deps.evm,
-    bsvRails: deps.bsv,
+    bsvRails: recoveryBsvRails,
     log: deps.log,
     // The kit's progress lines go through its own log, so the default sink can throttle the repeating wait lines.
     emitProgress: (s) => deps.log(formatInitiatorWatchtowerProgress(s).trimStart()),
@@ -114,10 +138,55 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       if (!state || !terminalSettlement(state)) records.clear(hashHex, expected)
     },
     recordPathFor: (hashHex) => records.pathFor(hashHex),
-    pollMs: 1_000,
+    pollMs: BUYER_RECOVERY_POLL_MS,
     refundConfs: 1,
     onPersist: (record) => mark(record.hashHex, record.state),
   })
+  const terminalArtifactsMatch = (buyer: BuyerSwapRecord, settlement: SettlementRecord): boolean =>
+    settlement.state === buyer.settlementState &&
+    settlement.baseLockTxHash === buyer.baseLockTxid &&
+    settlement.refundTxid === buyer.baseRefundTxid &&
+    settlement.bsvClaimTxid === buyer.bsvClaimTxid
+  const acknowledgeTerminalRecord = async (buyer: BuyerSwapRecord): Promise<boolean> => {
+    if (!buyer.settlementHashHex || !buyer.settlementState || !terminalSettlement(buyer.settlementState)) return false
+    const inflightKey = buyer.settlementHashHex.toLowerCase()
+    const inflight = terminalAcknowledgements.get(inflightKey)
+    if (inflight) return inflight
+    const task = (async (): Promise<boolean> => {
+      const listed = records.list()
+      const settlement = listed.records.find((item) => item.hashHex.toLowerCase() === inflightKey)
+      if (!settlement || !terminalArtifactsMatch(buyer, settlement)) return false
+      // A never-landed lock's tombstone stays on disk: it keeps the exact tuple, so a lock that still landed after the
+      if (settlement.abortReason === UNLANDED_LOCK_ABORT_REASON) return false
+      const token = JSON.stringify(settlement)
+      if (acknowledgedTerminalTokens.get(inflightKey) !== token) {
+        // The executor considers one SPV-proven confirmation sufficient for delivery, but the raw/BEEF claim is still
+        // the reorg/re-broadcast backstop until the recovery finality depth. Keep that artifact durable across restarts.
+        if (settlement.state === 'settled' && hasPersistedBsvClaimArtifact(settlement)) {
+          if (!claimIsBuried || !settlement.bsvClaimTxid) return false
+          try { if (!await claimIsBuried(settlement.bsvClaimTxid, DEFAULT_BSV_FINALITY_CONFIRMATIONS)) return false } catch { return false }
+        }
+        acknowledgedTerminalTokens.set(inflightKey, token)
+      }
+      // Fence a watcher that was armed by an earlier/concurrent pass before its
+      // old revealed snapshot can recreate the acknowledged terminal file.
+      recovery.cancelRecord?.(settlement, 'buyer terminal row acknowledged')
+      const latest = records.list().records.find((item) => item.hashHex.toLowerCase() === inflightKey)
+      if (!latest) return true
+      if (!terminalArtifactsMatch(buyer, latest)) return false
+      const latestToken = JSON.stringify(latest)
+      // A watcher may have refreshed only the terminal history while the proof
+      // read was in flight. The exact terminal artifacts remain the proof subject.
+      if (latest.bsvClaimTxid !== settlement.bsvClaimTxid || latest.state !== settlement.state) return false
+      acknowledgedTerminalTokens.set(inflightKey, latestToken)
+      records.clear(latest.hashHex, latest)
+      return true
+    })()
+    terminalAcknowledgements.set(inflightKey, task)
+    try { return await task } finally {
+      if (terminalAcknowledgements.get(inflightKey) === task) terminalAcknowledgements.delete(inflightKey)
+    }
+  }
   const remember = (swapId: string, record: SettlementRecord, notify?: (r: { hashHex: string; state: SettlementState }) => void): void => {
     const seen = { hashHex: record.hashHex, state: record.state }
     known.set(swapId, seen)
@@ -302,9 +371,14 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       return found ? { state: found.state, bsvClaimTxid: found.bsvClaimTxid, bsvClaimBeefHex: found.bsvClaimBeefHex } : undefined
     },
     async recoverAll(buyerRecords) {
+      // Terminal buyer rows are the durable acknowledgement side of the hand-off.
+      // Give them first chance to compare-clear before arming anything from the
+      // settlement directory; otherwise a buried tombstone is reprocessed and can
+      // race its own deletion on every background pass.
+      await Promise.all(buyerRecords.map((buyer) => acknowledgeTerminalRecord(buyer)))
       const listed = records.list()
       const resolvedRecords = await Promise.all(listed.records.map((record) => resolveUnlandedLockIfDue(record)))
-      recovery.ensure(resolvedRecords)
+      recovery.ensure(resolvedRecords.filter((record) => acknowledgedTerminalTokens.get(record.hashHex.toLowerCase()) !== JSON.stringify(record)))
       const stages = new Map<string, BuyerRecoveryOutcome>()
       for (const buyer of buyerRecords) {
         const hashHex = buyer.settlementHashHex
@@ -341,21 +415,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       return stages
     },
     async acknowledgeTerminal(buyer) {
-      if (!buyer.settlementHashHex || !buyer.settlementState || !terminalSettlement(buyer.settlementState)) return
-      const listed = records.list()
-      const settlement = listed.records.find((item) => item.hashHex === buyer.settlementHashHex)
-      if (!settlement || settlement.state !== buyer.settlementState) return
-      // A never-landed lock's tombstone stays on disk: it keeps the exact tuple, so a lock that still landed after the
-      if (settlement.abortReason === UNLANDED_LOCK_ABORT_REASON) return
-      // A tombstone is acknowledged only by the exact observable terminal artifacts, never merely by a UI stage.
-      if (settlement.baseLockTxHash !== buyer.baseLockTxid || settlement.refundTxid !== buyer.baseRefundTxid || settlement.bsvClaimTxid !== buyer.bsvClaimTxid) return
-      // The executor considers one SPV-proven confirmation sufficient for delivery, but the raw/BEEF claim is still
-      // the reorg/re-broadcast backstop until the recovery finality depth. Keep that artifact durable across restarts.
-      if (settlement.state === 'settled' && hasPersistedBsvClaimArtifact(settlement)) {
-        if (!claimIsBuried || !settlement.bsvClaimTxid) return
-        try { if (!await claimIsBuried(settlement.bsvClaimTxid, DEFAULT_BSV_FINALITY_CONFIRMATIONS)) return } catch { return }
-      }
-      records.clear(settlement.hashHex, settlement)
+      await acknowledgeTerminalRecord(buyer)
     },
   }
 }

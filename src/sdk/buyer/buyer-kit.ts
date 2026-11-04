@@ -1,5 +1,4 @@
 import { randomBytes } from 'crypto'
-import { Transaction, Utils } from '@bsv/sdk'
 import { isAddress } from 'viem'
 import { isBsv, isErc20, type ConvertRequest, type Quote, type SwapResult } from '../convert'
 import type { BuyerBaseWallet, BuyerKit, BuyerKitConfig, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, BuyerStore, BuyerWallet, DoorClient, BuyerExecutor, StartSwapRequest, BuyerWithdrawalCancelResult, BuyerWithdrawalIntents, BuyerWithdrawalReconcileOutcome } from './types'
@@ -7,7 +6,7 @@ import { isBaseInsufficientFunds } from './withdrawal-intent'
 import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
 import { assertBaseDestination, assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
-
+import { makeBuyerDelivery } from './delivery'
 const HARD_CAP_USD = 1000
 const DEFAULT_CAP_USD = 100
 const active = new Set<BuyerSwapStage>(['quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'sweeping', 'refund_waiting', 'needs_attention'])
@@ -49,18 +48,6 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
   if (!Number.isInteger(maxActive) || maxActive < 1) throw new Error('maxActiveSwaps must be a positive integer')
   const now = config.now ?? Date.now
   const log = deps.log ?? ((message: string) => console.error(`buyer-kit: ${message}`))
-  const hasDurableSweep = (): boolean => !!deps.wallet.buildSweep && !!deps.wallet.broadcastSweep && !!deps.wallet.isSweepConfirmed
-  const sweepBroadcastAttempts = new Map<string, number>()
-  const broadcastSweep = async (outbox: { rawTx: string; atomicBeefHex?: string; txid: string; sats: string }): Promise<boolean> => {
-    const txid = outbox.txid.toLowerCase()
-    const attemptedAt = now()
-    const lastAttempt = sweepBroadcastAttempts.get(txid)
-    if (lastAttempt !== undefined && attemptedAt - lastAttempt < 60_000) return false
-    // Record before awaiting the relay so overlapping recoveries cannot both send.
-    sweepBroadcastAttempts.set(txid, attemptedAt)
-    await deps.wallet.broadcastSweep!(outbox)
-    return true
-  }
   let reportNewWallet = !!config.newWallet
   // Keep every balance observation and durable admission of a new swap ordered with withdrawals.  The lifecycle that
   // follows the durable row is intentionally not held here: it has its own recovery protocol and may take minutes.
@@ -121,6 +108,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
   const write = async (record: BuyerSwapRecord, stage: BuyerSwapStage, extra: Partial<BuyerSwapRecord> = {}): Promise<BuyerSwapRecord> => {
     return updateRow(record, (current) => ({ ...record, ...current, ...extra, stage, updatedAtMs: now() }))
   }
+  const delivery = makeBuyerDelivery({ deps, now, log, updateRow, write })
   const guardRecovery = (record: BuyerSwapRecord, outcome: import('./types').BuyerRecoveryOutcome): import('./types').BuyerRecoveryOutcome => {
     // A stage label alone is untrusted and must not hide a real refund/failure.  A coherent terminal settlement
     // observation, however, is the durable hand-off written by the money path and cannot be undone by stale recovery.
@@ -215,7 +203,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       const { snapshot: activeLimits } = await prepareNewBaseSpend()
       if (!input.quote && input.minBsvOut === undefined) throw new Error('a quote or min_bsv_out is required; nothing was locked')
       if (input.deliverTo) { assertAddress(input.deliverTo); assertBsvDestination(activeLimits, input.deliverTo) }
-      if (input.deliverTo && !hasDurableSweep()) throw new Error('deliver_to requires the durable sweep interface (buildSweep, broadcastSweep, and isSweepConfirmed)')
+      if (input.deliverTo && !delivery.hasDurableSweep()) throw new Error('deliver_to requires the durable sweep interface (buildSweep, broadcastSweep, and isSweepConfirmed)')
       if (input.amountIn < 1n || input.amountIn > 1_000_000_000n || input.amountIn > BigInt(Math.floor(capUsdPerSwap * 1e6))) throw new Error(`amount exceeds this kit’s $${capUsdPerSwap} per-swap cap`)
       const allRecords = await deps.store.list()
       assertDailySwapCap(activeLimits, allRecords, input.amountIn, now())
@@ -299,67 +287,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
           if (saved.settlementState === 'settled' || saved.settlementState === 'refunded' || saved.settlementState === 'aborted') await deps.executor.acknowledgeTerminal?.(saved)
         }
       }
-      // A revealed claim's Atomic BEEF is enough to build its child without waiting
-      // for the UTXO indexer. The settlement checkpoint is the irreversible gate.
-      for (const record of await deps.store.list()) {
-        if (!record.deliverTo || record.stage !== 'claiming') continue
-        try {
-          let outbox = record.sweepOutbox
-          if (!outbox && deps.executor.readSettlement && deps.wallet.buildEarlySweep) {
-            const settlement = await deps.executor.readSettlement(record)
-            const claimTxid = record.bsvClaimTxid ?? settlement?.bsvClaimTxid
-            if (settlement?.state === 'revealed' && settlement.bsvClaimBeefHex && claimTxid) {
-              let claim: Transaction | undefined
-              try { claim = Transaction.fromAtomicBEEF(Utils.toArray(settlement.bsvClaimBeefHex, 'hex') as number[]) } catch { /* silently retain the confirmed path */ }
-              if (claim && claim.id('hex').toLowerCase() === claimTxid.toLowerCase()) {
-                const built = await deps.wallet.buildEarlySweep(record.deliverTo, { claim, claimTxid })
-                const candidate = { ...built, sats: built.sats.toString() }
-                const saved = await updateRow(record, (current) => {
-                  if (current.sweepOutbox || current.stage !== 'claiming') return current
-                  return { ...record, ...current, bsvClaimTxid: current.bsvClaimTxid ?? claimTxid, sweepOutbox: candidate, updatedAtMs: now() }
-                })
-                outbox = saved.stage === 'claiming' ? saved.sweepOutbox : undefined
-              }
-            }
-          }
-          if (outbox && deps.wallet.broadcastSweep) {
-            try {
-              await broadcastSweep(outbox)
-            } catch (error) {
-              log(`could not send the early delivery for ${record.swapId} (sweep ${outbox.txid}): ${error instanceof Error ? error.message : String(error)}`)
-            }
-          }
-        } catch { /* silently retain the confirmed recovery path and any durable outbox for retry */ }
-      }
-      // A claim is not safe to deliver until it has independently buried. This
-      // confirmed path deliberately reuses an early durable outbox if present.
-      for (const record of await deps.store.list()) {
-        if (!record.deliverTo || !record.bsvClaimTxid || (record.stage !== 'claimed' && record.stage !== 'settled' && record.stage !== 'sweeping')) continue
-        try {
-          let outbox = record.sweepOutbox
-          if (!outbox && deps.wallet.buildSweep) {
-            const built = await deps.wallet.buildSweep(record.deliverTo, { onlyTxid: record.bsvClaimTxid })
-            // The signed transaction is durable before it can escape to a relay.
-            const candidate = { ...built, sats: built.sats.toString() }
-            const saved = await updateRow(record, (current) => {
-              if (current.sweepOutbox || (current.stage !== 'claimed' && current.stage !== 'settled' && current.stage !== 'sweeping')) return current
-              return { ...record, ...current, stage: 'sweeping', sweepOutbox: candidate, updatedAtMs: now() }
-            })
-            // A concurrent recovery may have won with another candidate. Never send ours.
-            outbox = saved.sweepOutbox
-          }
-          if (outbox && deps.wallet.broadcastSweep && deps.wallet.isSweepConfirmed) {
-            // Check before re-sending: a relay can reject a mined sweep (its input is spent), which must not hide delivery.
-            if (await deps.wallet.isSweepConfirmed(outbox.txid, record.deliverTo)) { await write(record, 'delivered'); continue }
-            await broadcastSweep(outbox) // safe to repeat: it is the exact durable transaction
-            if (await deps.wallet.isSweepConfirmed(outbox.txid, record.deliverTo)) await write(record, 'delivered')
-          } else if (!hasDurableSweep()) {
-            log(`cannot automatically deliver_to for ${record.swapId}: deliver_to needs the durable sweep interface (buildSweep, broadcastSweep, and isSweepConfirmed)`)
-          }
-        } catch (error) {
-          log(`could not sweep confirmed BSV for ${record.swapId}: ${error instanceof Error ? error.message : String(error)}`)
-        }
-      }
+      await delivery.recover()
       return deps.store.list()
     },
     withdrawBsv: async (address) => serializeMoney(async () => {

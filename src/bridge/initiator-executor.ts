@@ -834,7 +834,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           try {
             const claimMaxBlocks = cfg.zeroConfClaimMaxBlocks ?? DEFAULT_CLAIM_WATCH_MAX_BLOCKS
             const watchOpts = {
-              // Block-cadence (BSVanon 2026-09-09): give up only after the chain advances `maxBlocks` REAL blocks; the
+              // Block cadence: give up only after the chain advances `maxBlocks` REAL blocks; the
               // maxPolls cap is the absolute failsafe (stalled chain), NOT the give-up — so a slow BSV block extends
               
               maxPolls: cfg.zeroConfClaimMaxPolls ?? 4320, sleepMs: cfg.zeroConfSleepMs ?? 5_000, sleep,

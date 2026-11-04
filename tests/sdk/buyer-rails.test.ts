@@ -1,6 +1,6 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import { MerklePath, Peer, PrivateKey, Transaction, P2PKH, UnlockingScript, type AuthMessage, type Transport } from '@bsv/sdk'
+import { Beef, MerklePath, Peer, PrivateKey, Transaction, P2PKH, UnlockingScript, type AuthMessage, type Transport } from '@bsv/sdk'
 import { makeIdentityOnlyWallet } from '../../src/sdk/buyer/runtime/identity-wallet'
 import { makeBuyerBsvRails } from '../../src/sdk/buyer/runtime/bsv-rails'
 import { guardBuyerEvmWrites, makeBuyerEvmRails } from '../../src/sdk/buyer/runtime/evm-rails'
@@ -54,6 +54,75 @@ function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?
 }
 
 describe('buyer runtime rails', () => {
+  it('keeps live reads lenient while strict recovery reads report a rate limit as unknown', async () => {
+    const calls: string[] = []
+    const rails = makeBuyerBsvRails({
+      anvilBaseUrl: 'https://buyer-anvil.invalid',
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        calls.push(String(input))
+        return new Response('rate limited', { status: 429 })
+      }) as typeof fetch,
+    })
+    await rejects(() => rails.txConfirmationsStrict('ab'.repeat(32)), /buyer BSV chain read unavailable.*HTTP 429/)
+    // Polling is the retry loop: one attempt at each proof source, not three
+    // nested retries at every 15-second confirmation poll.
+    expect(calls).to.have.length(3)
+    await rejects(() => rails.resolveSpenderStrict('ab'.repeat(32), 0), /spender read failed: HTTP 429/)
+    await rejects(() => rails.fetchTxStrict('ab'.repeat(32)), /buyer BSV chain read unavailable.*HTTP 429/)
+    await rejects(() => rails.fetchBeefStrict('ab'.repeat(32)), /buyer BSV chain read unavailable.*HTTP 429/)
+    expect(await rails.resolveSpender('ab'.repeat(32), 0)).to.equal(null)
+    expect(await rails.fetchTx('ab'.repeat(32))).to.equal(null)
+  })
+
+  it('retains zero as the deterministic not-mined/not-indexed answer needed for true eviction recovery', async () => {
+    const rails = makeBuyerBsvRails({
+      anvilBaseUrl: 'https://buyer-anvil.invalid',
+      fetchImpl: (async () => new Response('not found', { status: 404 })) as typeof fetch,
+    })
+    expect(await rails.txConfirmations('cd'.repeat(32))).to.equal(0)
+    expect(await rails.fetchTx('cd'.repeat(32))).to.equal(null)
+    expect(await rails.fetchBeef!('cd'.repeat(32))).to.equal(null)
+    expect(await rails.resolveSpender('cd'.repeat(32), 0)).to.equal(null)
+    expect(await rails.txConfirmationsStrict('cd'.repeat(32))).to.equal(0)
+    expect(await rails.fetchTxStrict('cd'.repeat(32))).to.equal(null)
+    expect(await rails.fetchBeefStrict('cd'.repeat(32))).to.equal(null)
+    expect(await rails.resolveSpenderStrict('cd'.repeat(32), 0)).to.equal(null)
+  })
+
+  it('keeps a live confirmation height read failure lenient but exposes it to recovery', async () => {
+    const tx = new Transaction()
+    tx.addOutput({ lockingScript: new P2PKH().lock(PrivateKey.fromRandom().toAddress()), satoshis: 1 })
+    const txid = tx.id('hex')
+    tx.merklePath = new MerklePath(800_000, [[{ offset: 0, hash: txid, txid: true }]])
+    const beef = new Beef()
+    beef.mergeTransaction(tx)
+    const rails = makeBuyerBsvRails({
+      anvilBaseUrl: 'https://buyer-anvil.invalid',
+      fetchImpl: (async (input: RequestInfo | URL) => String(input).includes(`/tx/${txid}/beef`)
+        ? new Response(new Uint8Array(beef.toBinary() as number[]))
+        : new Response('rate limited', { status: 429 })) as typeof fetch,
+    })
+    expect(await rails.txConfirmations(txid)).to.equal(0)
+    await rejects(() => rails.txConfirmationsStrict(txid), /confirmation height is unavailable/)
+  })
+
+  it('keeps the executor fetchTx on the raw reader so it finds an unmined lock', async () => {
+    const lock = new Transaction()
+    lock.addOutput({ lockingScript: new P2PKH().lock(PrivateKey.fromRandom().toAddress()), satoshis: 10_000 })
+    const calls: string[] = []
+    const rails = makeBuyerBsvRails({
+      anvilBaseUrl: 'https://buyer-anvil.invalid',
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = String(input); calls.push(url)
+        return url.includes('/hex') ? new Response(lock.toHex()) : new Response('not found', { status: 404 })
+      }) as typeof fetch,
+    })
+    const fetched = await rails.fetchTx(lock.id('hex'))
+    expect(fetched?.id('hex')).to.equal(lock.id('hex'))
+    expect(fetched?.merklePath).to.equal(undefined)
+    expect(calls.some((url) => url.includes('/hex'))).to.equal(true)
+  })
+
   it('identity wallet completes a BRC-31 Peer handshake over an in-memory transport', async () => {
     const [at, bt] = pair()
     const a = new Peer(makeIdentityOnlyWallet(PrivateKey.fromRandom()), at)
@@ -111,6 +180,33 @@ describe('buyer runtime rails', () => {
       expect(seen.some(({ url }) => url.startsWith('https://other-anvil.invalid'))).eq(false)
       expect(seen.some(({ url }) => url.startsWith('https://buyer-anvil.invalid/'))).eq(true)
     } finally { clearTaalApiKey(); setAnvilNode('https://buyer-anvil.invalid'); globalThis.fetch = saved }
+  })
+
+  it('submits ordinary BEEF to GorillaPool ARC from the buyer-kit broadcast path', async () => {
+    const rawTx = '01000000000000000000'
+    const atomicBeefHex = Transaction.fromHex(rawTx).toHexAtomicBEEF()
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const saved = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input); requests.push({ url, init })
+      if (url.includes('buyer-anvil.invalid/broadcast')) {
+        return new Response('{}', { status: 422, headers: { 'content-type': 'application/json' } })
+      }
+      if (url.includes('arc.gorillapool.io/v1/tx')) {
+        return new Response(JSON.stringify({ txid: 'ef'.repeat(32), txStatus: 'SEEN_ON_NETWORK' }), { headers: { 'content-type': 'application/json' } })
+      }
+      return new Response('{}', { status: 500, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+    try {
+      const rails = makeBuyerBsvRails({ anvilBaseUrl: 'https://buyer-anvil.invalid', fetchImpl: globalThis.fetch })
+      expect(await rails.broadcast(rawTx, atomicBeefHex)).to.equal('ef'.repeat(32))
+
+      const arc = requests.find(({ url }) => url === 'https://arc.gorillapool.io/v1/tx')
+      expect(arc).to.not.equal(undefined)
+      expect(arc!.init?.method).to.equal('POST')
+      expect(arc!.init?.headers).to.deep.equal({ 'Content-Type': 'application/json' })
+      expect(arc!.init?.body).to.equal(JSON.stringify({ rawTx: Transaction.fromHex(rawTx).toHexBEEF() }))
+    } finally { clearTaalApiKey(); setAnvilNode(''); globalThis.fetch = saved }
   })
 
   it('rechecks Base pool safety at each approval and lock write boundary', async () => {
