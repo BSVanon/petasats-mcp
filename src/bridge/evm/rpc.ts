@@ -255,7 +255,8 @@ export async function probeBaseRpcEndpoint(args: { url: string; swapAddress: str
       logs = false
       logsReason = error instanceof Error ? error.message : String(error)
     }
-    const oldBlock = await rpcProbeCall(args.url, 'eth_getBlockByNumber', [`0x${(finalizedNumber > 200n ? finalizedNumber - 200n : 0n).toString(16)}`, true], fetchImpl) as { transactions?: Array<string | { hash?: string }> } | null
+    // Hashes only: the full-transaction form of a busy Base block can take over 10 s on a free endpoint and time the probe out.
+    const oldBlock = await rpcProbeCall(args.url, 'eth_getBlockByNumber', [`0x${(finalizedNumber > 200n ? finalizedNumber - 200n : 0n).toString(16)}`, false], fetchImpl) as { transactions?: Array<string | { hash?: string }> } | null
     const tx = oldBlock?.transactions?.[0]
     const hash = typeof tx === 'string' ? tx : tx?.hash
     // An empty old block gives no evidence of historical receipt support. Treat
