@@ -13,7 +13,7 @@ import { assertBuyerMainnetP2pkhAddress } from './address'
 import { makeBuyerBsvRails } from './bsv-rails'
 import { guardBuyerEvmWrites, makeBuyerEvmRails } from './evm-rails'
 import { makeIdentityOnlyWallet } from './identity-wallet'
-import { buildSweepTx } from './sweep'
+import { buildEarlySweepTx, buildSweepTx } from './sweep'
 import { acquireBuyerHomeLock } from './home-lock'
 import { readBuyerLimits } from '../limits'
 import { readSpendingStop, stopSpending } from '../stop'
@@ -140,6 +140,11 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
         return { ...coin, sourceTx }
       }))
       const built = await f.buildSweepTx({ coins, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB })
+      return { rawTx: built.rawTx, atomicBeefHex: built.atomicBeefHex, txid: built.tx.id('hex') as string, sats: BigInt(built.outputSatoshis) }
+    },
+    buildEarlySweep: async (address: string, opts: { claim: import('@bsv/sdk').Transaction; claimTxid: string }) => {
+      assertBuyerMainnetP2pkhAddress(address, 'address')
+      const built = await buildEarlySweepTx({ claim: opts.claim, claimTxid: opts.claimTxid, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB, chainTracker: bsv.chainTracker })
       return { rawTx: built.rawTx, atomicBeefHex: built.atomicBeefHex, txid: built.tx.id('hex') as string, sats: BigInt(built.outputSatoshis) }
     },
     broadcastSweep: async (outbox: { rawTx: string; atomicBeefHex?: string; txid: string }) => {

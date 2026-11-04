@@ -1,4 +1,4 @@
-import { Beef, P2PKH, PrivateKey, SatoshisPerKilobyte, Transaction, Utils } from '@bsv/sdk'
+import { Beef, P2PKH, PrivateKey, SatoshisPerKilobyte, Transaction, Utils, type ChainTracker } from '@bsv/sdk'
 import type { WocUtxo } from '../../../wallet/reserve-basket-sweep'
 import { assertBuyerMainnetP2pkhAddress } from './address'
 
@@ -26,6 +26,15 @@ export interface BuiltBuyerSweep {
   tx: Transaction
   fee: number
   outputSatoshis: number
+}
+
+export interface BuildEarlySweepTxOptions {
+  claim: Transaction
+  claimTxid: string
+  toAddress: string
+  key: PrivateKey
+  feeRate: number
+  chainTracker: ChainTracker
 }
 
 /** Build one signed P2PKH output from exactly the caller-specified coins. */
@@ -60,6 +69,41 @@ export async function buildSweepTx(opts: BuildSweepTxOptions): Promise<BuiltBuye
   const fee = total - outputSatoshis
   if (outputSatoshis <= BUYER_SWEEP_DUST_SATS) throw new Error(`buyer sweep: output ${outputSatoshis} sat is at or below dust (${BUYER_SWEEP_DUST_SATS})`)
   if (tx.inputs.length !== opts.coins.length || tx.outputs.length !== 1 || fee <= 0) throw new Error('buyer sweep: invalid exact-input single-output transaction')
+  const txid = tx.id('hex') as string
+  const beef = Beef.fromBinary(tx.toBEEF())
+  return { rawTx: tx.toHex(), atomicBeefHex: Utils.toHex(beef.toBinaryAtomic(txid)), tx, fee, outputSatoshis }
+}
+
+/** Build a child of the persisted claim, retaining its merkle-proven lock ancestor in Atomic BEEF. */
+export async function buildEarlySweepTx(opts: BuildEarlySweepTxOptions): Promise<BuiltBuyerSweep> {
+  if (opts.claim.id('hex').toLowerCase() !== opts.claimTxid.toLowerCase()) throw new Error('buyer early sweep: claim transaction mismatch')
+  if (!Number.isFinite(opts.feeRate) || opts.feeRate <= 0) throw new Error('buyer early sweep: feeRate must be positive')
+  try { assertBuyerMainnetP2pkhAddress(opts.toAddress, 'buyer early sweep: toAddress') } catch {
+    throw new Error('buyer early sweep: toAddress is not a valid BSV P2PKH mainnet Base58Check address')
+  }
+  const lock = opts.claim.inputs[0]?.sourceTransaction
+  if (!lock?.merklePath) throw new Error('buyer early sweep: claim lock has no merkle proof')
+  let lockProven = false
+  try { lockProven = await lock.merklePath.verify(lock.id('hex'), opts.chainTracker) } catch { /* fail closed below */ }
+  if (!lockProven) throw new Error('buyer early sweep: claim lock merkle proof failed')
+  const kitLockHex = new P2PKH().lock(opts.key.toPublicKey().toAddress()).toHex()
+  const coins = opts.claim.outputs.flatMap((output, index) => output.lockingScript.toHex() === kitLockHex ? [{ output, index }] : [])
+  if (!coins.length) throw new Error('buyer early sweep: claim has no kit P2PKH outputs')
+  const tx = new Transaction()
+  let total = 0
+  for (const { output, index } of coins) {
+    const satoshis = output.satoshis
+    if (typeof satoshis !== 'number' || !Number.isSafeInteger(satoshis) || satoshis < 0) throw new Error(`buyer early sweep: source output ${index} has invalid satoshis`)
+    tx.addInput({ sourceTransaction: opts.claim, sourceOutputIndex: index, unlockingScriptTemplate: new P2PKH().unlock(opts.key, 'all', false) })
+    total += satoshis
+  }
+  tx.addOutput({ lockingScript: new P2PKH().lock(opts.toAddress), change: true })
+  await tx.fee(new SatoshisPerKilobyte(opts.feeRate))
+  await tx.sign()
+  const outputSatoshis = tx.outputs[0]?.satoshis ?? 0
+  const fee = total - outputSatoshis
+  if (outputSatoshis <= BUYER_SWEEP_DUST_SATS) throw new Error(`buyer early sweep: output ${outputSatoshis} sat is at or below dust (${BUYER_SWEEP_DUST_SATS})`)
+  if (tx.inputs.length !== coins.length || tx.outputs.length !== 1 || fee <= 0) throw new Error('buyer early sweep: invalid exact-input single-output transaction')
   const txid = tx.id('hex') as string
   const beef = Beef.fromBinary(tx.toBEEF())
   return { rawTx: tx.toHex(), atomicBeefHex: Utils.toHex(beef.toBinaryAtomic(txid)), tx, fee, outputSatoshis }

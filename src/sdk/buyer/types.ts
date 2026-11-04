@@ -1,5 +1,6 @@
 import type { ConvertRequest, PetaSats, Quote, SwapResult } from '../convert'
 import type { SettlementState } from '../../bridge/settlement-session'
+import type { Transaction } from '@bsv/sdk'
 
 /** Public lifecycle states.  They are deliberately words a UI can display. */
 export type BuyerSwapStage =
@@ -79,6 +80,8 @@ export interface BuyerExecutor {
   recover?(record: BuyerSwapRecord): Promise<BuyerRecoveryOutcome | undefined>
   /** Arm every durable settlement record; engines may return the current derived stage for linked kit swaps. */
   recoverAll?(records: BuyerSwapRecord[]): Promise<Map<string, BuyerRecoveryOutcome>>
+  /** Read the linked initiator checkpoint without changing it. Used only for the zero-conf delivery gate. */
+  readSettlement?(record: BuyerSwapRecord): Promise<{ state: SettlementState; bsvClaimTxid?: string; bsvClaimBeefHex?: string } | undefined>
   /** Clear an engine terminal tombstone only after this exact durable buyer row is written. */
   acknowledgeTerminal?(record: BuyerSwapRecord): Promise<void> | void
 }
@@ -114,6 +117,8 @@ export interface BuyerWallet {
   /** Optional sweep hook; implementation must reject dust before broadcast. */
   withdrawBsv?(address: string, opts?: { onlyTxid?: string; beforeBroadcast?: () => void | Promise<void> }): Promise<{ txid?: string; sats: bigint; reason?: string }>
   buildSweep?(address: string, opts: { onlyTxid: string }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
+  /** Build a child of a persisted, unconfirmed covenant claim without consulting the UTXO indexer. */
+  buildEarlySweep?(address: string, opts: { claim: Transaction; claimTxid: string }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
   broadcastSweep?(outbox: { rawTx: string; atomicBeefHex?: string; txid: string; sats: string }): Promise<void>
   /** Must validate the same confirmation threshold as the claim path. */
   isSweepConfirmed?(txid: string, address: string): Promise<boolean>

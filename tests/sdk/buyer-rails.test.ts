@@ -1,11 +1,11 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import { Peer, PrivateKey, Transaction, P2PKH, type AuthMessage, type Transport } from '@bsv/sdk'
+import { MerklePath, Peer, PrivateKey, Transaction, P2PKH, UnlockingScript, type AuthMessage, type Transport } from '@bsv/sdk'
 import { makeIdentityOnlyWallet } from '../../src/sdk/buyer/runtime/identity-wallet'
 import { makeBuyerBsvRails } from '../../src/sdk/buyer/runtime/bsv-rails'
 import { guardBuyerEvmWrites, makeBuyerEvmRails } from '../../src/sdk/buyer/runtime/evm-rails'
 import { clearTaalApiKey, setAnvilNode, setTaalApiKey } from '../../src/wallet/broadcast'
-import { buildSweepTx, BUYER_SWEEP_DUST_SATS } from '../../src/sdk/buyer/runtime/sweep'
+import { buildEarlySweepTx, buildSweepTx, BUYER_SWEEP_DUST_SATS } from '../../src/sdk/buyer/runtime/sweep'
 import { makeQuorumChainTracker } from '../../src/wallet/quorum-chaintracks'
 
 class MemoryTransport implements Transport {
@@ -164,6 +164,42 @@ describe('buyer runtime rails', () => {
     await rejects(() => buildSweepTx({ coins: [coin], toAddress: 'not-an-address', key, feeRate: 100 }), /valid BSV P2PKH/)
     const dustParent = new Transaction(); dustParent.addOutput({ lockingScript: new P2PKH().lock(from), satoshis: BUYER_SWEEP_DUST_SATS + 1 })
     await rejects(() => buildSweepTx({ coins: [{ ...coin, tx_hash: dustParent.id('hex') as string, value: BUYER_SWEEP_DUST_SATS + 1, sourceTx: dustParent }], toAddress: to, key, feeRate: 100 }), /dust/)
+  })
+
+  it('F3: the early sweep spends only claim outputs paying the kit and skips a claim with none', async () => {
+    const key = PrivateKey.fromRandom(); const kit = key.toPublicKey().toAddress(); const external = PrivateKey.fromRandom().toPublicKey().toAddress(); const to = PrivateKey.fromRandom().toPublicKey().toAddress()
+    const lock = new Transaction(); lock.addOutput({ lockingScript: new P2PKH().lock(external), satoshis: 30_000 }); lock.merklePath = new MerklePath(800_000, [[{ offset: 0, hash: lock.id('hex'), txid: true }, { offset: 1, duplicate: true }]])
+    const claim = new Transaction(); claim.addInput({ sourceTXID: lock.id('hex') as string, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); claim.inputs[0].sourceTransaction = lock
+    claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 12_000 }); claim.addOutput({ lockingScript: new P2PKH().lock(external), satoshis: 12_000 }); claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 5_000 })
+    const built = await buildEarlySweepTx({ claim, claimTxid: claim.id('hex') as string, toAddress: to, key, feeRate: 100, chainTracker: { currentHeight: async () => 800_000, isValidRootForHeight: async () => true } as any })
+    expect(built.tx.inputs.map((input) => input.sourceOutputIndex)).deep.eq([0, 2])
+    const noKit = Transaction.fromHex(claim.toHex()); noKit.inputs[0].sourceTransaction = lock; noKit.outputs.forEach((output) => { output.lockingScript = new P2PKH().lock(external) })
+    await rejects(() => buildEarlySweepTx({ claim: noKit, claimTxid: noKit.id('hex') as string, toAddress: to, key, feeRate: 100, chainTracker: { currentHeight: async () => 800_000, isValidRootForHeight: async () => true } as any }), /no kit P2PKH/)
+  })
+
+  it('F4: the early sweep fails closed without a valid lock merkle proof', async () => {
+    const key = PrivateKey.fromRandom(); const kit = key.toPublicKey().toAddress(); const to = PrivateKey.fromRandom().toPublicKey().toAddress()
+    const lock = new Transaction(); lock.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 30_000 })
+    const claim = new Transaction(); claim.addInput({ sourceTXID: lock.id('hex') as string, sourceOutputIndex: 0, unlockingScript: new UnlockingScript() }); claim.inputs[0].sourceTransaction = lock; claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 20_000 })
+    const options = { claim, claimTxid: claim.id('hex') as string, toAddress: to, key, feeRate: 100 }
+    await rejects(() => buildEarlySweepTx({ ...options, chainTracker: {} as any }), /no merkle proof/)
+    lock.merklePath = new MerklePath(800_000, [[{ offset: 0, hash: lock.id('hex'), txid: true }, { offset: 1, duplicate: true }]])
+    await rejects(() => buildEarlySweepTx({ ...options, chainTracker: { currentHeight: async () => 800_000, isValidRootForHeight: async () => false } as any }), /merkle proof failed/)
+  })
+
+  it('F11: the early sweep Atomic BEEF carries the unmined claim and merkle-proven lock, spends kit outputs, and pays deliverTo', async () => {
+    const key = PrivateKey.fromRandom(); const kit = key.toPublicKey().toAddress(); const deliverTo = PrivateKey.fromRandom().toPublicKey().toAddress()
+    const lock = new Transaction(); lock.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 30_000 }); lock.merklePath = new MerklePath(800_000, [[{ offset: 0, hash: lock.id('hex'), txid: true }, { offset: 1, duplicate: true }]])
+    // A locally signed P2PKH spend stands in for the production covenant claim.
+    const claim = new Transaction(); claim.addInput({ sourceTransaction: lock, sourceOutputIndex: 0, unlockingScriptTemplate: new P2PKH().unlock(key, 'all', false) })
+    claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 15_000 }); claim.addOutput({ lockingScript: new P2PKH().lock(kit), satoshis: 10_000 })
+    await claim.sign()
+    const built = await buildEarlySweepTx({ claim, claimTxid: claim.id('hex') as string, toAddress: deliverTo, key, feeRate: 100, chainTracker: { currentHeight: async () => 800_000, isValidRootForHeight: async () => true } as any })
+    const outbox = { rawTx: built.rawTx, atomicBeefHex: built.atomicBeefHex, txid: built.tx.id('hex') as string }
+    const decoded = Transaction.fromAtomicBEEF(Array.from(Buffer.from(built.atomicBeefHex, 'hex')))
+    expect(Transaction.fromHex(outbox.rawTx).id('hex')).eq(outbox.txid); expect(decoded.id('hex')).eq(outbox.txid); expect(decoded.inputs).to.have.length(2); expect(decoded.outputs[0].lockingScript.toHex()).eq(new P2PKH().lock(deliverTo).toHex())
+    expect(decoded.inputs.every((input) => input.sourceTransaction?.id('hex') === claim.id('hex'))).eq(true)
+    expect(decoded.inputs[0].sourceTransaction?.inputs[0].sourceTransaction?.merklePath).not.eq(undefined)
   })
 
   it('never includes a private key or WIF in buyer-rail errors', async () => {

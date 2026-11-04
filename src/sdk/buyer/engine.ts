@@ -294,6 +294,13 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       recovery.ensure([settlement])
       return { stage: stageForRecord(record, settlement.state), baseLockTxid: settlement.baseLockTxHash, baseRefundTxid: settlement.refundTxid, bsvClaimTxid: settlement.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(settlement), bsvLockOutpoint: settlement.bsvLockOutpoint, bsvRefundLocktime: settlement.bsvRefundLocktime, baseTimelockBlock: settlement.baseTimelockBlock, settlementState: settlementStateForRecord(record, settlement.state) }
     },
+    async readSettlement(record) {
+      if (!record.settlementHashHex) return undefined
+      const listed = records.list()
+      if (listed.errors.length) return undefined
+      const found = listed.records.find((item) => item.hashHex === record.settlementHashHex)
+      return found ? { state: found.state, bsvClaimTxid: found.bsvClaimTxid, bsvClaimBeefHex: found.bsvClaimBeefHex } : undefined
+    },
     async recoverAll(buyerRecords) {
       const listed = records.list()
       const resolvedRecords = await Promise.all(listed.records.map((record) => resolveUnlandedLockIfDue(record)))
