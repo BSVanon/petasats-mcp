@@ -196,6 +196,16 @@ export interface GuardResult {
   reason?: string
 }
 
+/** Shared live-height predicate for every initiator pre-reveal runway decision. */
+export function guardInitiatorRevealRunway(bsvRefundLocktime: number, bsvHeight: number): GuardResult {
+  if (!isChainHeight(bsvHeight)) return { ok: false, reason: `invalid live BSV height ${bsvHeight} — must be a finite non-negative integer (fail-closed)` }
+  const revealWindow = bsvRefundLocktime - bsvHeight
+  if (revealWindow < MIN_REVEAL_CONFIRM_BUDGET_BLOCKS) {
+    return { ok: false, reason: `reveal window ${revealWindow} block(s) < ${MIN_REVEAL_CONFIRM_BUDGET_BLOCKS} — too close to the BSV refund height; the claim may not confirm before the responder can refund` }
+  }
+  return { ok: true }
+}
+
 /**
  * The FULL ERC20Swap lockup a responder actually observes on Base — every field the
  * contract commits to, plus the emitter + chain. The responder MUST validate this
@@ -514,13 +524,9 @@ export class SettlementSession {
     if (this.rec.state !== 'bsv-locked' && !(opts.recovery === true && this.rec.state === 'revealed')) {
       return { ok: false, reason: `BSV must be locked first (state=${this.rec.state})` }
     }
-    if (!isChainHeight(bsvHeight)) return { ok: false, reason: `invalid live BSV height ${bsvHeight} — must be a finite non-negative integer (fail-closed)` }
-    const revealWindow = this.rec.bsvRefundLocktime - bsvHeight
-    if (revealWindow < MIN_REVEAL_CONFIRM_BUDGET_BLOCKS) {
-      return { ok: false, reason: `reveal window ${revealWindow} block(s) < ${MIN_REVEAL_CONFIRM_BUDGET_BLOCKS} — too close to the BSV refund height; the claim may not confirm before the responder can refund` }
-    }
-    return { ok: true }
+    return guardInitiatorRevealRunway(this.rec.bsvRefundLocktime, bsvHeight)
   }
+
   // ── event-driven transitions (fail-closed) ──
   /**
    * Compare a full observed Base lockup against the negotiated params — the §12.2

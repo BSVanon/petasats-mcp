@@ -9,7 +9,7 @@ const ACCOUNT = privateKeyToAccount(KEY)
 const SWAP = '0x1111111111111111111111111111111111111111' as const
 const USDC = '0x2222222222222222222222222222222222222222' as const
 const TO = '0x3333333333333333333333333333333333333333' as const
-const PROBE_HASH = `0x${'ab'.repeat(32)}` as Hex
+const DEPOSIT_HASH = `0x${'ab'.repeat(32)}` as Hex
 const BASE_FEE = 5_000_000n
 const SUGGESTION = 1_000_000n
 const INCLUDED = 50_000_000n
@@ -23,16 +23,30 @@ const receipt = (hash: Hex, number: bigint) => ({ transactionHash: hash, blockHa
 function fakeNode(opts: { history: boolean }) {
   const finalized = 100n
   const sent: Hex[] = []
+  const probeTransactions = new Map<Hex, bigint>()
+  const logForBlock = (number: bigint) => ({
+    address: SWAP, topics: [`0x${'12'.repeat(32)}`], transactionHash: `0x${number.toString(16).padStart(64, '0')}` as Hex,
+    logIndex: '0x0', blockNumber: hex(number), blockHash: `0x${'cd'.repeat(32)}`,
+  })
   const fetchImpl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const { id, method, params } = JSON.parse(String(init?.body)) as { id: unknown; method: string; params: unknown[] }
     if (method === 'eth_chainId') return reply(id, '0x2105')
     if (method === 'eth_blockNumber') return reply(id, hex(finalized + 2n))
     if (method === 'eth_getBlockByNumber') {
       const tag = params[0]
-      if (params[1] === true && tag !== 'pending') return reply(id, { ...block(typeof tag === 'string' && tag.startsWith('0x') ? BigInt(tag) : finalized), transactions: [PROBE_HASH] })
+      if (typeof tag === 'string' && tag.startsWith('0x')) {
+        const number = BigInt(tag); const transactionHash = `0x${number.toString(16).padStart(64, '0')}` as Hex
+        probeTransactions.set(transactionHash, number)
+        return reply(id, { ...block(number), transactions: [DEPOSIT_HASH, transactionHash] })
+      }
       return reply(id, block(tag === 'finalized' || tag === 'safe' ? finalized : finalized + 2n))
     }
-    if (method === 'eth_getLogs') return reply(id, [])
+    if (method === 'eth_getLogs') {
+      const filter = params[0] as { fromBlock?: string; toBlock?: string; topics?: unknown }
+      if (!Array.isArray(filter.topics) || !filter.fromBlock || !filter.toBlock) return reply(id, [])
+      const from = BigInt(filter.fromBlock); const to = BigInt(filter.toBlock); const offset = to - from >= 18n ? 9n : 0n
+      return reply(id, [logForBlock(from + offset), logForBlock(to - offset)])
+    }
     if (method === 'eth_getTransactionCount') return reply(id, '0x7')
     if (method === 'eth_maxPriorityFeePerGas') return reply(id, hex(SUGGESTION))
     if (method === 'eth_gasPrice') return reply(id, hex(BASE_FEE + SUGGESTION))
@@ -44,7 +58,11 @@ function fakeNode(opts: { history: boolean }) {
     if (method === 'eth_sendRawTransaction') { const signed = params[0] as Hex; sent.push(signed); return reply(id, keccak256(signed)) }
     if (method === 'eth_getTransactionReceipt') {
       const hash = params[0] as Hex
-      if (hash === PROBE_HASH) return reply(id, receipt(PROBE_HASH, finalized - 200n))
+      if (hash === DEPOSIT_HASH) return reply(id, receipt(DEPOSIT_HASH, 0n))
+      const probeBlock = probeTransactions.get(hash)
+      if (probeBlock !== undefined) return reply(id, {
+        ...receipt(hash, probeBlock), blockHash: `0x${'cd'.repeat(32)}`, logs: [logForBlock(probeBlock)],
+      })
       return sent.some((signed) => keccak256(signed) === hash) ? reply(id, receipt(hash, finalized)) : reply(id, null)
     }
     return reply(id, null)

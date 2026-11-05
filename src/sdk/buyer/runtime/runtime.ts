@@ -104,7 +104,12 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     comms, doorIdentity: config.doorIdentity, evm: guardBuyerEvmWrites(evmRails.client, async () => { await evmRails.assertSafeForNewLock() }), bsv: bsv as any,
     chainTracker: bsv.chainTracker, bsvReservePub: bsvKey.toPublicKey(), settlementDir: paths.settlementDir,
     usdcTokenAddress: BASE_USDC, capUsdPerSwap: config.capUsdPerSwap, now: Date.now,
-    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)), log,
+    sleep: (ms, signal) => new Promise((resolve, reject) => {
+      const onAbort = (): void => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(signal?.reason) }
+      const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
+    }), log,
     assertEvmPoolSafe: async () => { await evmRails.assertSafeForNewLock() },
     resolveUnmarkedStuckLocks: options.resolveOldStuckSwaps ?? process.env.PETASATS_RESOLVE_OLD_STUCK_SWAPS === '1',
   })

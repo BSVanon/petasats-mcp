@@ -17,7 +17,7 @@ const BALANCE = 194790595100339n
 const COST = 194891395100339n
 const SWAP = '0x1111111111111111111111111111111111111111' as const
 const USDC = '0x2222222222222222222222222222222222222222' as const
-const PROBE_HASH = `0x${'ab'.repeat(32)}` as Hex
+const DEPOSIT_HASH = `0x${'ab'.repeat(32)}` as Hex
 
 const reply = (id: unknown, result: unknown, status = 200) => new Response(JSON.stringify({ jsonrpc: '2.0', result, id }), { status, headers: { 'content-type': 'application/json' } })
 const refusal = (id: unknown) => new Response(JSON.stringify({ jsonrpc: '2.0', error: { code: -32602, message: 'Archive requests require a personal token. Get one at: https://www.allnodes.com/publicnode' }, id }), { status: 403, headers: { 'content-type': 'application/json' } })
@@ -36,6 +36,7 @@ class FakeBaseNode {
   readonly methods: string[] = []
   readonly held = new Map<Hex, Hex>()
   readonly mined = new Map<Hex, bigint>()
+  readonly probeTransactions = new Map<Hex, bigint>()
   finalized = 100n
   finalizedNonce = NONCE
   failReceipts = false
@@ -51,17 +52,32 @@ class FakeBaseNode {
     if (method === 'eth_blockNumber') return reply(id, `0x${(this.finalized + 2n).toString(16)}`)
     if (method === 'eth_getBlockByNumber') {
       const tag = params[0]
-      if (params[1] === true && tag !== 'pending') return reply(id, { ...block(typeof tag === 'string' && tag.startsWith('0x') ? BigInt(tag) : this.finalized), transactions: [PROBE_HASH] })
       if (tag === 'pending') return reply(id, { ...block(this.finalized + 2n), transactions: [] })
+      if (typeof tag === 'string' && tag.startsWith('0x')) {
+        const number = BigInt(tag); const transactionHash = `0x${number.toString(16).padStart(64, '0')}` as Hex
+        this.probeTransactions.set(transactionHash, number)
+        return reply(id, { ...block(number), transactions: [DEPOSIT_HASH, transactionHash] })
+      }
       return reply(id, block(tag === 'finalized' || tag === 'safe' ? this.finalized : this.finalized + 2n))
     }
-    if (method === 'eth_getLogs') return reply(id, [])
+    if (method === 'eth_getLogs') {
+      const filter = params[0] as { fromBlock?: string; toBlock?: string; topics?: unknown }
+      if (!Array.isArray(filter.topics) || !filter.fromBlock || !filter.toBlock) return reply(id, [])
+      const from = BigInt(filter.fromBlock); const to = BigInt(filter.toBlock); const offset = to - from >= 18n ? 9n : 0n
+      const makeLog = (number: bigint) => ({ address: SWAP, topics: [`0x${'12'.repeat(32)}`], transactionHash: `0x${number.toString(16).padStart(64, '0')}`, logIndex: '0x0', blockNumber: `0x${number.toString(16)}`, blockHash: `0x${'cd'.repeat(32)}` })
+      return reply(id, [makeLog(from + offset), makeLog(to - offset)])
+    }
     if (method === 'eth_getTransactionCount') return reply(id, `0x${this.finalizedNonce.toString(16)}`)
     if (method === 'eth_maxPriorityFeePerGas' || method === 'eth_gasPrice') return reply(id, '0x1')
     if (method === 'eth_estimateGas') return reply(id, '0x5208')
     if (method === 'eth_getTransactionReceipt') {
       const hash = params[0] as Hex
-      if (hash === PROBE_HASH) return reply(id, receipt(PROBE_HASH, this.finalized - 200n))
+      if (hash === DEPOSIT_HASH) return reply(id, receipt(DEPOSIT_HASH, 0n))
+      const probeBlock = this.probeTransactions.get(hash)
+      if (probeBlock !== undefined) return reply(id, {
+        ...receipt(hash, probeBlock), blockHash: `0x${'cd'.repeat(32)}`,
+        logs: [{ address: SWAP, topics: [`0x${'12'.repeat(32)}`], transactionHash: hash, logIndex: '0x0', blockNumber: `0x${probeBlock.toString(16)}`, blockHash: `0x${'cd'.repeat(32)}` }],
+      })
       if (this.failReceipts) return new Response('synthetic receipt failure', { status: 500 })
       const mined = this.mined.get(hash)
       if (mined !== undefined) return reply(id, receipt(hash, mined))

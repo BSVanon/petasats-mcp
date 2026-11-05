@@ -1,10 +1,15 @@
 import { createPublicClient, type Address, type Hex } from 'viem'
 import { Erc20SwapEvmClient } from '../../../bridge/evm/client'
-import { BaseRpcFailoverPool, DEFAULT_BASE_RPC_PROBE_INTERVAL_MS } from '../../../bridge/evm/rpc'
+import { BaseRpcFailoverPool, DEFAULT_BASE_RPC_PROBE_INTERVAL_MS, makeBaseRpcUnsafeForNewRisk } from '../../../bridge/evm/rpc'
 import { buyerBaseChain } from '../../../bridge/evm/tip-floor'
 
-/** The public Base endpoint already used by the unattended boxes. */
-export const DEFAULT_BUYER_BASE_RPC_URLS = ['https://base-rpc.publicnode.com'] as const
+/** Provider-keyless Base endpoints, ordered by observed log span and then read-only fallback value. */
+export const DEFAULT_BUYER_BASE_RPC_URLS = [
+  'https://base-rpc.publicnode.com',
+  'https://base.drpc.org',
+  'https://mainnet.base.org',
+  'https://base-public.nodies.app',
+] as const
 
 export interface BuyerEvmRailsOptions {
   privateKey: Hex
@@ -69,11 +74,12 @@ export async function makeBuyerEvmRails(opts: BuyerEvmRailsOptions): Promise<Buy
   })
   const reader = createPublicClient({ chain: buyerBaseChain, transport: pool.transport })
   await rawClient.assertChainId()
+  const isBaseRpcUnsafeForNewRisk = makeBaseRpcUnsafeForNewRisk(pool)
   const assertSafeForNewLock = async (): Promise<string> => {
     await pool.probeNow()
-    // A vetted fallback can keep recovery reads live, but a new withdrawal or
-    // lock must not proceed after any configured observer falls behind or forks.
-    if (pool.isSplit() || pool.isUnverified() || pool.activeUrls.length !== urls.length) {
+    // A transiently unavailable member may fail over. A safety exclusion (wrong chain,
+    // finalized-hash disagreement, or head lag) still pauses new value exactly as before.
+    if (isBaseRpcUnsafeForNewRisk()) {
       throw new Error('buyer EVM rail is split or unverified — refusing a new lock')
     }
     return pool.activeUrls.join('\u0000')

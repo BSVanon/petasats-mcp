@@ -129,6 +129,8 @@ export interface FetchBeefForTxidOptions {
   anvilTimeoutMs?: number
   /** Override the BananaBlocks BEEF fetch timeout (ms). */
   bananaBlocksTimeoutMs?: number
+  /** Remember an unproven Anvil transaction as the final non-proof fallback. Ignored when requireProof is true. */
+  acceptUnprovenAnvilBeef?: boolean
   /** Observe proof-source and raw-fallback errors without changing fetch behavior. */
   onSourceError?: (source: string, message: string) => void
 }
@@ -145,6 +147,8 @@ export async function fetchBeefForTxid(
   const errors: string[] = []
   const wocTimeoutMs = opts.wocTimeoutMs ?? WOC_TIMEOUT_MS
   const requireProof = opts.requireProof === true
+  const acceptUnprovenAnvilBeef = !requireProof && opts.acceptUnprovenAnvilBeef === true
+  let unprovenAnvilBeef: Beef | undefined
 
   // ── 1. Proof-bearing source(s) — MULTI-SOURCE when requireProof ──
   // Each source retries transient failures (429 / 5xx / network) with
@@ -195,9 +199,13 @@ export async function fetchBeefForTxid(
         opts.anvilAuthToken,
         fetchImpl,
         opts.anvilTimeoutMs ?? ANVIL_BEEF_TIMEOUT_MS,
+        acceptUnprovenAnvilBeef,
       ),
     )
-    if (anvilBeef) return anvilBeef
+    if (anvilBeef) {
+      if (beefHasProofFor(anvilBeef, txid)) return anvilBeef
+      unprovenAnvilBeef = anvilBeef
+    }
   }
 
   // Source 2: WoC /beef (the historical proof-bearing source).
@@ -237,7 +245,10 @@ export async function fetchBeefForTxid(
   // ── 2. WoC /hex (mempool fallback — single rawTx, no proofs) ──
   try {
     const beef = await fetchSingleTxBeefFromWoc(txid, fetchImpl, wocTimeoutMs)
-    if (beef) return beef
+    if (beef) {
+      if (acceptUnprovenAnvilBeef && !beef.findAtomicTransaction(txid)) throw new Error(`returned transaction id does not match requested ${txid}`)
+      return beef
+    }
   } catch (e) {
     const source = 'WoC /hex'
     const message = (e as Error).message
@@ -248,13 +259,18 @@ export async function fetchBeefForTxid(
   // ── 3. GP /tx/{txid}/raw (secondary raw-tx fallback) ──
   try {
     const beef = await fetchSingleTxBeefFromGp(txid, fetchImpl, opts.gorillaPoolTimeoutMs ?? GP_TIMEOUT_MS)
-    if (beef) return beef
+    if (beef) {
+      if (acceptUnprovenAnvilBeef && !beef.findAtomicTransaction(txid)) throw new Error(`returned transaction id does not match requested ${txid}`)
+      return beef
+    }
   } catch (e) {
     const source = 'GP /tx/raw'
     const message = (e as Error).message
     errors.push(`${source}: ${message}`)
     try { opts.onSourceError?.(source, message) } catch { /* observers must not affect fetching */ }
   }
+
+  if (unprovenAnvilBeef) return unprovenAnvilBeef
 
   throw new Error(
     `fetchBeefForTxid(${txid}): all providers failed.\n  ${errors.join('\n  ')}`,
@@ -364,8 +380,8 @@ export function beefHasProofFor(beef: Beef, txid: string): boolean {
  * (binary BEEF v2 + BUMP). Mirrors `spv-proof-builder`'s Anvil path.
  * Returns null on 404 (tx not on this node yet) so the caller falls
  * through; throws on transient (429/5xx/network) so the retry loop backs
- * off. A response that parses but carries no proof is treated as a miss
- * (return null) — the tx isn't mined-and-proven on this node yet.
+ * off. A response that parses but carries no proof is normally a miss; the
+ * lock-discovery-only option may retain a matching transaction as a final fallback.
  */
 async function fetchBeefFromAnvil(
   txid: string,
@@ -373,6 +389,7 @@ async function fetchBeefFromAnvil(
   anvilAuthToken: string | undefined,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  acceptUnproven: boolean,
 ): Promise<Beef | null> {
   const url = `${anvilNodeUrl.replace(/\/$/, '')}/tx/${txid}/beef`
   const headers: Record<string, string> = {}
@@ -389,7 +406,9 @@ async function fetchBeefFromAnvil(
   }
   const buf = await res.arrayBuffer()
   const beef = Beef.fromBinary(Array.from(new Uint8Array(buf)))
-  if (!beefHasProofFor(beef, txid)) return null // not mined/proven here yet
+  if (!beefHasProofFor(beef, txid)) {
+    if (!acceptUnproven || !beef.findAtomicTransaction(txid)) return null
+  }
   return beef
 }
 

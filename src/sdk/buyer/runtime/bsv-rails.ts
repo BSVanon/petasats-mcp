@@ -27,7 +27,7 @@ export interface BuyerStrictRecoveryBsvReads {
   fetchBeefStrict(txid: string): Promise<Transaction | null>
   resolveSpenderStrict(txid: string, vout: number): Promise<string | null>
 }
-export type BuyerBsvRails = Pick<BridgeInitiatorBsvRails, 'broadcast' | 'chainHeight' | 'readBsvHeight' | 'txConfirmations' | 'fetchTx' | 'fetchBeef'> &
+export type BuyerBsvRails = Pick<BridgeInitiatorBsvRails, 'broadcast' | 'chainHeight' | 'readBsvHeight' | 'txConfirmations' | 'fetchTx' | 'fetchLockTx' | 'fetchBeef'> &
   Pick<RecoveryBsvRails, 'resolveSpender'> & BuyerStrictRecoveryBsvReads &
   { chainTracker: ChainTracker; zeroConfStatus: typeof getTxStatus; zeroConfArcStatuses: typeof getMultiArcTxStatuses; unspentFor(address: string): Promise<BuyerUnspent[]> }
 
@@ -93,6 +93,12 @@ export function makeBuyerBsvRails(opts: BuyerBsvRailsOptions = {}): BuyerBsvRail
     },
     fetchTx: async (txid: string): Promise<Transaction | null> => {
       try { return Transaction.fromHex(await fetchTxHexForTxid(txid, rawOptions)) } catch { return null }
+    },
+    fetchLockTx: async (txid: string): Promise<Transaction | null> => {
+      try {
+        const tx = (await fetchBeefForTxid(txid, { ...rawOptions, acceptUnprovenAnvilBeef: true })).findAtomicTransaction(txid) ?? null
+        return tx?.id('hex') === txid ? tx : null
+      } catch { return null }
     },
     fetchBeef: async (txid: string): Promise<Transaction | null> => {
       try { return (await fetchBeefForTxid(txid, proofOptions)).findAtomicTransaction(txid) ?? null } catch { return null }

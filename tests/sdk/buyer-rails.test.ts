@@ -3,7 +3,9 @@ import { expect } from 'chai'
 import { Beef, MerklePath, Peer, PrivateKey, Transaction, P2PKH, UnlockingScript, type AuthMessage, type Transport } from '@bsv/sdk'
 import { makeIdentityOnlyWallet } from '../../src/sdk/buyer/runtime/identity-wallet'
 import { makeBuyerBsvRails } from '../../src/sdk/buyer/runtime/bsv-rails'
-import { guardBuyerEvmWrites, makeBuyerEvmRails } from '../../src/sdk/buyer/runtime/evm-rails'
+import { DEFAULT_BUYER_BASE_RPC_URLS, guardBuyerEvmWrites, makeBuyerEvmRails } from '../../src/sdk/buyer/runtime/evm-rails'
+import { isAlreadyKnown, isNonceTooLow, isReplacementUnderpriced } from '../../src/bridge/evm/inflight-submit'
+import { BaseRpcUnknownSendError } from '../../src/bridge/evm/rpc'
 import { clearTaalApiKey, setAnvilNode, setTaalApiKey } from '../../src/wallet/broadcast'
 import { buildEarlySweepTx, buildSweepTx, BUYER_SWEEP_DUST_SATS } from '../../src/sdk/buyer/runtime/sweep'
 import { makeQuorumChainTracker } from '../../src/wallet/quorum-chaintracks'
@@ -35,25 +37,81 @@ async function rejects(work: () => Promise<unknown>, pattern: RegExp | string): 
   expect((thrown as Error).message).to.match(typeof pattern === 'string' ? new RegExp(pattern) : pattern)
 }
 
-function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?: string }>): typeof fetch {
+function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?: string; down?: boolean }>): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input).replace(/\/$/, '')
     const request = JSON.parse(String(init?.body)) as { id: unknown; method: string; params: unknown[] }
     const s = state[url] ?? {}
+    const blockHash = s.hash ?? `0x${'a'.repeat(64)}`
+    const depositTx = `0x${'d'.repeat(64)}`
+    const txForBlock = (block: string): string => `0x${BigInt(block).toString(16).padStart(64, '0')}`
+    const logForBlock = (block: string) => ({
+      address: `0x${'9'.repeat(40)}`, topics: [`0x${'1'.repeat(64)}`], transactionHash: txForBlock(block),
+      logIndex: '0x1', blockNumber: `0x${BigInt(block).toString(16)}`, blockHash,
+    })
+    if (s.down) return new Response('synthetic outage', { status: 503 })
     if (request.method === 'eth_chainId') return response(request.id, s.chain ?? '0x2105')
     if (request.method === 'eth_blockNumber') return response(request.id, s.latest ?? '0x202')
     if (request.method === 'eth_getBlockByNumber') {
-      if (request.params[0] === 'safe') return response(request.id, { number: '0x200', hash: s.hash ?? `0x${'a'.repeat(64)}` })
-      if (request.params[0] === 'finalized') return response(request.id, { number: '0x200', hash: s.hash ?? `0x${'a'.repeat(64)}` })
-      return response(request.id, { number: '0x202', hash: s.hash ?? `0x${'a'.repeat(64)}` })
+      if (request.params[0] === 'safe' || request.params[0] === 'finalized') return response(request.id, { number: '0x200', hash: blockHash })
+      return response(request.id, { number: request.params[0], hash: blockHash, transactions: [depositTx, txForBlock(String(request.params[0]))] })
     }
-    if (request.method === 'eth_getLogs') return response(request.id, [])
-    if (request.method === 'eth_getTransactionReceipt') return response(request.id, { transactionHash: `0x${'c'.repeat(64)}` })
+    if (request.method === 'eth_getLogs') {
+      const filter = request.params[0] as { fromBlock?: string; toBlock?: string; topics?: unknown }
+      if (!Array.isArray(filter.topics) || !filter.fromBlock || !filter.toBlock) return response(request.id, [])
+      const from = BigInt(filter.fromBlock); const to = BigInt(filter.toBlock); const offset = to - from >= 18n ? 9n : 0n
+      return response(request.id, [logForBlock(`0x${(from + offset).toString(16)}`), logForBlock(`0x${(to - offset).toString(16)}`)])
+    }
+    if (request.method === 'eth_getTransactionReceipt') {
+      const transactionHash = String(request.params[0])
+      const blockNumber = `0x${BigInt(transactionHash).toString(16)}`
+      return response(request.id, {
+        transactionHash, blockNumber, blockHash,
+        logs: transactionHash === depositTx ? [] : [logForBlock(blockNumber)],
+      })
+    }
     return response(request.id, null)
   }) as typeof fetch
 }
 
 describe('buyer runtime rails', () => {
+  it('uses the ordered provider-keyless Base RPC defaults', () => {
+    expect(DEFAULT_BUYER_BASE_RPC_URLS).to.deep.equal([
+      'https://base-rpc.publicnode.com',
+      'https://base.drpc.org',
+      'https://mainnet.base.org',
+      'https://base-public.nodies.app',
+    ])
+  })
+
+  it('B4: buyer raw sends use the same pool ambiguity rule and never expose nonce-too-low as the aggregate error', async () => {
+    const state = { 'http://a.test': {}, 'http://b.test': {} }
+    const probeFetch = rpcFetch(state)
+    let sendsEnabled = false
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { id: unknown; method: string }
+      if (sendsEnabled && request.method === 'eth_sendRawTransaction') {
+        if (String(input).includes('a.test')) throw new Error('synthetic timeout after acceptance')
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, error: { code: -32000, message: 'nonce too low' } }), { headers: { 'content-type': 'application/json' } })
+      }
+      return probeFetch(input, init)
+    }) as typeof fetch
+    const rails = await makeBuyerEvmRails({
+      privateKey: (`0x${'11'.repeat(32)}`) as `0x${string}`,
+      swapAddress: (`0x${'22'.repeat(20)}`) as `0x${string}`,
+      usdcTokenAddress: (`0x${'33'.repeat(20)}`) as `0x${string}`,
+      rpcUrls: ['http://a.test', 'http://b.test'], fetchImpl, retryDelayMs: 1,
+    })
+    sendsEnabled = true
+    let failure: unknown
+    try { await rails.client.resendSigned('0x01') } catch (error) { failure = error }
+    expect(failure).to.be.instanceOf(BaseRpcUnknownSendError)
+    expect((failure as BaseRpcUnknownSendError).attempts.map((attempt) => attempt.outcome)).to.deep.equal(['unknown', 'definite'])
+    expect(isNonceTooLow(failure)).to.equal(false)
+    expect(isAlreadyKnown(failure)).to.equal(false)
+    expect(isReplacementUnderpriced(failure)).to.equal(false)
+  })
+
   it('keeps live reads lenient while strict recovery reads report a rate limit as unknown', async () => {
     const calls: string[] = []
     const rails = makeBuyerBsvRails({
@@ -121,6 +179,27 @@ describe('buyer runtime rails', () => {
     expect(fetched?.id('hex')).to.equal(lock.id('hex'))
     expect(fetched?.merklePath).to.equal(undefined)
     expect(calls.some((url) => url.includes('/hex'))).to.equal(true)
+  })
+
+  it('LOCKWAIT L1/L6: fetchLockTx alone accepts a matching proof-less Anvil BEEF after the cascade misses', async () => {
+    const lock = new Transaction()
+    lock.addOutput({ lockingScript: new P2PKH().lock(PrivateKey.fromRandom().toAddress()), satoshis: 10_000 })
+    const unproven = new Beef(); unproven.mergeRawTx(lock.toBinary())
+    const calls: string[] = []
+    const rails = makeBuyerBsvRails({
+      anvilBaseUrl: 'https://buyer-anvil.invalid',
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = String(input); calls.push(url)
+        return url.includes('buyer-anvil.invalid')
+          ? new Response(new Uint8Array(unproven.toBinary() as number[]))
+          : new Response('not found', { status: 404 })
+      }) as typeof fetch,
+    })
+    expect((await rails.fetchLockTx!(lock.id('hex')))?.id('hex')).to.equal(lock.id('hex'))
+    expect(calls.some((url) => url.includes('/hex'))).to.equal(true)
+    calls.length = 0
+    expect(await rails.fetchTx(lock.id('hex'))).to.equal(null)
+    expect(calls.some((url) => url.includes('buyer-anvil.invalid'))).to.equal(true)
   })
 
   it('identity wallet completes a BRC-31 Peer handshake over an in-memory transport', async () => {
@@ -248,6 +327,18 @@ describe('buyer runtime rails', () => {
     state['http://two.test'].hash = `0x${'a'.repeat(64)}`
     state['http://one.test'].latest = '0x100'
     await rejects(() => rails.assertSafeForNewLock(), /split or unverified/)
+  })
+
+  it('EVM factory keeps new locks enabled on a verified fallback after a transient primary outage', async () => {
+    const key = (`0x${'11'.repeat(32)}`) as `0x${string}`; const swap = (`0x${'22'.repeat(20)}`) as `0x${string}`
+    const state = { 'http://publicnode.test': {}, 'http://drpc.test': {} as { down?: boolean } }
+    const rails = await makeBuyerEvmRails({
+      privateKey: key, swapAddress: swap, usdcTokenAddress: swap,
+      rpcUrls: ['http://publicnode.test', 'http://drpc.test'], fetchImpl: rpcFetch(state),
+    })
+    state['http://publicnode.test'] = { down: true }
+    expect(await rails.assertSafeForNewLock()).to.equal('http://drpc.test')
+    expect(rails.pool.hasSafetyExclusion()).to.equal(false)
   })
 
   it('buildSweepTx spends exactly requested confirmed coins, charges a fee, and refuses unsafe input', async () => {

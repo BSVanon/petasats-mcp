@@ -97,9 +97,6 @@ const ERC20_TRANSFER_ABI = [parseAbiItem('function transfer(address to, uint256 
  *  range with -32614 "eth_getLogs is limited to a 2,000 range" (probed 2026-09-26; it allowed 10k when these scans were
  *  first chunked), and several providers cap at 2,000 too. */
 export const CLAIM_SCAN_STEP = 2_000n
-/** findLockup's newest window runs to `latest`; it starts this many blocks short of a full window, so blocks mined after
- *  the tip read (Base makes one every 2 s) cannot push it past the span cap. */
-const LOCKUP_LATEST_HEADROOM = 100n
 /** findLockup refuses a wider scan (about 9 days of Base blocks) rather than issue thousands of windowed reads. It covers
  *  the signer verifier's largest configurable lookback (302,400 blocks). */
 export const LOCKUP_MAX_SCAN_BLOCKS = 400_000n
@@ -898,18 +895,16 @@ export class Erc20SwapEvmClient {
     fromBlock: bigint = 0n,
   ): Promise<(LockupEvent & { txHash: Hex; logIndex: number; contractAddress: Address; chainId: number; blockNumber?: number }) | null> {
     // Chunked like the Claim/Refund scans, so an older lock (the signer verifier accepts one up to its lookback) stays
-    // under the RPC's eth_getLogs span cap. The newest window still runs to `latest`, so a span that fits in one window
-    // is the same single call as before.
+    // under the RPC's eth_getLogs span cap. Every window ends at the numeric tip sampled below, which lets the pool
+    // split and coverage-prove it. A lock mined after this sample is intentionally left for the caller's next poll.
     const tip = await this.pub.getBlockNumber()
     if (tip - fromBlock > LOCKUP_MAX_SCAN_BLOCKS) {
       throw new Error(`findLockup: a ${tip - fromBlock}-block scan exceeds the ${LOCKUP_MAX_SCAN_BLOCKS}-block bound; pass a recent fromBlock anchor`)
     }
-    const openFrom = tip - CLAIM_SCAN_STEP + LOCKUP_LATEST_HEADROOM + 1n
-    const windows: Array<{ from: bigint; to?: bigint }> = fromBlock < openFrom ? blockScanWindows(fromBlock, openFrom - 1n, CLAIM_SCAN_STEP) : []
-    windows.push({ from: fromBlock < openFrom ? openFrom : fromBlock })
+    const windows = blockScanWindows(fromBlock, tip, CLAIM_SCAN_STEP)
     for (const w of windows) {
       const logs = await this.pub.getLogs({
-        address: this.swapAddress, event: LOCKUP_EVENT, args: { preimageHash }, fromBlock: w.from, ...(w.to === undefined ? {} : { toBlock: w.to }),
+        address: this.swapAddress, event: LOCKUP_EVENT, args: { preimageHash }, fromBlock: w.from, toBlock: w.to,
       })
       for (const log of logs) {
         const a = log.args

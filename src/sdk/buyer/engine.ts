@@ -89,7 +89,7 @@ export interface BuyerEngineDeps {
   usdcTokenAddress: `0x${string}`
   capUsdPerSwap: number
   now: () => number
-  sleep: (ms: number) => Promise<void>
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>
   log: (message: string) => void
   /** Throws while the Base pool is split or unverified; an unlanded-lock tombstone is never written past it. */
   assertEvmPoolSafe: () => void | Promise<void>
@@ -249,7 +249,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       const executor = makeBridgeInitiatorExecutor({
         bsvReservePub: deps.bsvReservePub, evm: deps.evm, bsv: deps.bsv, coordinator, chainTracker: deps.chainTracker,
         zeroConfStatus: deps.bsv.zeroConfStatus, zeroConfArcStatuses: deps.bsv.zeroConfArcStatuses,
-        now: () => Math.floor(deps.now() / 1000), nowMs: deps.now, sleep: deps.sleep,
+        now: () => Math.floor(deps.now() / 1000), nowMs: deps.now, sleep: deps.sleep, signal: lifecycle.signal,
         persist: (record) => {
           executingHash = record.hashHex
           executingHashes.add(record.hashHex)
@@ -270,6 +270,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           claimBudgetBaseBlocks: times.claimBudgetBaseBlocks, bsvFeeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB, bsvConfirmations: 1, // both sides size the covenant fee budget identically
           capUsdPerSwap: deps.capUsdPerSwap, zeroConfCapUsd: agreedMode === 'fast' ? Number(BigInt(fastCap)) / 1_000_000 : 0, requireLockMerkleProof: true, htlcKind: 'covenant',
           zeroConfMinArcProviders: 2,
+          lockTxFetchUntilRevealRunway: true,
           ...(input.quote.doorProtocolVersion === 2 ? { doorProtocolVersion: 2 as const, doorQuoteId: input.quote.doorQuoteId, agreedSettlementMode: agreedMode, fastCapUsdcBaseUnits: fastCap } : {}),
           approveOnlyBelowAllowance: true, recordLockAttempts: true,
         },

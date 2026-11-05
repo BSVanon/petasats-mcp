@@ -8,8 +8,24 @@ export function makePreRevealHeightRead(opts: {
   sleep: (ms: number) => Promise<void>
   log: (msg: string) => void
   delaysMs?: readonly number[]
-}): () => Promise<number> {
-  return () => opts.revealed()
-    ? opts.read()
-    : retryOnSchedule(opts.read, { delaysMs: opts.delaysMs ?? PRE_REVEAL_READ_RETRY_DELAYS_MS, sleep: opts.sleep, log: opts.log, retryable: () => true, what: 'BSV height before the reveal: the chain read failed', again: 'reading again' })
+}): (maxRetryWaitMs?: number) => Promise<number> {
+  // The optional budget is used only by the runway-bound lock wait; every existing reveal call keeps the full schedule.
+  return (maxRetryWaitMs?: number) => {
+    const configured = opts.delaysMs ?? PRE_REVEAL_READ_RETRY_DELAYS_MS
+    let delaysMs = configured
+    if (maxRetryWaitMs !== undefined) {
+      let remaining = Math.max(0, maxRetryWaitMs)
+      const bounded: number[] = []
+      for (const delay of configured) {
+        if (remaining <= 0) break
+        const boundedDelay = Math.min(delay, remaining)
+        bounded.push(boundedDelay)
+        remaining -= boundedDelay
+      }
+      delaysMs = bounded
+    }
+    return opts.revealed()
+      ? opts.read()
+      : retryOnSchedule(opts.read, { delaysMs, sleep: opts.sleep, log: opts.log, retryable: () => true, what: 'BSV height before the reveal: the chain read failed', again: 'reading again' })
+  }
 }

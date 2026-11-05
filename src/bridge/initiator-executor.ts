@@ -11,6 +11,7 @@ import { assertLockSafeForZeroConf, assertLockSafeForZeroConfMultiArc, watchReve
 import { ARC_PROVIDERS, CLAIM_WATCH_RESEND_MS, classifyArcStatus, classifyMultiArc, DEFAULT_CLAIM_WATCH_MAX_BLOCKS, watchLockThroughClaim } from './zeroconf-monitor'
 import { DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
 import { makePreRevealHeightRead } from './pre-reveal-height'
+import { waitForLockTx } from './lock-tx-wait'
 /** The concrete swap the initiator runs: deliver an allowlisted ERC-20, receive BSV. */
 export interface BridgeDeliverErc20Spec {
   /** The ERC-20 the initiator delivers (locks on Base). Validated against the allowlist. */
@@ -83,6 +84,8 @@ export interface BridgeInitiatorBsvRails {
    * expected script + satoshis before it builds/broadcasts a claim carrying `s`. null ⇒ not found ⇒ do NOT reveal.
    */
   fetchTx(txid: string): Promise<Transaction | null>
+  /** Lock-announcement-only lookup; may accept a locally served unproven transaction. */
+  fetchLockTx?(txid: string): Promise<Transaction | null>
   
   fetchBeef?(txid: string): Promise<Transaction | null>
 }
@@ -122,6 +125,11 @@ export interface BridgeInitiatorConfig {
    *  miss is re-checked instead of refusing at once. Defaults 40 tries / 3s (≈2 min); at most 1,000 tries, 60s apart. */
   lockTxFetchMaxTries?: number
   lockTxFetchRetryMs?: number
+  /** Buyer-kit opt-in: continue lock discovery while the shared reveal runway remains open. */
+  lockTxFetchUntilRevealRunway?: boolean
+  /** Slow-phase cadence (default 30s) and whole-wait ceiling (default 4h). */
+  lockTxFetchSlowRetryMs?: number
+  lockTxFetchMaxWaitMs?: number
   capUsdPerSwap?: number
   /** 0-conf fast path (LEVER B #3/#4): a swap whose USDC value-at-risk ≤ this reveals against an UNCONFIRMED BSV lock,
    *  gated by the ARC double-spend monitor instead of a confirmation + merkle proof. 0 (default) ⇒ DISABLED — every swap
@@ -142,6 +150,7 @@ export interface BridgeInitiatorConfig {
    *  HONEST claim has time to mine (red-team 2026-09-04: 40 polls = 200s ≪ a ~600s BSV block → the watch gave up before
    *  the first-seen claim could confirm, false-reporting completed swaps as failures + false-nuking reputation). */
   zeroConfClaimMaxPolls?: number
+  
   zeroConfClaimMaxBlocks?: number
   /** LEVER B #3 — require the 0-conf clear to be witnessed by at least this many DISTINCT ARC-class providers (vantage
    *  points). Default 1 (the mainnet-proven floor — assertLockSafeForZeroConf already needs ≥1 ARC 'accepted'); set 2
@@ -192,11 +201,14 @@ export interface BridgeInitiatorDeps {
   now?(): number
   /** Millisecond wall clock for the Base lock landing deadline (separate from SettlementSession's seconds clock). */
   nowMs?(): number
-  sleep?(ms: number): Promise<void>
+  sleep?(ms: number, signal?: AbortSignal): Promise<void>
+  /** Optional lifecycle cancellation for the buyer kit's long lock-discovery wait. */
+  signal?: AbortSignal
   log?(tag: string, msg: string): void
   /** Restock-only signer arbitration: acquire reveal before the irreversible write-ahead and BSV broadcast. */
   acquireRevealSide?(hashHex: string): Promise<void>
 }
+
 const MAX_SAFE_SATS = BigInt(Number.MAX_SAFE_INTEGER)
 
 /** Reject an untrusted settlement reply before it can cause an EVM or BSV action. */
@@ -208,9 +220,9 @@ function validateResponderQuote(quote: BridgeQuote): void {
     if (PublicKey.fromString(quote.responderBsvPubKeyHex).toAddress().toString() !== quote.responderBsvAddress) fail()
   } catch { fail() }
 }
-
 // The BSV claim reveals the secret — the money-critical broadcast. Anvil is an SPV node with no UTXO set: it verifies
 // the spend from the lock's merkle proof carried in a BEEF, and REJECTS a bare tx (HTTP 422, BEEF parse-fail at byte 0;
+
 // block. The reveal-safety gate is re-read from a FRESH BSV height before every attempt, so the retry/backoff window
 // cannot carry a once-safe claim past its margin. `revealed` + the exact raw claim are persisted write-ahead before
 // broadcast; an all-fail/ambiguous attempt therefore remains claim-recoverable and never becomes Base-refundable.
@@ -337,6 +349,12 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
   }
   if (cfg.lockTxFetchRetryMs !== undefined && !(Number.isSafeInteger(cfg.lockTxFetchRetryMs) && cfg.lockTxFetchRetryMs >= 1 && cfg.lockTxFetchRetryMs <= 60_000)) {
     throw new Error(`initiator-executor: lockTxFetchRetryMs must be an integer in [1, 60000] (got ${cfg.lockTxFetchRetryMs})`)
+  }
+  if (cfg.lockTxFetchSlowRetryMs !== undefined && !(Number.isSafeInteger(cfg.lockTxFetchSlowRetryMs) && cfg.lockTxFetchSlowRetryMs >= 1_000 && cfg.lockTxFetchSlowRetryMs <= 60_000)) {
+    throw new Error(`initiator-executor: lockTxFetchSlowRetryMs must be an integer in [1000, 60000] (got ${cfg.lockTxFetchSlowRetryMs})`)
+  }
+  if (cfg.lockTxFetchMaxWaitMs !== undefined && !(Number.isSafeInteger(cfg.lockTxFetchMaxWaitMs) && cfg.lockTxFetchMaxWaitMs >= 60_000 && cfg.lockTxFetchMaxWaitMs <= 12 * 60 * 60_000)) {
+    throw new Error(`initiator-executor: lockTxFetchMaxWaitMs must be an integer in [60000, 43200000] (got ${cfg.lockTxFetchMaxWaitMs})`)
   }
   if (cfg.doorProtocolVersion === 2) {
     if (!isPublicDoorQuoteId(cfg.doorQuoteId) || !publicSettlementModeAndCapAreConsistent(cfg.agreedSettlementMode, cfg.fastCapUsdcBaseUnits)) {
@@ -562,18 +580,15 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // The responder announces the lock the moment it broadcasts it; the discovery source can lag the mempool or
         // throttle for seconds (2026-09-27 D1c: a real, later-mined lock missed on the one immediate fetch). A miss or a
         // fetch error is therefore re-checked for a bounded window; everything below still verifies what is fetched.
-        const fetchTries = cfg.lockTxFetchMaxTries ?? 40
-        const fetchRetryMs = cfg.lockTxFetchRetryMs ?? 3_000
-        let lockTx: Transaction | null = null
-        let lastFetchError = ''
-        for (let i = 0; i < fetchTries && !lockTx; i++) {
-          if (i > 0) {
-            if (i === 1) log('bsv', `responder's BSV lock ${bsvLocked.bsvLockTxid.slice(0, 12)}… not visible yet — re-checking every ${fetchRetryMs}ms (up to ${fetchTries} tries)…`)
-            await sleep(fetchRetryMs)
-          }
-          lockTx = await bsv.fetchTx(bsvLocked.bsvLockTxid).catch((e: unknown) => { lastFetchError = e instanceof Error ? e.message : String(e); return null })
-        }
-        if (!lockTx) throw new Error(`responder's BSV lock tx ${bsvLocked.bsvLockTxid} not found on-chain after ${fetchTries} tries${lastFetchError ? ` (last error: ${lastFetchError})` : ''} — refusing to reveal`)
+        const lockTx = await waitForLockTx({
+          txid: bsvLocked.bsvLockTxid, fetchTx: (bsv.fetchLockTx ?? bsv.fetchTx).bind(bsv),
+          fastMaxTries: cfg.lockTxFetchMaxTries ?? 40, fastRetryMs: cfg.lockTxFetchRetryMs ?? 3_000,
+          untilRevealRunway: cfg.lockTxFetchUntilRevealRunway === true,
+          slowRetryMs: cfg.lockTxFetchSlowRetryMs ?? 30_000, maxWaitMs: cfg.lockTxFetchMaxWaitMs ?? 4 * 60 * 60_000,
+          bsvRefundLocktime: intent.bsvRefundLocktime, revealHeight, nowMs, sleep, signal: deps.signal,
+          log: (message) => log('bsv', message),
+        })
+        deps.signal?.throwIfAborted()
         if (lockTx.id('hex') !== bsvLocked.bsvLockTxid) throw new Error(`fetched tx id ${lockTx.id('hex')} ≠ named BSV lock ${bsvLocked.bsvLockTxid} — refusing to reveal`)
         const out0 = lockTx.outputs[0]
         if (!out0) throw new Error(`BSV lock ${bsvLocked.bsvLockTxid} has no output 0 — refusing to reveal`)
@@ -833,6 +848,9 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
                 throw new Error(`restock reveal intent unavailable: ${reason}`)
               }
             }
+            // Shutdown stops a reveal until its write-ahead has been persisted; a claim already durable always finishes.
+            // (An in-memory 'revealed' session whose persist threw is not durable, so it is still stoppable.)
+            if (durableClaimTxid === undefined) deps.signal?.throwIfAborted()
             // WRITE-AHEAD: the exact raw claim (and BEEF when available), its deterministic txid, and `revealed`
             // state are durable before bytes leave this process. A crash or ambiguous broadcaster response can only
             // resume the BSV-claim path; it can never resurrect the Base-refund path.
@@ -850,6 +868,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             durableClaimTxid = submittedTxid
             break
           } catch (e) {
+            if (durableClaimTxid === undefined) deps.signal?.throwIfAborted()
             if (revealIntentFailure) throw e
             const landed = await bsv.fetchTx(claimTxid).catch(() => null)
             if (landed) { bsvClaimTxid = claimTxid; log('bsv', `claim ${claimTxid.slice(0, 12)}… already on-chain — treating as accepted`); break }
