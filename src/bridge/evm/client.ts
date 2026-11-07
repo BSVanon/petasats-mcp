@@ -93,11 +93,11 @@ const TRANSFER_EVENT = parseAbiItem('event Transfer(address indexed from, addres
 
 const ERC20_TRANSFER_ABI = [parseAbiItem('function transfer(address to, uint256 amount) returns (bool)')]
 
-/** Per-request `eth_getLogs` span (inclusive windows of at most this many blocks). mainnet.base.org rejects a wider
+/** Per-request `eth_getLogs` span (about 6m40s at the supported floor; inclusive windows of at most this many blocks). mainnet.base.org rejects a wider
  *  range with -32614 "eth_getLogs is limited to a 2,000 range" (probed 2026-09-26; it allowed 10k when these scans were
  *  first chunked), and several providers cap at 2,000 too. */
 export const CLAIM_SCAN_STEP = 2_000n
-/** findLockup refuses a wider scan (about 9 days of Base blocks) rather than issue thousands of windowed reads. It covers
+/** findLockup refuses a wider scan (about 22h13m at the supported floor) rather than issue thousands of windowed reads. It covers
  *  the signer verifier's largest configurable lookback (302,400 blocks). */
 export const LOCKUP_MAX_SCAN_BLOCKS = 400_000n
 /**

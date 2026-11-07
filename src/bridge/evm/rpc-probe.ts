@@ -27,20 +27,32 @@ export type BaseRpcProbeResult = {
 /** A hung endpoint must fail its probe, not stall a boot or stack periodic probes. */
 const BASE_RPC_PROBE_CALL_TIMEOUT_MS = 15_000
 
-/** Largest-first: publicnode accepts the existing 2,000-block window; dRPC accepts the 100-block fallback. */
+/** Largest-first: publicnode accepts 2,000 blocks (~6m40s); dRPC accepts 100 blocks (~20s) at the supported floor. */
 export const BASE_RPC_LOG_SPAN_LADDER = [2_000n, 100n] as const
-/** Bound one caller request to at most 4,000 blocks on a 100-block-only endpoint. */
+/** Bound one caller request to 4,000 blocks (~13m20s) on a 100-block-only endpoint. */
 export const BASE_RPC_MAX_LOG_CHUNKS = 40
 const BASE_RPC_LOG_ANCHOR_TX_LIMIT = 8
 
-export async function rpcProbeCall(url: string, method: string, params: unknown[], fetchImpl: typeof fetch): Promise<unknown> {
+export async function rpcProbeCall(
+  url: string,
+  method: string,
+  params: unknown[],
+  fetchImpl: typeof fetch,
+  opts: { signal?: AbortSignal; timeoutMs?: number; strict?: boolean } = {},
+): Promise<unknown> {
+  const timeout = AbortSignal.timeout(opts.timeoutMs ?? BASE_RPC_PROBE_CALL_TIMEOUT_MS)
   const response = await fetchImpl(url, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    signal: AbortSignal.timeout(BASE_RPC_PROBE_CALL_TIMEOUT_MS),
+    signal: opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout,
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   const reply = await response.json() as RpcReply
   if (reply.error) throw new Error(`RPC ${reply.error.code ?? ''} ${reply.error.message ?? ''}`.trim())
+  // Opt-in: a reply must be a JSON-RPC 2.0 answer to this request (id 1) that carries a result.
+  if (opts.strict && (typeof reply !== 'object' || reply === null || (reply as { jsonrpc?: unknown }).jsonrpc !== '2.0'
+    || (reply as { id?: unknown }).id !== 1 || !Object.prototype.hasOwnProperty.call(reply, 'result'))) {
+    throw new Error('malformed JSON-RPC reply')
+  }
   return reply.result
 }
 

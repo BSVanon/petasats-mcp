@@ -9,7 +9,8 @@ import { preimageHashOf, type Erc20SwapParams } from './evm/erc20swap'
 import type { BridgeIntent, BridgeIntentV2, BridgeQuote, BridgeQuoteV2 } from './settlement-types'
 import { assertLockSafeForZeroConf, assertLockSafeForZeroConfMultiArc, watchRevealThroughClaim, watchRevealThroughClaimMultiArc, coverageLabel, type FetchTxStatus, type FetchArcStatuses } from './mainnet-zeroconf'
 import { ARC_PROVIDERS, CLAIM_WATCH_RESEND_MS, classifyArcStatus, classifyMultiArc, DEFAULT_CLAIM_WATCH_MAX_BLOCKS, watchLockThroughClaim } from './zeroconf-monitor'
-import { DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
+import { assertInitiatorTimelocks, DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
+import { baseAvailableSecsForBlocks, baseRequiredSecsForBlocks } from './base-block-time'
 import { makePreRevealHeightRead } from './pre-reveal-height'
 import { waitForLockTx } from './lock-tx-wait'
 /** The concrete swap the initiator runs: deliver an allowlisted ERC-20, receive BSV. */
@@ -246,9 +247,9 @@ function paramsFrom(intent: BridgeIntent, quote: BridgeQuote, decimals: number, 
     amountUsdc: intent.usdcAmount,
     amountBsvSats: intent.bsvAmount,
     quoteRef: 'convert-initiator',
-    baseRefundTs: now + 12 * 3600,
+    baseRefundTs: now + baseAvailableSecsForBlocks(cfg.baseTimelockBlocks),
     bsvRefundTs: now + 6 * 3600,
-    claimBudgetBaseSecs: 2 * 3600,
+    claimBudgetBaseSecs: baseRequiredSecsForBlocks(cfg.claimBudgetBaseBlocks ?? DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS),
     baseTimelockBlock: intent.baseTimelockBlock,
     bsvRefundLocktime: intent.bsvRefundLocktime,
     claimBudgetBaseBlocks: cfg.claimBudgetBaseBlocks ?? DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS,
@@ -327,6 +328,10 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
   if (!posInt(cfg.baseTimelockBlocks)) throw new Error(`initiator-executor: baseTimelockBlocks must be a positive integer ≥ 1 (got ${cfg.baseTimelockBlocks})`)
   if (!posInt(cfg.bsvRefundBlocks)) throw new Error(`initiator-executor: bsvRefundBlocks must be a positive integer ≥ 1 (got ${cfg.bsvRefundBlocks})`)
   if (!posInt(confs)) throw new Error(`initiator-executor: bsvConfirmations must be a positive integer ≥ 1 (got ${confs})`)
+  assertInitiatorTimelocks({
+    baseTimelockBlocks: cfg.baseTimelockBlocks,
+    claimBudgetBaseBlocks: cfg.claimBudgetBaseBlocks ?? DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS,
+  })
   const lockLandDeadlineMs = cfg.lockLandDeadlineMs ?? DEFAULT_EVM_LOCK_LAND_DEADLINE_MS
   if (!Number.isSafeInteger(lockLandDeadlineMs) || lockLandDeadlineMs < 1_000 || lockLandDeadlineMs > 600_000) {
     throw new Error(`initiator-executor: lockLandDeadlineMs must be a safe integer in [1000, 600000] (got ${String(lockLandDeadlineMs)})`)
@@ -862,10 +867,11 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             deps.persist?.(session.toRecord())
             durableClaimTxid = claimTxid
             const submittedTxid = await bsv.broadcast(claimRawHex, claimAtomicBeefHex) // ladder: raw + BEEF → Anvil→ARC→WoC→Bitails
-            // Production broadcasters return the deterministic raw-tx id. Retain the returned identity for legacy
-            // injected rails/tests; durable recovery always derives and validates identity from the persisted bytes.
-            bsvClaimTxid = submittedTxid
-            durableClaimTxid = submittedTxid
+            if (submittedTxid.toLowerCase() !== claimTxid.toLowerCase()) {
+              log('bsv', `claim broadcaster reported ${submittedTxid.slice(0, 12)}… but submitted subject is ${claimTxid.slice(0, 12)}…; retaining derived claim txid`)
+            }
+            bsvClaimTxid = claimTxid
+            durableClaimTxid = claimTxid
             break
           } catch (e) {
             if (durableClaimTxid === undefined) deps.signal?.throwIfAborted()

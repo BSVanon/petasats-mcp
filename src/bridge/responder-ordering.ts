@@ -7,6 +7,8 @@
  * most 1e-6: exp(-t/600) * sum(i=0..window-1, (t/600)^i / i!).
  */
 
+import { BASE_BLOCK_SECS_FLOOR, baseAvailableSecsForBlocks, baseBlocksForSecs } from './base-block-time'
+
 /** Minimum BSV runway for lock confirmation plus the initiator's reveal budget. */
 export const MIN_REVEAL_CONFIRM_BUDGET_BLOCKS = 6
 export const MIN_RESPONDER_WINDOW_BLOCKS = MIN_REVEAL_CONFIRM_BUDGET_BLOCKS + 2
@@ -15,9 +17,10 @@ export const MIN_RESPONDER_WINDOW_BLOCKS = MIN_REVEAL_CONFIRM_BUDGET_BLOCKS + 2
 export const MAX_RESPONDER_WINDOW_BLOCKS = 24
 
 /** Extra Base runway beyond the claim budget. */
-export const MIN_RESPONDER_BASE_MARGIN_BLOCKS = 900
+export const MIN_RESPONDER_BASE_MARGIN_BLOCKS = baseBlocksForSecs(30 * 60)
 export const BSV_BLOCK_SECS_EST = 600
-export const BASE_BLOCK_SECS_EST = 2
+/** Compatibility alias. New Base timing code should import the floor from base-block-time directly. */
+export const BASE_BLOCK_SECS_EST = BASE_BLOCK_SECS_FLOOR
 export const CROSS_CHAIN_MARGIN_SECS = 30 * 60
 
 // Index 0 is deliberately unused so the BSV window is the direct table index.
@@ -53,6 +56,32 @@ export function isChainHeight(h: number): boolean {
   return Number.isSafeInteger(h) && h >= 0
 }
 
+/**
+ * Base-only responder runway gate. This is safe to run when the buyer declares
+ * an intent because Base height only advances; the later full ordering gate
+ * still owns the BSV-window and cross-chain ordering checks.
+ */
+export function checkResponderBaseRunway(
+  baseTimelockBlock: number,
+  claimBudgetBaseBlocks: number,
+  baseHeight: number,
+): OrderingGuardResult {
+  if (!Number.isSafeInteger(baseTimelockBlock) || baseTimelockBlock <= 0 ||
+      !Number.isSafeInteger(claimBudgetBaseBlocks) || claimBudgetBaseBlocks <= 0) {
+    return { ok: false, reason: `invalid Base runway inputs (fail-closed): baseTimelockBlock=${baseTimelockBlock} claimBudgetBaseBlocks=${claimBudgetBaseBlocks} — both must be positive safe integers` }
+  }
+  if (!isChainHeight(baseHeight)) {
+    return { ok: false, reason: `invalid live Base height ${baseHeight} — must be a finite non-negative integer (fail-closed; a NaN/Infinity would silently pass every runway check)` }
+  }
+
+  const baseRunway = baseTimelockBlock - baseHeight
+  const baseFloor = claimBudgetBaseBlocks + MIN_RESPONDER_BASE_MARGIN_BLOCKS
+  if (baseRunway < baseFloor) {
+    return { ok: false, reason: `Base runway ${baseRunway} block(s) < claim budget ${claimBudgetBaseBlocks} + margin ${MIN_RESPONDER_BASE_MARGIN_BLOCKS} — the USDC-claim window could expire mid-swap` }
+  }
+  return { ok: true }
+}
+
 export function checkResponderRunwayAndOrdering(
   p: ResponderOrderingInputs,
   heights: { bsvHeight: number; baseHeight: number },
@@ -74,14 +103,13 @@ export function checkResponderRunwayAndOrdering(
     return { ok: false, reason: `BSV window ${bsvWindow} block(s) > ${MAX_RESPONDER_WINDOW_BLOCKS} — exceeds the maximum accepted responder window` }
   }
 
+  const baseRunwayCheck = checkResponderBaseRunway(p.baseTimelockBlock, p.claimBudgetBaseBlocks, heights.baseHeight)
+  if (!baseRunwayCheck.ok) return baseRunwayCheck
+
   const baseRunway = p.baseTimelockBlock - heights.baseHeight
-  const baseFloor = p.claimBudgetBaseBlocks + MIN_RESPONDER_BASE_MARGIN_BLOCKS
-  if (baseRunway < baseFloor) {
-    return { ok: false, reason: `Base runway ${baseRunway} block(s) < claim budget ${p.claimBudgetBaseBlocks} + margin ${MIN_RESPONDER_BASE_MARGIN_BLOCKS} — the USDC-claim window could expire mid-swap` }
-  }
 
   const bsvRefundBoundSecs = bsvRefundGammaUpperBoundSecs(bsvWindow)
-  const safeClaimWcSecs = (baseRunway - p.claimBudgetBaseBlocks) * BASE_BLOCK_SECS_EST
+  const safeClaimWcSecs = baseAvailableSecsForBlocks(baseRunway - p.claimBudgetBaseBlocks)
   if (safeClaimWcSecs < bsvRefundBoundSecs + CROSS_CHAIN_MARGIN_SECS) {
     return {
       ok: false,

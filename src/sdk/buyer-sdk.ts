@@ -9,6 +9,11 @@ export {
 export { createBuyerRuntime } from './buyer/runtime/runtime'
 export { assertBuyerMainnetP2pkhAddress } from './buyer/runtime/address'
 export { buyerStatusView } from './buyer/status-view'
+export {
+  BUYER_BASE_CONFIRMATION_BLOCKS, BUYER_BASE_CONFIRMATION_SECS,
+  BUYER_BASE_REFUND_BLOCKS, BUYER_BASE_REFUND_HOURS,
+  BUYER_BASE_CLAIM_BUDGET_BLOCKS, BUYER_BASE_CLAIM_BUDGET_HOURS,
+} from './buyer/timing-text'
 export { buyerClaimFeeBudgetSats } from './buyer/engine'
 export { mapDoorDecline, DoorDeclineError } from './buyer/door-client'
 export { readBuyerLimits } from './buyer/limits'

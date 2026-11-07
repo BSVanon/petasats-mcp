@@ -1,5 +1,5 @@
 import { type Transport } from 'viem'
-import { BASE_MAINNET_CHAIN_ID, BASE_RPC_UNVERIFIED_CRITICAL_AFTER_MS, DEFAULT_BASE_RPC_DEGRADED_PROBE_INTERVAL_MS, DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS, baseRpcTransport, describeBaseSendRpc, resolveBaseRpcDegradedProbeIntervalMs, resolveBaseRpcMaxHeadLagBlocks, resolveBaseRpcProbeIntervalMs, resolveBaseRpcUrlsForChain } from './rpc-config'
+import { BASE_MAINNET_CHAIN_ID, BASE_RPC_UNVERIFIED_CRITICAL_AFTER_MS, DEFAULT_BASE_RPC_DEGRADED_PROBE_INTERVAL_MS, DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS, baseRpcTransport, describeBaseSendRpc, redactBaseRpcUrlText, resolveBaseRpcDegradedProbeIntervalMs, resolveBaseRpcMaxHeadLagBlocks, resolveBaseRpcProbeIntervalMs, resolveBaseRpcUrlsForChain } from './rpc-config'
 import { BASE_RPC_MAX_LOG_CHUNKS, type BaseRpcProbeResult, probeBaseRpcEndpoint, rpcProbeCall } from './rpc-probe'
 import { guardLookup } from './lookup-refusal'
 import { baseSendTransport, requestRawTransactionSnapshot } from './rpc-send'
@@ -227,6 +227,12 @@ export class BaseRpcFailoverPool {
     return transport
   }
 
+  private redactErrorText(error: unknown): string {
+    let text = error instanceof Error ? error.message : String(error)
+    for (const url of this.opts.urls) text = redactBaseRpcUrlText(text, url)
+    return text
+  }
+
   /** Probe immediately; concurrent callers share one pass so endpoint snapshots cannot race. */
   async probeNow(): Promise<void> {
     if (this.probing) return this.probing
@@ -247,6 +253,7 @@ export class BaseRpcFailoverPool {
     const headLagFailures = new Set<string>()
     let degraded = false
     const retainTransient = (url: string, reason: string): void => {
+      reason = redactBaseRpcUrlText(reason, url)
       transientFailures.add(url)
       if (hadPreviousSet && previous.has(url)) {
         transientlyFailedPrevious.set(url, reason)
@@ -291,7 +298,7 @@ export class BaseRpcFailoverPool {
           if (!block?.hash) throw new Error('finalized hash missing')
           return { result, hash: block.hash.toLowerCase() }
         } catch (error) {
-          retainTransient(result.url, `finalized hash cross-check failed: ${error instanceof Error ? error.message : String(error)}`)
+          retainTransient(result.url, `finalized hash cross-check failed: ${this.redactErrorText(error)}`)
           return { result, hash: undefined }
         }
       }))
@@ -418,7 +425,7 @@ export class BaseRpcFailoverPool {
     this.timer = setTimeout(() => {
       this.timer = undefined
       void this.probeNow()
-        .catch((error) => this.opts.alert(`[base-rpc] periodic probe failed; active endpoints are fail-closed: ${error instanceof Error ? error.message : String(error)}`))
+        .catch((error) => this.opts.alert(`[base-rpc] periodic probe failed; active endpoints are fail-closed: ${this.redactErrorText(error)}`))
         .finally(() => this.scheduleNextProbe())
     }, this.nextDelayMs)
     this.timer.unref?.()

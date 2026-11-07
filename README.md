@@ -17,31 +17,31 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Pinning `petasats-mcp@0.2.15` is recommended.
+Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.16`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
 
 ```sh
-claude mcp add petasats -- npx -y petasats-mcp
+claude mcp add petasats -- npx -y petasats-mcp@0.2.16
 ```
 
 Claude Desktop (`claude_desktop_config.json`), Cursor (`~/.cursor/mcp.json`):
 
 ```json
-{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp"]}}}
+{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.16"]}}}
 ```
 
 VS Code (`.vscode/mcp.json`):
 
 ```json
-{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp"]}}}
+{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.16"]}}}
 ```
 
 Codex (CLI, IDE extension, or app):
 
 ```sh
-codex mcp add petasats -- npx -y petasats-mcp
+codex mcp add petasats -- npx -y petasats-mcp@0.2.16
 ```
 
-Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
+Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.16`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
 
 ## Fund the kit
 
@@ -78,9 +78,9 @@ You can create `~/.petasats/limits.json` to restrict where an AI may send funds 
 }
 ```
 
-Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp limits` to inspect it.
+Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.16 limits` to inspect it.
 
-`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp resume`; recovery for swaps already started keeps working.
+`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.16 resume`; recovery for swaps already started keeps working.
 
 `allowFastSettlement: false` forbids fast settlement for new swaps. If the field is missing, an explicitly requested fast swap is permitted to negotiate it; standard remains the default.
 
@@ -92,7 +92,7 @@ The server gives the AI an operating guide. With a person watching, it reports o
 
 ## Safety model
 
-Funds can go only to the swap contract on Base, the kit’s own addresses, or an address you provide. The kit verifies before reveal. The market maker’s BSV can return about four hours (24 blocks) after lock; your USDC refunds after about 16 hours if the swap does not finish. Recovery resumes after restart. Run one swap at a time and keep the server running during a swap.
+Funds can go only to the swap contract on Base, the kit’s own addresses, or an address you provide. The kit verifies before reveal. The standard Base gate is 60 confirmations (about 12 seconds). The market maker’s BSV can return about four hours (24 blocks) after lock; your USDC refunds after about 16 hours (288,000 Base blocks) if the swap does not finish. Recovery resumes after restart. Run one swap at a time and keep the server running during a swap.
 
 Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation. Fast is the buyer’s explicit choice; omitting `speed` uses standard settlement.
 
@@ -106,9 +106,9 @@ The npm package is built by GitHub Actions from a tagged commit and published wi
 
 ## Files, status, and recovery
 
-The kit uses `~/.petasats`. Run `npx petasats-mcp status` for status and `npx petasats-mcp recover` after interruption.
+The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.16 status` for status and `npx petasats-mcp@0.2.16 recover` after interruption.
 
-A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp withdrawal <hash> sent` or `npx petasats-mcp withdrawal <hash> not-sent`.
+A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.16 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.16 withdrawal <hash> sent` or `npx petasats-mcp@0.2.16 withdrawal <hash> not-sent`.
 
 Repeating the same Base withdrawal (same asset, amount, and address) within an hour is refused as a likely retry. Do not run two AI apps using the kit on the same folder at the same time.
 

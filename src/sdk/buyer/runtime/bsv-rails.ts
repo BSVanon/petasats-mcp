@@ -77,7 +77,10 @@ export function makeBuyerBsvRails(opts: BuyerBsvRailsOptions = {}): BuyerBsvRail
     zeroConfArcStatuses: getMultiArcTxStatuses,
     // ARC understands ordinary BEEF but not Atomic BEEF. Keep Atomic BEEF for
     // Anvil (which needs the BRC-95 subject) and opt in to ARC's BRC-62 wire.
-    broadcast: async (rawTx: string, atomicBeefHex?: string): Promise<string> => (await broadcast(rawTx, atomicBeefHex, { taalApiKey: null, anvilNodeUrl: anvilBaseUrl, anvilAuthToken: null, arcAtomicBeefAsBeef: true })).txid,
+    broadcast: async (rawTx: string, atomicBeefHex?: string): Promise<string> => {
+      await broadcast(rawTx, atomicBeefHex, { taalApiKey: null, anvilNodeUrl: anvilBaseUrl, anvilAuthToken: null, arcAtomicBeefAsBeef: true })
+      return Transaction.fromHex(rawTx).id('hex') as string
+    },
     chainHeight: (): Promise<number> => heights.readBsvHeight('risk'),
     readBsvHeight: (purpose): Promise<number> => heights.readBsvHeight(purpose),
     txConfirmations: async (txid: string): Promise<number> => {

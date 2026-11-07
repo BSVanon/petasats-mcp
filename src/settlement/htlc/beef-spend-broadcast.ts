@@ -25,5 +25,6 @@ export async function broadcastHtlcSpendAsBeef(spendTx: Transaction, rails: Beef
     lockInput.sourceTransaction = lockWithProof
     atomicBeefHex = Utils.toHex(spendTx.toAtomicBEEF())
   }
-  return rails.broadcast(rawTx, atomicBeefHex)
+  await rails.broadcast(rawTx, atomicBeefHex)
+  return spendTx.id('hex') as string
 }

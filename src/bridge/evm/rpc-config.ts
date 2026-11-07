@@ -1,10 +1,19 @@
 import { createHash } from 'node:crypto'
 import { fallback, http, type HttpTransport, type Transport } from 'viem'
 import { guardLookup, lookupRefusalGuard, lookupRefusalRetryableFetch } from './lookup-refusal'
+import { baseBlocksForSecs } from '../base-block-time'
 /** The deliberate default — a single stable endpoint, not the flaky `sepolia.base.org` round-robin. */
 export const PINNED_BASE_SEPOLIA_RPC = 'https://base-sepolia-rpc.publicnode.com'
 export const BASE_MAINNET_CHAIN_ID = 8453
 export const BASE_SEPOLIA_CHAIN_ID = 84532
+/** Provider-keyless Base endpoints, ordered by observed log span and then read-only fallback value. */
+export const DEFAULT_BASE_MAINNET_PUBLIC_RPC_URLS = [
+  'https://base-rpc.publicnode.com',
+  'https://base.drpc.org',
+  'https://mainnet.base.org',
+  'https://base-public.nodies.app',
+] as const
+
 /** The official public endpoint is round-robin/load-balanced; safe with the counter, but operationally less reliable. */
 const KNOWN_LOAD_BALANCED_BASE_SEND_HOSTS = new Set(['mainnet.base.org'])
 /** Accepted with a loud reliability/latency warning; a dedicated/private endpoint is still preferred. */
@@ -16,10 +25,11 @@ function validateRpcUrl(url: string, varName: string): string {
   try {
     parsed = new URL(url)
   } catch {
-    throw new Error(`${varName} is not a valid URL: '${url}'`)
+    // The value is withheld: an endpoint URL may carry a provider key.
+    throw new Error(`${varName} is not a valid URL (value withheld; it has ${url.length} characters)`)
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new Error(`${varName} must be http(s), got '${parsed.protocol}' in '${url}'`)
+    throw new Error(`${varName} must be http(s), got '${parsed.protocol}' for ${parsed.host || 'an endpoint with no host'}`)
   }
   return url
 }
@@ -51,7 +61,7 @@ export function resolveBaseRpcProbeIntervalMs(env: Record<string, string | undef
 }
 
 /** Endpoints lagging farther than this latest head are not safe for shared swap reads. */
-export const DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS = 30
+export const DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS = baseBlocksForSecs(60)
 export function resolveBaseRpcMaxHeadLagBlocks(env: Record<string, string | undefined> = process.env): number {
   const raw = env.BASE_RPC_MAX_HEAD_LAG_BLOCKS
   if (raw === undefined || raw === '') return DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS
@@ -163,6 +173,93 @@ export function describeBaseSendRpc(url: string): string {
   return `${parsed.origin} · endpoint-sha256 ${fingerprint}`
 }
 
+/**
+ * Remove one Base endpoint's provider credential from arbitrary error text.  A path segment or query value long enough
+ * to be a credential (16+ characters decoded, e.g. https://rpc.example.com/base/<key> or ?apikey=<key>) makes the
+ * endpoint private; short parts such as "base" or "v2" are not secrets and are left alone everywhere in the text.
+ * Endpoints with no such part deliberately pass through unchanged so their diagnostics remain byte-for-byte stable.
+ */
+export function redactBaseRpcUrlText(value: string, url: string): string {
+  let parsed: URL
+  try { parsed = new URL(url) } catch { return value }
+
+  const decodedLength = (part: string): number => { try { return decodeURIComponent(part).length } catch { return part.length } }
+  const pathSegments = parsed.pathname.split('/').filter((segment) => decodedLength(segment) >= 16)
+  const queryValues = [...parsed.searchParams.values()].filter((candidate) => candidate.length >= 16)
+  if (pathSegments.length === 0 && queryValues.length === 0) return value
+
+  const safe = describeBaseSendRpc(url)
+  const replacements = new Map<string, string>()
+  const withoutQuery = new URL(parsed)
+  withoutQuery.search = ''
+  withoutQuery.hash = ''
+  for (const candidate of [url, parsed.toString(), url.split(/[?#]/, 1)[0], withoutQuery.toString()]) {
+    if (candidate) replacements.set(candidate, safe)
+  }
+  for (const segment of pathSegments) {
+    replacements.set(segment, '<redacted>')
+    try { replacements.set(decodeURIComponent(segment), '<redacted>') } catch {}
+  }
+  for (const candidate of queryValues) replacements.set(candidate, '<redacted>')
+  for (const rawPart of parsed.search.slice(1).split('&')) {
+    const rawValue = rawPart.slice(rawPart.indexOf('=') + 1)
+    if (!rawValue) continue
+    try {
+      if (decodeURIComponent(rawValue).length >= 16) replacements.set(rawValue, '<redacted>')
+    } catch {}
+  }
+
+  let result = value
+  for (const [candidate, replacement] of [...replacements].sort(([left], [right]) => right.length - left.length)) {
+    result = result.split(candidate).join(replacement)
+  }
+  return result
+}
+
+/** Mutate viem's nested error objects without changing their class, name, or code. */
+export function redactBaseRpcError(error: unknown, url: string): void {
+  const seen = new Set<object>()
+  let candidate = error
+  while (typeof candidate === 'object' && candidate !== null && !seen.has(candidate)) {
+    seen.add(candidate)
+    const record = candidate as Record<string, unknown>
+    for (const field of ['message', 'shortMessage', 'details', 'url', 'stack'] as const) {
+      if (typeof record[field] !== 'string') continue
+      try { record[field] = redactBaseRpcUrlText(record[field], url) } catch {}
+    }
+    if (Array.isArray(record.metaMessages)) {
+      try {
+        record.metaMessages = record.metaMessages.map((entry) =>
+          typeof entry === 'string' ? redactBaseRpcUrlText(entry, url) : entry,
+        )
+      } catch {}
+    }
+    candidate = record.cause
+  }
+}
+
+/** Add in-place credential scrubbing to a viem HTTP transport without changing its request semantics. */
+export function redactedBaseHttpTransport(url: string, transport: HttpTransport): HttpTransport {
+  return ((config) => {
+    const inner = transport(config)
+    const request = async (args: Parameters<typeof inner.request>[0]) => {
+      try { return await inner.request(args) }
+      catch (error) {
+        redactBaseRpcError(error, url)
+        throw error
+      }
+    }
+    const configRequest = async (args: Parameters<typeof inner.config.request>[0]) => {
+      try { return await inner.config.request(args) }
+      catch (error) {
+        redactBaseRpcError(error, url)
+        throw error
+      }
+    }
+    return { ...inner, config: { ...inner.config, request: configRequest }, request }
+  }) as HttpTransport
+}
+
 /** Base READ retries: 6 retries after 250/500/1000/2000/4000/8000 ms (~15.75 s max added wait per read). This covers a
  *  throttled 429 (see below) and also widens viem's default schedule (3 × 150 ms) for the errors viem already retries
  *  (5xx, 408, …). The D2 drill (2026-09-27) saw mainnet.base.org keep throttling past the earlier 4-retry, ~3.75 s
@@ -183,7 +280,9 @@ export function throttleRetryableFetch(inner: typeof fetch = fetch): typeof fetc
  *  retried read is idempotent; the send path keeps the plain transport because the send engine owns its own
  *  resend/recovery logic. `retryDelayMs` exists for tests; production uses the default schedule. */
 export function baseReadTransport(url: string, fetchImpl?: typeof fetch, retryDelayMs = BASE_READ_RETRY_DELAY_MS): HttpTransport {
-  return lookupRefusalGuard(http(url, { fetchFn: throttleRetryableFetch(lookupRefusalRetryableFetch(fetchImpl)), retryCount: BASE_READ_RETRY_COUNT, retryDelay: retryDelayMs }))
+  return lookupRefusalGuard(redactedBaseHttpTransport(url, http(url, {
+    fetchFn: throttleRetryableFetch(lookupRefusalRetryableFetch(fetchImpl)), retryCount: BASE_READ_RETRY_COUNT, retryDelay: retryDelayMs,
+  })))
 }
 
 /**

@@ -1,5 +1,6 @@
 import { SettlementSession, validateSettlementRecord, type CompetingResolution, type SettlementRecord, type SettlementState, type SwapRole } from './settlement-session'
 import type { BsvClaimProof } from './bsv-claim-proof'
+import { BASE_BLOCK_SECS_FLOOR, baseAvailableSecsForBlocks, snapBaseSecondsNearInteger } from './base-block-time'
 export type WatchAction =
   | 'idle' // nothing locked yet
   | 'wait' // locked, refund timelock not yet matured (heartbeat)
@@ -75,8 +76,8 @@ export interface SecsPerBlock {
   bsv: number
   base: number
 }
-/** BSV ~10 min/block, Base ~2 s/block — for ETA rendering only (gates compare heights, not clocks). */
-export const DEFAULT_SECS_PER_BLOCK: SecsPerBlock = { bsv: 600, base: 2 }
+/** BSV ~10 min/block; Base uses the supported floor — ETA only (gates compare heights, not clocks). */
+export const DEFAULT_SECS_PER_BLOCK: SecsPerBlock = { bsv: 600, base: BASE_BLOCK_SECS_FLOOR }
 /** Six BSV blocks (~1 hour) is the minimum terminal burial used by recovery. A persisted producer target may raise
  * this floor but can never lower it back to the unsafe historical 1-confirmation behavior. */
 export const DEFAULT_BSV_FINALITY_CONFIRMATIONS = 6
@@ -99,7 +100,12 @@ export interface WatchtowerStatus {
 
 function mkGate(name: WatchGate['name'], chain: WatchGate['chain'], atHeight: number, currentHeight: number, secsPerBlock: number): WatchGate {
   const blocksRemaining = Math.max(0, atHeight - currentHeight)
-  return { name, chain, atHeight, currentHeight, blocksRemaining, etaSeconds: blocksRemaining * secsPerBlock }
+  const etaSeconds = chain === 'base'
+    ? secsPerBlock === BASE_BLOCK_SECS_FLOOR
+      ? baseAvailableSecsForBlocks(blocksRemaining)
+      : Math.floor(snapBaseSecondsNearInteger(blocksRemaining * secsPerBlock))
+    : blocksRemaining * secsPerBlock
+  return { name, chain, atHeight, currentHeight, blocksRemaining, etaSeconds }
 }
 
 /** A rail answer establishes public visibility only when it identifies the exact requested transaction. */

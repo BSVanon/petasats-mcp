@@ -5,7 +5,7 @@ import { makeIdentityOnlyWallet } from '../../src/sdk/buyer/runtime/identity-wal
 import { makeBuyerBsvRails } from '../../src/sdk/buyer/runtime/bsv-rails'
 import { DEFAULT_BUYER_BASE_RPC_URLS, guardBuyerEvmWrites, makeBuyerEvmRails } from '../../src/sdk/buyer/runtime/evm-rails'
 import { isAlreadyKnown, isNonceTooLow, isReplacementUnderpriced } from '../../src/bridge/evm/inflight-submit'
-import { BaseRpcUnknownSendError } from '../../src/bridge/evm/rpc'
+import { BaseRpcUnknownSendError, DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS } from '../../src/bridge/evm/rpc'
 import { clearTaalApiKey, setAnvilNode, setTaalApiKey } from '../../src/wallet/broadcast'
 import { buildEarlySweepTx, buildSweepTx, BUYER_SWEEP_DUST_SATS } from '../../src/sdk/buyer/runtime/sweep'
 import { makeQuorumChainTracker } from '../../src/wallet/quorum-chaintracks'
@@ -225,11 +225,12 @@ describe('buyer runtime rails', () => {
   it('keyless BSV ladder clears an inherited TAAL credential and attaches neither Authorization nor API-key headers', async () => {
     const saved = globalThis.fetch
     const seen: HeadersInit[] = []
+    const subjectTxid = Transaction.fromHex('01000000000000000000').id('hex')
     setTaalApiKey('credential-from-an-earlier-embedding-client')
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       seen.push(init?.headers ?? {})
       const url = String(input)
-      if (url.includes('whatsonchain.com')) return new Response(`"${'ab'.repeat(32)}"`, { headers: { 'content-type': 'application/json' } })
+      if (url.includes('whatsonchain.com')) return new Response(`"${subjectTxid}"`, { headers: { 'content-type': 'application/json' } })
       // Force the ARC tier to fail. Before the buyer clears TAAL this causes a
       // TAAL request carrying the inherited bearer credential.
       return new Response(JSON.stringify({}), { status: 500, headers: { 'content-type': 'application/json' } })
@@ -243,9 +244,10 @@ describe('buyer runtime rails', () => {
 
   it('keeps a TAAL key set after construction out of buyer broadcasts', async () => {
     const saved = globalThis.fetch; const seen: Array<{ url: string; headers: HeadersInit }> = []
+    const subjectTxid = Transaction.fromHex('01000000000000000000').id('hex')
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input); seen.push({ url, headers: init?.headers ?? {} })
-      if (url.includes('whatsonchain.com')) return new Response(`"${'ab'.repeat(32)}"`)
+      if (url.includes('whatsonchain.com')) return new Response(`"${subjectTxid}"`)
       return new Response(JSON.stringify({}), { status: 500, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
     try {
@@ -263,6 +265,7 @@ describe('buyer runtime rails', () => {
 
   it('submits ordinary BEEF to GorillaPool ARC from the buyer-kit broadcast path', async () => {
     const rawTx = '01000000000000000000'
+    const subjectTxid = Transaction.fromHex(rawTx).id('hex')
     const atomicBeefHex = Transaction.fromHex(rawTx).toHexAtomicBEEF()
     const requests: Array<{ url: string; init?: RequestInit }> = []
     const saved = globalThis.fetch
@@ -272,13 +275,13 @@ describe('buyer runtime rails', () => {
         return new Response('{}', { status: 422, headers: { 'content-type': 'application/json' } })
       }
       if (url.includes('arc.gorillapool.io/v1/tx')) {
-        return new Response(JSON.stringify({ txid: 'ef'.repeat(32), txStatus: 'SEEN_ON_NETWORK' }), { headers: { 'content-type': 'application/json' } })
+        return new Response(JSON.stringify({ txid: subjectTxid, txStatus: 'SEEN_ON_NETWORK' }), { headers: { 'content-type': 'application/json' } })
       }
       return new Response('{}', { status: 500, headers: { 'content-type': 'application/json' } })
     }) as typeof fetch
     try {
       const rails = makeBuyerBsvRails({ anvilBaseUrl: 'https://buyer-anvil.invalid', fetchImpl: globalThis.fetch })
-      expect(await rails.broadcast(rawTx, atomicBeefHex)).to.equal('ef'.repeat(32))
+      expect(await rails.broadcast(rawTx, atomicBeefHex)).to.equal(subjectTxid)
 
       const arc = requests.find(({ url }) => url === 'https://arc.gorillapool.io/v1/tx')
       expect(arc).to.not.equal(undefined)
@@ -325,7 +328,7 @@ describe('buyer runtime rails', () => {
     state['http://two.test'].hash = `0x${'b'.repeat(64)}`
     await rejects(() => rails.assertSafeForNewLock(), /split or unverified/)
     state['http://two.test'].hash = `0x${'a'.repeat(64)}`
-    state['http://one.test'].latest = '0x100'
+    state['http://one.test'].latest = `0x${(0x202 - DEFAULT_BASE_RPC_MAX_HEAD_LAG_BLOCKS - 20).toString(16)}`
     await rejects(() => rails.assertSafeForNewLock(), /split or unverified/)
   })
 

@@ -48,7 +48,7 @@ export const resolveEvmRefreshBudgetMs = (env: Record<string, string | undefined
   boundedMs(env, "EVM_REFRESH_BUDGET_MS", DEFAULT_EVM_REFRESH_BUDGET_MS, 2_000, 30_000)
 
 /** How long an attributed op's consumed nonce may stay without any receipt before one resend at a new nonce. Capped
- * at 10 minutes (~300 Base blocks), so even two unresolved generations stay far inside the 3600-block claim budget. */
+ * at 10 minutes (~3,000 Base blocks), so even two unresolved generations stay far inside the 36,000-block claim budget. */
 export const resolveEvmUnresolvedConsumedResendMs = (env: Record<string, string | undefined> = process.env): number =>
   boundedMs(env, "EVM_UNRESOLVED_CONSUMED_RESEND_MS", DEFAULT_EVM_UNRESOLVED_CONSUMED_RESEND_MS, 120_000, 600_000)
 

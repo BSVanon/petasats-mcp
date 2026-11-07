@@ -159,7 +159,8 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
       // RT-16 invariant: submit the persisted bytes VERBATIM. Recovery never rebuilds or fee-bumps this transaction,
       // so every duplicate broadcast is byte-identical and therefore has the same txid. A future fee-bump feature
       // must add explicit replacement-family tracking before it may change this line.
-      return broadcastBsv(rec.bsvRefundTxHex)
+      await broadcastBsv(rec.bsvRefundTxHex)
+      return Transaction.fromHex(rec.bsvRefundTxHex).id('hex') as string
     },
 
     // The responder doesn't refund the Base leg; wiring that is the initiator-side follow-up.
@@ -215,7 +216,8 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
       if (!rawHex) throw new Error('rebroadcastClaim: record has no persisted claim BEEF or raw transaction')
       if (opts.dry) return DRY_BSV_CLAIM
       await opts.beforeSend?.()
-      return broadcastBsv(rawHex, rec.bsvClaimBeefHex)
+      await broadcastBsv(rawHex, rec.bsvClaimBeefHex)
+      return artifactTxid
     },
 
     claimConfirmations: async (_rec: SettlementRecord, claimTxid: string): Promise<number> => bsvConfirmations(claimTxid),

@@ -1,5 +1,6 @@
 import type { BuyerSwapRecord } from './types'
 import { MIN_REVEAL_CONFIRM_BUDGET_BLOCKS } from '../../bridge/responder-ordering'
+import { BASE_BLOCK_SECS_FLOOR } from '../../bridge/base-block-time'
 
 const stages: Record<string, { label: string; step: number | null }> = {
   quoted: { label: 'Quote saved', step: 1 }, admitted: { label: 'Admitted', step: 2 },
@@ -42,7 +43,7 @@ export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown
     deadlines: {
       claim_bsv_by: record.bsvRefundLocktime === undefined ? undefined : { bsv_block: record.bsvRefundLocktime - MIN_REVEAL_CONFIRM_BUDGET_BLOCKS },
       usdc_refund_after: record.baseTimelockBlock === undefined ? undefined : { base_block: record.baseTimelockBlock },
-      note: 'block heights; a BSV block takes about 10 minutes, a Base block about 2 seconds',
+      note: `block heights; a BSV block takes about 10 minutes, a Base block about ${BASE_BLOCK_SECS_FLOOR} seconds`,
     },
     txids: { base_lock: record.baseLockTxid ? { txid: record.baseLockTxid, url: base(record.baseLockTxid) } : undefined, base_refund: record.baseRefundTxid ? { txid: record.baseRefundTxid, url: base(record.baseRefundTxid) } : undefined, bsv_lock: lockTxid ? { txid: lockTxid, url: bsv(lockTxid) } : undefined, bsv_claim: record.bsvClaimTxid ? { txid: record.bsvClaimTxid, url: bsv(record.bsvClaimTxid) } : undefined, bsv_delivery: record.sweepOutbox ? { txid: record.sweepOutbox.txid, url: bsv(record.sweepOutbox.txid) } : undefined },
     reason: record.reason, created_at: new Date(record.createdAtMs).toISOString(), updated_at: new Date(record.updatedAtMs).toISOString(),

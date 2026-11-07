@@ -122,8 +122,8 @@ const isValidTxid = (s: string): boolean => /^[0-9a-f]{64}$/i.test(s)
 /**
  * Canonical txid of a raw-tx hex — the success identifier to return when a
  * provider reports "already on chain" (its error body carries no txid then).
- * Returns '' if the hex can't be parsed (caller still treats it as success;
- * the tx is on chain regardless of whether we could re-derive the id).
+ * Returns '' if the hex cannot be parsed; the public ladder refuses to report
+ * a success without a locally derived subject id.
  */
 function txidFromRawTx(rawTx: string): string {
   try {
@@ -131,6 +131,17 @@ function txidFromRawTx(rawTx: string): string {
   } catch {
     return ''
   }
+}
+
+/**
+ * A provider may parse a multi-transaction BEEF differently from its caller.
+ * Its returned id therefore only proves a relay of our subject when it equals
+ * the id derived from the raw subject bytes we submitted.
+ */
+function reportedSubjectTxid(tier: string, reportedTxid: string, subjectTxid: string): boolean {
+  if (reportedTxid.toLowerCase() === subjectTxid.toLowerCase()) return true
+  console.warn(`broadcast ${tier} reported txid ${reportedTxid}, expected subject txid ${subjectTxid}`)
+  return false
 }
 
 export class FatalBroadcastError extends Error {
@@ -152,6 +163,7 @@ async function broadcastViaAnvil(
   atomicBeefHex?: string,
   nodeUrl = anvilNodeUrl,
   authToken = anvilAuthToken,
+  subjectTxid = txidFromRawTx(rawTx),
 ): Promise<BroadcastResult | null> {
   if (!nodeUrl) return null
   try {
@@ -188,8 +200,10 @@ async function broadcastViaAnvil(
     // re-broadcasting. Accepting `queued` here was that allowlist's un-hardened twin (red-team
     // 2026-08-30, the silent-refund-strand root): Anvil folds ARC RECEIVED/STORED → `queued`, so a
     // never-relayed refund got marked sent and the resolve loop stopped re-broadcasting it.
-    if (data.status === 'propagated' && data.txid) {
-      return { txid: data.txid, status: data.status, provider: 'Anvil' }
+    const anvilTxid = typeof data.txid === 'string' ? data.txid : ''
+    if (data.status === 'propagated' && anvilTxid) {
+      if (!reportedSubjectTxid('Anvil', anvilTxid, subjectTxid)) return null
+      return { txid: subjectTxid, status: data.status, provider: 'Anvil' }
     }
   } catch (e) {
     // A fatal broadcast status must PROPAGATE — don't fall through to ARC
@@ -206,6 +220,7 @@ async function broadcastViaArc(
   atomicBeefHex?: string,
   callTaalApiKey = taalApiKey,
   atomicBeefAsBeef = false,
+  subjectTxid = txidFromRawTx(rawTx),
 ): Promise<BroadcastResult> {
   const providers = [
     { url: 'https://arc.gorillapool.io', name: 'GorillaPool', apiKey: undefined as string | undefined },
@@ -261,8 +276,13 @@ async function broadcastViaArc(
         const summary = fields.length > 0 ? fields.join(' · ') : 'unknown'
         // Already-on-chain → idempotent success, not a failure.
         if (isAlreadyOnChain(summary) || isAlreadyOnChain(JSON.stringify(data))) {
+          const reportedTxid = typeof data.txid === 'string' ? data.txid : ''
+          if (reportedTxid && !reportedSubjectTxid(provider.name, reportedTxid, subjectTxid)) {
+            errors.push(`${provider.name}: already-known response named a different txid`)
+            continue
+          }
           return {
-            txid: data.txid || txidFromRawTx(rawTx),
+            txid: subjectTxid,
             status: 'ALREADY_IN_MEMPOOL',
             provider: provider.name,
           }
@@ -277,18 +297,26 @@ async function broadcastViaArc(
       // INVALID/MALFORMED, an unrecognised status — falls through (the next provider / WoC / Bitails, or the caller's
       // retry once ARC moves to SEEN_ON_NETWORK). Returning any of those as the txid would make a money caller mark a
       // never-relayed refund as done.
-      const arcTxid: string = data.txid ?? ''
+      const arcTxid = typeof data.txid === 'string' ? data.txid : ''
       const arcStatus: string = (data.txStatus ?? '').toUpperCase()
       // Idempotent: some ARCs 200 with an already-known-tx body → success with a validated txid.
       if (isAlreadyOnChain(JSON.stringify(data))) {
-        return { txid: isValidTxid(arcTxid) ? arcTxid : txidFromRawTx(rawTx), status: 'ALREADY_IN_MEMPOOL', provider: provider.name }
+        if (arcTxid && !reportedSubjectTxid(provider.name, arcTxid, subjectTxid)) {
+          errors.push(`${provider.name}: already-known response named a different txid`)
+          continue
+        }
+        return { txid: subjectTxid, status: 'ALREADY_IN_MEMPOOL', provider: provider.name }
       }
       const bad = BAD_ARC_SIGNAL.test(`${data.txStatus ?? ''} ${data.detail ?? ''} ${data.extraInfo ?? ''} ${data.title ?? ''}`)
       if (!isValidTxid(arcTxid) || !ARC_RELAYED.has(arcStatus) || bad) {
         errors.push(`${provider.name}: 2xx but not relayed (txid='${arcTxid}', status='${arcStatus || 'none'}'${bad ? ', bad-signal' : ''})`)
         continue
       }
-      return { txid: arcTxid, status: data.txStatus as string, provider: provider.name }
+      if (!reportedSubjectTxid(provider.name, arcTxid, subjectTxid)) {
+        errors.push(`${provider.name}: relayed response named a different txid`)
+        continue
+      }
+      return { txid: subjectTxid, status: data.txStatus as string, provider: provider.name }
     } catch (err) {
       if (err instanceof FatalBroadcastError) throw err
       errors.push(`${provider.name}: ${(err as Error).message}`)
@@ -304,7 +332,7 @@ async function broadcastViaArc(
  * even when GorillaPool/TAAL ARC reject for policy reasons. Used
  * after both Anvil + ARC have failed.
  */
-async function broadcastViaWoc(rawTx: string): Promise<BroadcastResult> {
+async function broadcastViaWoc(rawTx: string, subjectTxid = txidFromRawTx(rawTx)): Promise<BroadcastResult> {
   const url = 'https://api.whatsonchain.com/v1/bsv/main/tx/raw'
   const res = await fetch(url, {
     method: 'POST',
@@ -318,22 +346,24 @@ async function broadcastViaWoc(rawTx: string): Promise<BroadcastResult> {
     // an idempotent re-broadcast, not a failure. Return success with the
     // canonical txid (WoC's error body carries no txid).
     if (isAlreadyOnChain(text)) {
-      return { txid: txidFromRawTx(rawTx), status: 'ALREADY_IN_MEMPOOL', provider: 'WoC' }
+      return { txid: subjectTxid, status: 'ALREADY_IN_MEMPOOL', provider: 'WoC' }
     }
     // WoC error bodies are plain text, sometimes JSON-wrapped. Surface
     // raw body so the caller can see what got rejected.
     throw new Error(`WoC ${res.status}: ${text.slice(0, 500)}`)
   }
   // WoC returns the txid as a JSON-quoted string ("<64-hex>") on
-  // success. Strip surrounding quotes if present.
-  const txid = text.replace(/^"|"$/g, '').trim()
+  // success. Trim first (a JSON string may carry outer whitespace), then
+  // strip surrounding quotes if present.
+  const txid = text.trim().replace(/^"|"$/g, '')
   if (!/^[0-9a-f]{64}$/i.test(txid)) {
     if (isAlreadyOnChain(text)) {
-      return { txid: txidFromRawTx(rawTx), status: 'ALREADY_IN_MEMPOOL', provider: 'WoC' }
+      return { txid: subjectTxid, status: 'ALREADY_IN_MEMPOOL', provider: 'WoC' }
     }
     throw new Error(`WoC returned non-txid response: ${text.slice(0, 200)}`)
   }
-  return { txid, status: 'SEEN_ON_NETWORK', provider: 'WoC' }
+  if (!reportedSubjectTxid('WoC', txid, subjectTxid)) throw new Error('WoC reported a different txid')
+  return { txid: subjectTxid, status: 'SEEN_ON_NETWORK', provider: 'WoC' }
 }
 
 /**
@@ -342,7 +372,7 @@ async function broadcastViaWoc(rawTx: string): Promise<BroadcastResult> {
  * path. Used after WoC has also failed. Last-resort tier before we
  * declare the tx genuinely unrelayable.
  */
-async function broadcastViaBitails(rawTx: string): Promise<BroadcastResult> {
+async function broadcastViaBitails(rawTx: string, subjectTxid = txidFromRawTx(rawTx)): Promise<BroadcastResult> {
   const url = 'https://api.bitails.io/tx/broadcast'
   const res = await fetch(url, {
     method: 'POST',
@@ -353,7 +383,7 @@ async function broadcastViaBitails(rawTx: string): Promise<BroadcastResult> {
   const text = await res.text()
   if (!res.ok) {
     if (isAlreadyOnChain(text)) {
-      return { txid: txidFromRawTx(rawTx), status: 'ALREADY_IN_MEMPOOL', provider: 'Bitails' }
+      return { txid: subjectTxid, status: 'ALREADY_IN_MEMPOOL', provider: 'Bitails' }
     }
     throw new Error(`Bitails ${res.status}: ${text.slice(0, 500)}`)
   }
@@ -364,17 +394,18 @@ async function broadcastViaBitails(rawTx: string): Promise<BroadcastResult> {
     const parsed = JSON.parse(text)
     txid = typeof parsed === 'string' ? parsed : parsed.txid ?? parsed.id ?? ''
   } catch {
-    txid = text.replace(/^"|"$/g, '').trim()
+    txid = text.trim().replace(/^"|"$/g, '')
   }
   if (!/^[0-9a-f]{64}$/i.test(txid)) {
     // Bitails reports already-known as a 200 with an error object
     // `{error:{code:-27,message:"already-in-mempool"}}` — that's success.
     if (isAlreadyOnChain(text)) {
-      return { txid: txidFromRawTx(rawTx), status: 'ALREADY_IN_MEMPOOL', provider: 'Bitails' }
+      return { txid: subjectTxid, status: 'ALREADY_IN_MEMPOOL', provider: 'Bitails' }
     }
     throw new Error(`Bitails returned non-txid response: ${text.slice(0, 200)}`)
   }
-  return { txid, status: 'SEEN_ON_NETWORK', provider: 'Bitails' }
+  if (!reportedSubjectTxid('Bitails', txid, subjectTxid)) throw new Error('Bitails reported a different txid')
+  return { txid: subjectTxid, status: 'SEEN_ON_NETWORK', provider: 'Bitails' }
 }
 
 /**
@@ -408,27 +439,29 @@ export async function broadcast(
   atomicBeefHex?: string,
   options?: BroadcastOptions,
 ): Promise<BroadcastResult> {
+  const subjectTxid = txidFromRawTx(rawTx)
+  if (!subjectTxid) throw new Error('cannot derive subject txid from raw transaction')
   const callAnvilNodeUrl = options && 'anvilNodeUrl' in options ? options.anvilNodeUrl ?? null : anvilNodeUrl
   const callTaalApiKey = options && 'taalApiKey' in options ? options.taalApiKey ?? null : taalApiKey
   const callAnvilAuthToken = options && 'anvilAuthToken' in options ? options.anvilAuthToken ?? null : anvilAuthToken
   const callArcAtomicBeefAsBeef = options?.arcAtomicBeefAsBeef === true
-  const anvilResult = await broadcastViaAnvil(rawTx, atomicBeefHex, callAnvilNodeUrl, callAnvilAuthToken)
+  const anvilResult = await broadcastViaAnvil(rawTx, atomicBeefHex, callAnvilNodeUrl, callAnvilAuthToken, subjectTxid)
   if (anvilResult) return anvilResult
   let arcMsg = ''
   let wocMsg = ''
   try {
-    return await broadcastViaArc(rawTx, atomicBeefHex, callTaalApiKey, callArcAtomicBeefAsBeef)
+    return await broadcastViaArc(rawTx, atomicBeefHex, callTaalApiKey, callArcAtomicBeefAsBeef, subjectTxid)
   } catch (arcErr) {
     if (arcErr instanceof FatalBroadcastError) throw arcErr
     arcMsg = (arcErr as Error).message
   }
   try {
-    return await broadcastViaWoc(rawTx)
+    return await broadcastViaWoc(rawTx, subjectTxid)
   } catch (wocErr) {
     wocMsg = `WoC: ${(wocErr as Error).message}`
   }
   try {
-    return await broadcastViaBitails(rawTx)
+    return await broadcastViaBitails(rawTx, subjectTxid)
   } catch (bitErr) {
     throw new Error(
       `All broadcast providers failed:\n${arcMsg}\n${wocMsg}\nBitails: ${(bitErr as Error).message}`,

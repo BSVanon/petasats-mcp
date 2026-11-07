@@ -63,6 +63,7 @@ export async function fetchTestnetTx(txid: string): Promise<Transaction> {
 
 /** Broadcast a raw tx to BSV testnet; returns the txid. */
 export async function broadcastTestnet(txHex: string): Promise<string> {
+  const subjectTxid = Transaction.fromHex(txHex).id('hex') as string
   const res = await fetch(`${WOC}/tx/raw`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -71,7 +72,12 @@ export async function broadcastTestnet(txHex: string): Promise<string> {
   })
   const body = (await res.text()).trim()
   if (!res.ok) throw new Error(`WoC-test broadcast → HTTP ${res.status}: ${body}`)
-  return body.replace(/^"|"$/g, '') // WoC returns the txid as a quoted string
+  const reportedTxid = body.replace(/^"|"$/g, '') // WoC returns the txid as a quoted string
+  if (reportedTxid.toLowerCase() !== subjectTxid.toLowerCase()) {
+    console.warn(`testnet broadcast reported txid ${reportedTxid}, expected subject txid ${subjectTxid}`)
+    throw new Error('WoC-test broadcast reported a different txid')
+  }
+  return subjectTxid
 }
 
 /**

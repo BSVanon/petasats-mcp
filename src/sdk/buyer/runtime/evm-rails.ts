@@ -1,15 +1,10 @@
 import { createPublicClient, type Address, type Hex } from 'viem'
 import { Erc20SwapEvmClient } from '../../../bridge/evm/client'
-import { BaseRpcFailoverPool, DEFAULT_BASE_RPC_PROBE_INTERVAL_MS, makeBaseRpcUnsafeForNewRisk } from '../../../bridge/evm/rpc'
+import { BaseRpcFailoverPool, DEFAULT_BASE_MAINNET_PUBLIC_RPC_URLS, DEFAULT_BASE_RPC_PROBE_INTERVAL_MS, makeBaseRpcUnsafeForNewRisk } from '../../../bridge/evm/rpc'
 import { buyerBaseChain } from '../../../bridge/evm/tip-floor'
 
 /** Provider-keyless Base endpoints, ordered by observed log span and then read-only fallback value. */
-export const DEFAULT_BUYER_BASE_RPC_URLS = [
-  'https://base-rpc.publicnode.com',
-  'https://base.drpc.org',
-  'https://mainnet.base.org',
-  'https://base-public.nodies.app',
-] as const
+export const DEFAULT_BUYER_BASE_RPC_URLS = DEFAULT_BASE_MAINNET_PUBLIC_RPC_URLS
 
 export interface BuyerEvmRailsOptions {
   privateKey: Hex

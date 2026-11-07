@@ -1,5 +1,5 @@
 import { http, RpcRequestError, type HttpTransport } from 'viem'
-import { describeBaseSendRpc } from './rpc-config'
+import { describeBaseSendRpc, redactedBaseHttpTransport } from './rpc-config'
 
 export type BaseRpcSendAttemptSummary = {
   endpoint: string
@@ -39,7 +39,7 @@ function statusAwareSendFetch(inner: typeof fetch = fetch): typeof fetch {
 
 /** Raw sends get exactly one HTTP attempt. The pool's explicit URL loop is the sole owner of byte-identical resends. */
 export function baseSendTransport(url: string, fetchImpl?: typeof fetch): HttpTransport {
-  return http(url, { fetchFn: statusAwareSendFetch(fetchImpl), retryCount: 0 })
+  return redactedBaseHttpTransport(url, http(url, { fetchFn: statusAwareSendFetch(fetchImpl), retryCount: 0 }))
 }
 
 function errorChain(error: unknown): unknown[] {

@@ -133,7 +133,9 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
       }))
       const built = await f.buildSweepTx({ coins, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB })
       await opts?.beforeBroadcast?.()
-      const txid = await bsv.broadcast(built.rawTx, built.atomicBeefHex)
+      const submittedTxid = await bsv.broadcast(built.rawTx, built.atomicBeefHex)
+      const txid = built.tx.id('hex') as string
+      if (submittedTxid.toLowerCase() !== txid.toLowerCase()) log(`buyer sweep broadcaster reported ${submittedTxid.slice(0, 12)}… but submitted subject is ${txid.slice(0, 12)}…; retaining derived txid`)
       return { txid, sats: BigInt(built.outputSatoshis) }
     },
     buildSweep: async (address: string, opts: { onlyTxid: string }) => {
@@ -155,7 +157,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     },
     broadcastSweep: async (outbox: { rawTx: string; atomicBeefHex?: string; txid: string }) => {
       const accepted = await bsv.broadcast(outbox.rawTx, outbox.atomicBeefHex)
-      if (accepted.toLowerCase() !== outbox.txid.toLowerCase()) throw new Error(`buyer sweep: relay returned mismatched txid ${accepted}`)
+      if (accepted.toLowerCase() !== outbox.txid.toLowerCase()) log(`buyer sweep broadcaster reported ${accepted.slice(0, 12)}… but submitted subject is ${outbox.txid.slice(0, 12)}…; retaining derived txid`)
     },
     isSweepConfirmed: async (txid: string, _address: string) => {
       // The recipient can spend a confirmed output immediately.  Delivery is a fact

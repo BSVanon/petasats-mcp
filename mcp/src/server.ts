@@ -2,7 +2,11 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { assertBuyerMainnetP2pkhAddress, buyerStatusView, type Quote, type Route, type BuyerKit, type BuyerQuote } from 'petasats/sdk'
+import {
+  assertBuyerMainnetP2pkhAddress, buyerStatusView,
+  BUYER_BASE_CLAIM_BUDGET_HOURS, BUYER_BASE_REFUND_HOURS,
+  type Quote, type Route, type BuyerKit, type BuyerQuote,
+} from 'petasats/sdk'
 import { requireString, optionalString, optionalObject, requireAmount, success, toolError, toolErrorData, ToolInputError } from './validate.js'
 import { parseAsset, formatAsset, supportedPairs } from './assets.js'
 import { VERSION } from './version.js'
@@ -30,7 +34,7 @@ REPORTING
 
 SAFETY
 - Standard speed is the default. Fast mode is the buyer's explicit choice and both sides must agree; otherwise the swap waits for one BSV confirmation. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.
-- Keep this MCP server running until the swap is done. If it stops, the swap resumes safely when it starts again. If it stays stopped for more than about 3 hours after the USDC lock, the swap cannot finish; the kit then refunds the USDC the next time it runs after the Base timelock ends (about 16 hours after the lock).
+- Keep this MCP server running until the swap is done. If it stops, the swap resumes safely when it starts again. If it stays stopped for more than about ${BUYER_BASE_CLAIM_BUDGET_HOURS} hours after the USDC lock, the swap cannot finish; the kit then refunds the USDC the next time it runs after the Base timelock ends (about ${BUYER_BASE_REFUND_HOURS} hours after the lock).
 - The kit refuses a new swap or a withdrawal while a swap is in progress.
 - stop_spending stops new swaps and withdrawals until the user runs \`npx petasats-mcp resume\` in a terminal. Limits in limits.json can also refuse destinations and daily spending.
 - withdraw_bsv and withdraw_base send funds out of the kit. Use only an address the user gave you, and confirm it with them.
