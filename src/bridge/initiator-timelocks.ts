@@ -21,9 +21,9 @@ export interface InitiatorTimelockSettingNames {
   claimBudget: string
 }
 
-/** Fail at startup on a setting that can never satisfy the responder's largest accepted BSV window. */
+/** Fail at startup on a setting that cannot satisfy the configured responder window (or the shared maximum by default). */
 export function assertInitiatorTimelocks(
-  values: Pick<InitiatorTimelockDefaults, 'baseTimelockBlocks' | 'claimBudgetBaseBlocks'>,
+  values: Pick<InitiatorTimelockDefaults, 'baseTimelockBlocks' | 'claimBudgetBaseBlocks'> & Partial<Pick<InitiatorTimelockDefaults, 'bsvRefundBlocks'>>,
   names: InitiatorTimelockSettingNames = { baseTimelock: 'baseTimelockBlocks', claimBudget: 'claimBudgetBaseBlocks' },
 ): void {
   if (!Number.isSafeInteger(values.claimBudgetBaseBlocks) || values.claimBudgetBaseBlocks < MIN_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS) {
@@ -34,14 +34,18 @@ export function assertInitiatorTimelocks(
   if (!Number.isSafeInteger(values.baseTimelockBlocks) || values.baseTimelockBlocks <= 0) {
     throw new Error(`${names.baseTimelock} must be a positive safe integer; got ${String(values.baseTimelockBlocks)}`)
   }
+  const responderWindow = values.bsvRefundBlocks ?? MAX_RESPONDER_WINDOW_BLOCKS
+  if (!Number.isSafeInteger(responderWindow) || responderWindow < 1 || responderWindow > MAX_RESPONDER_WINDOW_BLOCKS) {
+    throw new Error(`bsvRefundBlocks must be a safe integer in [1, ${MAX_RESPONDER_WINDOW_BLOCKS}] when set; got ${String(responderWindow)}`)
+  }
   const result = checkResponderRunwayAndOrdering({
-    bsvRefundLocktime: MAX_RESPONDER_WINDOW_BLOCKS,
+    bsvRefundLocktime: responderWindow,
     baseTimelockBlock: values.baseTimelockBlocks,
     claimBudgetBaseBlocks: values.claimBudgetBaseBlocks,
   }, { bsvHeight: 0, baseHeight: 0 })
   if (!result.ok) {
     throw new Error(
-      `${names.baseTimelock}=${values.baseTimelockBlocks} cannot pass the responder gate at the largest allowed BSV window (${MAX_RESPONDER_WINDOW_BLOCKS} blocks) with ${names.claimBudget}=${values.claimBudgetBaseBlocks}: ${result.reason}`,
+      `${names.baseTimelock}=${values.baseTimelockBlocks} cannot pass the responder gate at the configured BSV window (${responderWindow} blocks) with ${names.claimBudget}=${values.claimBudgetBaseBlocks}: ${result.reason}`,
     )
   }
 }

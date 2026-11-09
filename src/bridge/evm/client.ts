@@ -43,6 +43,12 @@ import {
   type Erc20SwapParams,
   type LockupEvent,
 } from './erc20swap'
+import {
+  assertCooperativeRefundConstants,
+  cooperativeRefundCalldataMatches,
+  cooperativeRefundTypedData,
+  encodeRefundCooperative,
+} from './cooperative-refund'
 
 /** A positive identity mismatch is distinct from an RPC outage: callers must keep reporting it as unhealthy even
  * when no current record happens to require EVM recovery. */
@@ -747,6 +753,28 @@ export class Erc20SwapEvmClient {
     return this.send(this.swapAddress, encodeRefund(p), undefined, priorBroadcastTxid, authorizeNewBroadcast, true)
   }
 
+  async cooperativeRefund(
+    p: Erc20SwapParams,
+    authorizeNewBroadcast?: EvmNewBroadcastAuthorizer,
+    onRecorded?: (signed: { hash: Hex; signedTx: Hex; nonce: number }) => void | Promise<void>,
+  ): Promise<SentTx> {
+    const writer = this.writer()
+    await this.assertContractIdentity()
+    if (p.claimAddress.toLowerCase() !== this.addr.toLowerCase()) {
+      throw new Error(`cooperative refund refused: Lockup claimAddress ${p.claimAddress} is not the market maker ${this.addr}`)
+    }
+    const [domainSeparator, typehash] = await Promise.all([
+      this.pub.readContract({ address: this.swapAddress, abi: ERC20_SWAP_ABI, functionName: 'DOMAIN_SEPARATOR' }),
+      this.pub.readContract({ address: this.swapAddress, abi: ERC20_SWAP_ABI, functionName: 'TYPEHASH_REFUND' }),
+    ])
+    assertCooperativeRefundConstants(this.chainId, this.swapAddress, domainSeparator, typehash)
+    const account = writer.account
+    if (!account || account.type !== 'local') throw new Error('cooperative refund refused: EVM writer has no local signing account')
+    const signature = await account.signTypedData(cooperativeRefundTypedData(p, this.chainId, this.swapAddress))
+    const data = encodeRefundCooperative(p, signature)
+    return this.send(this.swapAddress, data, undefined, undefined, authorizeNewBroadcast, true, undefined, onRecorded)
+  }
+
   async transferErc20(
     token: Address,
     to: Address,
@@ -770,6 +798,7 @@ export class Erc20SwapEvmClient {
     if (value <= 0n) throw new Error('transferNative value must be positive')
     return this.send(to, '0x', value, undefined, undefined, false, undefined, opts.onRecorded, opts.pinnedFees)
   }
+
   /** Price a Base native transfer once, including the OP-stack L1 data fee. */
   async priceNativeTransfer(to: Address): Promise<NativeTransferPrice> {
     if (this.nonceCounter) throw new Error('transferNative is not supported by a counter-leased client')
@@ -1021,12 +1050,21 @@ export class Erc20SwapEvmClient {
     return tx.to?.toLowerCase() === to.toLowerCase() && tx.input.toLowerCase() === data.toLowerCase()
   }
 
+  /** Bind a top-level call to the verified nine-argument cooperative-refund overload and exact swap tuple. */
+  async transactionCallsCooperativeRefund(hash: Hex, to: Address, p: Erc20SwapParams): Promise<boolean> {
+    await this.assertContractIdentity()
+    const tx = await this.pub.getTransaction({ hash })
+    return tx.to?.toLowerCase() === to.toLowerCase() &&
+      typeof tx.input === 'string' && cooperativeRefundCalldataMatches(tx.input, p)
+  }
+
   /**
    * Resolve HOW this exact hashlock left escrow, using only canonical events at/below the OP-stack `finalized` head.
    * The recorded lock block is mandatory: it is the bounded anchor that makes legitimately old swaps scannable under
    * public RPCs' `eth_getLogs` span cap. Every inclusive window is ≤`CLAIM_SCAN_STEP` blocks. Because Claim/Refund events
-   * index only the public hashlock, every candidate event transaction is additionally bound to `claim`/`refund`
-   * calldata for this exact six-field tuple before it is accepted; same-hash decoys are ignored. This method never
+   * index only the public hashlock, every candidate event transaction is additionally bound to `claim`, ordinary
+   * `refund`, or the verified nine-argument cooperative-refund calldata for this exact six-field tuple before it is
+   * accepted; same-hash decoys are ignored. This method never
    * falls back to `latest`, genesis, or tuple absence. Any read/malformed-data doubt returns `unresolved` rather than
    * throwing or guessing; observing both tuple-bound event kinds is an on-chain/provider contradiction and likewise
    * fails closed.
@@ -1079,7 +1117,8 @@ export class Erc20SwapEvmClient {
             malformed = true
             continue
           }
-          const tupleBound = await this.transactionCalls(eventTxid, this.swapAddress, encodeRefund(p))
+          const tupleBound = await this.transactionCalls(eventTxid, this.swapAddress, encodeRefund(p)) ||
+            await this.transactionCallsCooperativeRefund(eventTxid, this.swapAddress, p)
           if (!tupleBound) continue
           if (refunded && refunded.eventTxid.toLowerCase() !== eventTxid.toLowerCase()) {
             malformed = true

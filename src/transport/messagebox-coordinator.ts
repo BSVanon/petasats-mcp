@@ -20,6 +20,8 @@ export interface MessageBoxInitiatorCoordinatorOpts extends MessageBoxChannelOpt
   /** Private peer-compatibility adaptation, applied before the public quote schema. */
   normalizeQuote?: (quote: unknown) => unknown
   settlementProtocolVersion?: 1 | 2
+  /** Optional shorter receive period used by a caller that re-checks an on-chain deadline between BSV-lock polls. */
+  bsvLockTimeoutMs?: number
 }
 
 export interface MessageBoxResponderCoordinatorOpts extends MessageBoxChannelOpts { settlementProtocolVersion?: 1 | 2 }
@@ -42,6 +44,9 @@ export function makeMessageBoxInitiatorCoordinator(opts: MessageBoxInitiatorCoor
     throw new Error('makeMessageBoxInitiatorCoordinator: peerIdentityPubKeyHex (the responder identity) is required — the initiator sends the intent first and must address it')
   }
   const ch = makeMessageBoxChannel(opts)
+  // The peer is configured for initiators, so this independent poll channel has the same authenticated identity and
+  // namespace. Existing callers retain the one-channel default exactly.
+  const bsvLockChannel = opts.bsvLockTimeoutMs === undefined ? ch : makeMessageBoxChannel({ ...opts, timeoutMs: opts.bsvLockTimeoutMs })
   const normalizeQuote = opts.normalizeQuote ?? ((quote: unknown) => quote)
   return {
     sendIntent: (i: BridgeIntent) => ch.send(SWAP_MESSAGE_KINDS.intent, i),
@@ -53,7 +58,7 @@ export function makeMessageBoxInitiatorCoordinator(opts: MessageBoxInitiatorCoor
     sendBaseLocked: (m: { txHash: `0x${string}`; blockNumber: number }) => ch.send(SWAP_MESSAGE_KINDS.baseLocked, m),
     recvRefundSkeleton: () => ch.recv<RefundSkeletonMsg>(SWAP_MESSAGE_KINDS.refundSkeleton, isRefundSkeleton),
     sendRefundSigA: (m: { sigA: number[] }) => ch.send(SWAP_MESSAGE_KINDS.refundSigA, m),
-    recvBsvLocked: () => ch.recv<{ bsvLockTxid: string; htlcScriptHex: string }>(SWAP_MESSAGE_KINDS.bsvLocked, isBsvLocked),
+    recvBsvLocked: () => bsvLockChannel.recv<{ bsvLockTxid: string; htlcScriptHex: string }>(SWAP_MESSAGE_KINDS.bsvLocked, isBsvLocked),
     sendRevealHint: (m: { bsvClaimTxid: string }) => ch.send(SWAP_MESSAGE_KINDS.reveal, m),
   }
 }

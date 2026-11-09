@@ -1,6 +1,5 @@
 import { Transaction, type ChainTracker, type CommsLayer, type PublicKey } from '@bsv/sdk'
 import { makeBridgeInitiatorExecutor, type BridgeInitiatorBsvRails, type BridgeInitiatorEvmRails } from '../../bridge/initiator-executor'
-import { defaultInitiatorTimelocks } from '../../bridge/initiator-timelocks'
 import { formatInitiatorWatchtowerProgress, makeInitiatorRecoverySupervisor, makeValidatedBsvFinality, type RecoveryBsvRails } from '../../bridge/in-process-recovery'
 import type { RecoveryClaimEvm } from '../../bridge/watchtower-adapters'
 import { DEFAULT_BSV_FINALITY_CONFIRMATIONS } from '../../bridge/watchtower'
@@ -14,8 +13,13 @@ import type { FetchArcStatuses, FetchTxStatus } from '../../bridge/mainnet-zeroc
 import type { BuyerExecutor, BuyerQuote, BuyerRecoveryOutcome, BuyerSwapRecord, BuyerSwapStage } from './types'
 import { resolveUnlandedLock, UNLANDED_LOCK_ABORT_REASON, type BuyerUnlandedLockRails } from './unlanded-lock'
 import { makeTerminalAcknowledgement } from './terminal-ack'
+import { resolveCooperativeRefund } from './cooperative-refund'
+import { defaultBuyerInitiatorTimelocks } from './timing-text'
+import { COOPERATIVE_REFUND_REASON } from './types'
+import { MIN_RESPONDER_WINDOW_BLOCKS } from '../../bridge/responder-ordering'
 
 export const BUYER_RECOVERY_POLL_MS = 15_000
+export const BUYER_BSV_LOCK_POLL_MS = 15_000
 
 const knownBuyerStage = (stage: string): stage is BuyerSwapStage => new Set<BuyerSwapStage>([
   'quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'claimed',
@@ -121,6 +125,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
   const executorClears = new Map<string, { state: SettlementState; reason?: string }>()
   const lastUnlandedLockCheck = new Map<string, number>()
   const executingHashes = new Set<string>()
+  const resolutionNeedsAttention = new Set<string>()
   const mark = (hashHex: string, state: SettlementState): void => {
     for (const [swapId, current] of known) if (current.hashHex === hashHex) known.set(swapId, { hashHex, state })
   }
@@ -225,6 +230,28 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     mark(resolved.hashHex, resolved.state)
     return resolved
   }
+  const resolveCooperativeRefundIfPresent = async (record: SettlementRecord): Promise<{ record: SettlementRecord; needsAttention?: string }> => {
+    const resolution = await resolveCooperativeRefund(record, {
+      evm: deps.evm,
+      now: deps.now,
+      reread: (hashHex) => records.list().records.find((entry) => entry.hashHex === hashHex),
+      persist: (next) => records.write(next),
+      assertPoolSafe: deps.assertEvmPoolSafe,
+    })
+    if (resolution.kind === 'refunded') {
+      recovery.cancel(record.hashHex, COOPERATIVE_REFUND_REASON)
+      mark(record.hashHex, 'refunded')
+      deps.log(`buyer recovery: ${COOPERATIVE_REFUND_REASON} (${resolution.eventTxid})`)
+      return { record: resolution.record }
+    }
+    if (resolution.kind === 'claimed') {
+      resolutionNeedsAttention.add(record.hashHex.toLowerCase())
+      const reason = `RECOVERY NEEDS ATTENTION: finalized Base Claim ${resolution.eventTxid} consumed the exact USDC tuple before a buyer reveal`
+      deps.log(reason)
+      return { record: resolution.record, needsAttention: reason }
+    }
+    return { record: resolution.record }
+  }
 
   return {
     async execute(input) {
@@ -233,6 +260,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       // default wait: capping them at the short admission window would strand a locked USDC leg until the timelock.
       const messageBox = makeMessageBoxInitiatorCoordinator({
         comms: deps.comms, namespace: input.swapNamespace, peerIdentityPubKeyHex: deps.doorIdentity, settlementProtocolVersion: input.quote.doorProtocolVersion === 2 ? 2 : 1, signal: lifecycle.signal,
+        bsvLockTimeoutMs: BUYER_BSV_LOCK_POLL_MS, now: deps.now,
       })
       // Admission is a short-lived reservation at the public door. Refuse before emitting the first settlement message
       // when it has expired, rather than allowing an old admission to create a fresh on-chain lock.
@@ -242,8 +270,50 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           if (deps.now() >= input.handshakeDeadlineMs) throw new Error('market maker admission expired before the swap intent was sent')
           return messageBox.sendIntent(...args)
         },
+        recvBsvLocked: async () => {
+          for (;;) {
+            let locked
+            try {
+              locked = await messageBox.recvBsvLocked()
+            } catch (error) {
+              const text = error instanceof Error ? error.message : String(error)
+              if (!/timed out waiting for 'bsv-locked'/.test(text)) throw error
+              const current = executingHash ? records.list().records.find((entry) => entry.hashHex === executingHash) : undefined
+              if (!current) throw error
+              const checked = await resolveCooperativeRefundIfPresent(current)
+              if (checked.record.state === 'refunded') throw new Error(COOPERATIVE_REFUND_REASON)
+              if (checked.needsAttention) throw new Error(checked.needsAttention)
+              try {
+                const height = await deps.bsv.chainHeight()
+                if (checked.record.bsvRefundLocktime - height < MIN_RESPONDER_WINDOW_BLOCKS) throw error
+                deps.log(`buyer: still waiting for the market maker's BSV lock; ${checked.record.bsvRefundLocktime - height} BSV blocks remain in the market maker's safe lock window`)
+              } catch (heightError) {
+                if (heightError === error) throw error
+                deps.log(`buyer: BSV height unavailable while waiting for the market maker's lock; continuing without changing the recovery path (${heightError instanceof Error ? heightError.message : String(heightError)})`)
+              }
+              continue
+            }
+            const current = executingHash ? records.list().records.find((entry) => entry.hashHex === executingHash) : undefined
+            const checked = current ? await resolveCooperativeRefundIfPresent(current) : undefined
+            if (checked?.record.state === 'refunded') {
+              deps.log(`buyer: refused BSV lock after cooperative refund for ${checked.record.hashHex}`)
+              throw new Error(COOPERATIVE_REFUND_REASON)
+            }
+            if (checked?.needsAttention) throw new Error(checked.needsAttention)
+            if (current?.state === 'refunded') {
+              deps.log(`buyer: refused later BSV lock after cooperative refund for ${current.hashHex}`)
+              throw new Error(COOPERATIVE_REFUND_REASON)
+            }
+            if (current && resolutionNeedsAttention.has(current.hashHex.toLowerCase())) {
+              const reason = 'RECOVERY NEEDS ATTENTION: refusing BSV lock after finalized Base Claim consumed the exact USDC tuple'
+              deps.log(reason)
+              throw new Error(reason)
+            }
+            return locked
+          }
+        },
       }
-      const times = defaultInitiatorTimelocks()
+      const times = defaultBuyerInitiatorTimelocks()
       const agreedMode = input.agreedSettlementMode ?? 'confirmed'
       const fastCap = agreedMode === 'fast' ? input.fastCapUsdcBaseUnits ?? '0' : '0'
       const executor = makeBridgeInitiatorExecutor({
@@ -272,7 +342,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           zeroConfMinArcProviders: 2,
           lockTxFetchUntilRevealRunway: true,
           ...(input.quote.doorProtocolVersion === 2 ? { doorProtocolVersion: 2 as const, doorQuoteId: input.quote.doorQuoteId, agreedSettlementMode: agreedMode, fastCapUsdcBaseUnits: fastCap } : {}),
-          approveOnlyBelowAllowance: true, recordLockAttempts: true,
+          approveOnlyBelowAllowance: true, recordLockAttempts: true, assertTimelocksAgainstConfiguredBsvWindow: true,
         },
       })
       try {
@@ -288,6 +358,12 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         }
         if (result.ok && seen) known.set(input.swapId, { hashHex: seen.hashHex, state: 'settled' })
         const settlement = seen ? records.list().records.find((entry) => entry.hashHex === seen.hashHex) : undefined
+        if (settlement?.state === 'refunded') {
+          return { ...result, cooperativeRefunded: true, baseRefundTxid: settlement.refundTxid, reason: COOPERATIVE_REFUND_REASON }
+        }
+        if (settlement && resolutionNeedsAttention.has(settlement.hashHex.toLowerCase())) {
+          return { ...result, resolutionNeedsAttention: true, reason: 'RECOVERY NEEDS ATTENTION: finalized Base Claim consumed the exact USDC tuple before a buyer reveal' }
+        }
         return { ...result, bsvClaimPayoutSats: settlement ? claimPayoutSats(settlement) : undefined, revealed: seen?.state === 'revealed' || !!result.bsvClaimTxid, settlementModeUsed: result.settlementModeUsed ?? settlement?.settlementModeUsed, settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? settlement?.settlementModeDowngradeReason }
       } catch (error) {
         const cleared = executorClears.get(input.swapId)
@@ -318,7 +394,8 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         return { stage: 'needs_attention', reason }
       }
       const found = listed.records.find((item) => item.hashHex === hashHex)
-      const settlement = found ? await resolveUnlandedLockIfDue(found) : undefined
+      const cooperative = found ? await resolveCooperativeRefundIfPresent(found) : undefined
+      const settlement = cooperative ? await resolveUnlandedLockIfDue(cooperative.record) : undefined
       if (!settlement) {
         if (!record.settlementRecordCreated && record.handshakeDeadlineMs !== undefined && deps.now() >= record.handshakeDeadlineMs) {
           return { stage: 'failed', reason: 'handshake expired before a settlement checkpoint was created; nothing was locked' }
@@ -326,6 +403,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         return await absentOutcome(record)
       }
       known.set(record.swapId, { hashHex, state: settlement.state })
+      if (cooperative?.needsAttention) return { stage: 'needs_attention', settlementState: settlement.state, reason: cooperative.needsAttention }
       recovery.ensure([settlement])
       return { stage: stageForRecord(record, settlement.state), baseLockTxid: settlement.baseLockTxHash, baseRefundTxid: settlement.refundTxid, bsvClaimTxid: settlement.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(settlement), bsvLockOutpoint: settlement.bsvLockOutpoint, bsvRefundLocktime: settlement.bsvRefundLocktime, baseTimelockBlock: settlement.baseTimelockBlock, settlementState: settlementStateForRecord(record, settlement.state), settlementModeUsed: settlement.settlementModeUsed, settlementModeDowngradeReason: settlement.settlementModeDowngradeReason }
     },
@@ -343,7 +421,9 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       // race its own deletion on every background pass.
       await Promise.all(buyerRecords.map((buyer) => acknowledgeTerminalRecord(buyer)))
       const listed = records.list()
-      const resolvedRecords = await Promise.all(listed.records.map((record) => resolveUnlandedLockIfDue(record)))
+      const cooperative = await Promise.all(listed.records.map((record) => resolveCooperativeRefundIfPresent(record)))
+      const resolutionByHash = new Map(cooperative.map((result) => [result.record.hashHex.toLowerCase(), result]))
+      const resolvedRecords = await Promise.all(cooperative.map((result) => resolveUnlandedLockIfDue(result.record)))
       recovery.ensure(resolvedRecords.filter((record) => acknowledgedTerminalTokens.get(record.hashHex.toLowerCase()) !== JSON.stringify(record)))
       const stages = new Map<string, BuyerRecoveryOutcome>()
       for (const buyer of buyerRecords) {
@@ -372,7 +452,10 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         const item = resolvedRecords.find((entry) => entry.hashHex === hashHex)
         // Track live records so the supervisor's terminal clear (refunded/settled) is visible to this swap.
         if (item) known.set(buyer.swapId, { hashHex, state: item.state })
-        stages.set(buyer.swapId, item
+        const resolution = resolutionByHash.get(hashHex.toLowerCase())
+        stages.set(buyer.swapId, resolution?.needsAttention && item
+          ? { stage: 'needs_attention', settlementState: item.state, reason: resolution.needsAttention }
+          : item
           ? { stage: stageForRecord(buyer, item.state), settlementState: settlementStateForRecord(buyer, item.state), baseLockTxid: item.baseLockTxHash, baseRefundTxid: item.refundTxid, bsvClaimTxid: item.bsvClaimTxid, bsvClaimPayoutSats: claimPayoutSats(item), bsvLockOutpoint: item.bsvLockOutpoint, bsvRefundLocktime: item.bsvRefundLocktime, baseTimelockBlock: item.baseTimelockBlock, reason: item.abortReason, settlementModeUsed: item.settlementModeUsed, settlementModeDowngradeReason: item.settlementModeDowngradeReason }
           : !buyer.settlementRecordCreated && buyer.handshakeDeadlineMs !== undefined && deps.now() >= buyer.handshakeDeadlineMs
             ? { stage: 'failed', reason: 'handshake expired before a settlement checkpoint was created; nothing was locked' }

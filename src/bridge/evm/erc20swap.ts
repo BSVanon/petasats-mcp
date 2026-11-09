@@ -25,6 +25,8 @@ export const ERC20_SWAP = {
 /** The subset of the ERC20Swap + ERC20 ABI we use (standard mode). */
 export const ERC20_SWAP_ABI = parseAbi([
   'function VERSION() view returns (uint8)',
+  'function DOMAIN_SEPARATOR() view returns (bytes32)',
+  'function TYPEHASH_REFUND() view returns (bytes32)',
   'function lock(bytes32 preimageHash, uint256 amount, address tokenAddress, address claimAddress, address refundAddress, uint256 timelock)',
   'function claim(bytes32 preimage, uint256 amount, address tokenAddress, address claimAddress, address refundAddress, uint256 timelock)',
   'function refund(bytes32 preimageHash, uint256 amount, address tokenAddress, address claimAddress, address refundAddress, uint256 timelock)',

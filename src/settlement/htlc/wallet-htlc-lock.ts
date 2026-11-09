@@ -1,15 +1,56 @@
 import { Beef, P2PKH, Transaction, type PrivateKey, type WalletAction, type WalletInterface } from '@bsv/sdk'
+import { DEFAULT_FEE_SAT_PER_KB } from '../../wallet/agent-wallet'
 import { listAllActions } from '../../wallet/list-all-actions'
 import { CANCEL_LABEL, isResolvedLock, type ResolvedLock } from '../../wallet/stranded-lock-cancel'
 import { HTLC_LOCK_FUND_LABEL, isInertLockDraft, QUARANTINED_LOCK_STATUSES } from './quarantined-locks'
 export { HTLC_LOCK_FUND_LABEL } from './quarantined-locks'
 /** Fetch a funding tx's atomic BEEF (each agent serves this from its OWN Anvil node — no third-party trust). */
 export type FetchBeef = (txid: string) => Promise<number[]>
+export interface ReserveFundingCoin { outpoint: string; satoshis: number }
+export type ReservedFundingSource =
+  | { kind: 'wallet-change'; sourceId: 'wallet-change'; totalSats: number; inputCount?: number }
+  | { kind: "maker-reserve"; sourceId: string; coins: ReserveFundingCoin[] }
+/** The allocator never admits a lock needing an unbounded input fan-in. Twenty-five P2PKH inputs keep the lock
+ *  below ordinary relay/package limits while still covering heavily fragmented reserves. */
+export const MAX_FUNDING_INPUTS = 25
+/** The wire validator permits at most 5,000 bytes of locking script. The live covenant is smaller, but sizing to the
+ *  wire ceiling keeps the quote-time bound conservative if the canonical covenant grows. */
+export const MAX_HTLC_LOCKING_SCRIPT_BYTES = 5_000
+export const FUNDING_FEE_SAFETY_FACTOR = 2
+
+/** Conservative signed-size upper bound: version/locktime + compact counts, N 108-byte-unlock P2PKH inputs, the
+ *  largest accepted HTLC output, and one P2PKH change output. */
+export function fundingLockFeeUpperBoundSats(inputCount: number, feeSatPerKb = DEFAULT_FEE_SAT_PER_KB): number {
+  if (!Number.isSafeInteger(inputCount) || inputCount < 1 || inputCount > MAX_FUNDING_INPUTS) {
+    throw new WalletHtlcLockError(`funding input count must be in [1, ${MAX_FUNDING_INPUTS}], got ${String(inputCount)}`, { noActionCreated: true })
+  }
+  if (!Number.isSafeInteger(feeSatPerKb) || feeSatPerKb <= 0) {
+    throw new WalletHtlcLockError(`feeSatPerKb must be a positive safe integer, got ${String(feeSatPerKb)}`, { noActionCreated: true })
+  }
+  const fixedBytes = 4 + 1 + 1 + (8 + 3 + MAX_HTLC_LOCKING_SCRIPT_BYTES) + (8 + 1 + 25) + 4
+  const p2pkhInputBytes = 32 + 4 + 1 + 108 + 4
+  return Math.ceil((fixedBytes + inputCount * p2pkhInputBytes) * feeSatPerKb * FUNDING_FEE_SAFETY_FACTOR / 1_000)
+}
+
+export function requiredLockFundingSats(
+  amountSats: number,
+  inputCount: number,
+  feeHeadroomSats = 1_000,
+  feeSatPerKb = DEFAULT_FEE_SAT_PER_KB,
+): number {
+  if (!Number.isSafeInteger(amountSats) || amountSats <= 0) throw new WalletHtlcLockError(`amountSats must be a positive safe integer, got ${String(amountSats)}`, { noActionCreated: true })
+  if (!Number.isSafeInteger(feeHeadroomSats) || feeHeadroomSats < 0) throw new WalletHtlcLockError(`fee headroom must be a non-negative safe integer, got ${String(feeHeadroomSats)}`, { noActionCreated: true })
+  const required = amountSats + feeHeadroomSats + fundingLockFeeUpperBoundSats(inputCount, feeSatPerKb)
+  if (!Number.isSafeInteger(required)) throw new WalletHtlcLockError('required funding exceeds the safe-integer range', { noActionCreated: true })
+  return required
+}
+
 export interface WalletHtlcLockParams {
   /** The exact HTLC locking script (from `buildBsvHtlcScript`) — pinned as the vout-0 output; never re-templated. */
   htlcScriptHex: string
   /** Sats locked into the HTLC. The output value must equal this exactly (the refund half-sig commits to it). */
   amountSats: number
+  
   reserveBasket: string
   /** Root key controlling the basketed reserve P2PKH (signs the funding input externally). */
   rootKey: PrivateKey
@@ -18,8 +59,12 @@ export interface WalletHtlcLockParams {
   fetchBeef: FetchBeef
   /** Headroom over `amountSats` a reserve coin must clear to be picked (covers the fee). Default 1000 sat. */
   feeHeadroomSats?: number
+  /** The wallet storage fee model used to size the allocator/funder shared upper bound. Default 110 sat/kB. */
+  feeSatPerKb?: number
   /** Upper bound on the lock fee — a burn bug (wrong change) shows as a large fee. Default 100_000 sat. */
   maxFeeSats?: number
+  /** Admission allocator authority. When present, the funder must use this source and may not substitute another. */
+  fundingSource?: ReservedFundingSource
 }
 /**
  * A funded, signed, but UNBROADCAST HTLC lock the caller drives to completion (canonical-P1 noSend-lifecycle fix).
@@ -38,6 +83,8 @@ export interface PreparedWalletLock {
   lockTxid: string
   /** The reserve/change outpoint consumed. */
   fundingOutpoint: string
+  /** Every consumed funding outpoint. `fundingOutpoint` remains the first for interface compatibility. */
+  fundingOutpoints?: string[]
   /** Total change returned to the wallet (fresh, wallet-derived addresses). */
   changeSats: number
   /**
@@ -57,7 +104,12 @@ export interface PreparedWalletLock {
 }
 
 export class WalletHtlcLockError extends Error {
-  constructor(message: string) { super(`wallet-htlc-lock: ${message}`); this.name = 'WalletHtlcLockError' }
+  /** True only for a refusal raised before any wallet action (pending or signed) existed for this lock. The signer
+   *  relies on this TYPE, never on message wording, to prove "nothing was signed" (cooperative-refund fence). */
+  readonly noActionCreated: boolean
+  constructor(message: string, opts: { noActionCreated?: boolean } = {}) {
+    super(`wallet-htlc-lock: ${message}`); this.name = 'WalletHtlcLockError'; this.noActionCreated = opts.noActionCreated === true
+  }
 }
 
 export async function buildHtlcLockViaWallet(wallet: WalletInterface, p: WalletHtlcLockParams): Promise<PreparedWalletLock> {
@@ -66,12 +118,24 @@ export async function buildHtlcLockViaWallet(wallet: WalletInterface, p: WalletH
   // silently weaken the burn guard. Validate both.
   if (p.feeHeadroomSats !== undefined && (!Number.isInteger(p.feeHeadroomSats) || p.feeHeadroomSats < 0)) throw new WalletHtlcLockError(`feeHeadroomSats must be a non-negative integer, got ${p.feeHeadroomSats}`)
   if (p.maxFeeSats !== undefined && (!Number.isInteger(p.maxFeeSats) || p.maxFeeSats <= 0)) throw new WalletHtlcLockError(`maxFeeSats must be a positive integer, got ${p.maxFeeSats}`)
+  if (p.feeSatPerKb !== undefined && (!Number.isSafeInteger(p.feeSatPerKb) || p.feeSatPerKb <= 0)) throw new WalletHtlcLockError(`feeSatPerKb must be a positive safe integer, got ${p.feeSatPerKb}`)
 
   // Prefer wallet-derived change (continuous-op; 0-conf-chainable ONCE the prior lock is BROADCAST). The toolbox
   // will NOT auto-select UNBROADCAST (noSend) change, so on the first swap — or before the prior lock is broadcast —
   // this reports insufficient funds and we fall to the reserve bootstrap. FAIL-CLOSED: if neither source can fund,
   // fundFromReserve throws → the swap declines. NEVER a double-spend — a spent reserve coin is reserved after its
   // (noSend) action, so a concurrent/next lock can't re-select it (empirically verified).
+  if (p.fundingSource?.kind === 'wallet-change') {
+    const inputCount = p.fundingSource.inputCount ?? 1
+    const required = requiredLockFundingSats(p.amountSats, inputCount, p.feeHeadroomSats ?? 1000, p.feeSatPerKb ?? DEFAULT_FEE_SAT_PER_KB)
+    if (p.fundingSource.totalSats < required) throw new WalletHtlcLockError(`reserved wallet-change source no longer covers the shared ${required} sat funding bound`, { noActionCreated: true })
+    const internal = await tryFundInternal(wallet, p)
+    if (!internal) throw new WalletHtlcLockError('reserved wallet-change source could not fund the lock — refusing substitution', { noActionCreated: true })
+    return internal
+  }
+  if (p.fundingSource?.kind === "maker-reserve") {
+    return fundFromReserve(wallet, p, p.feeHeadroomSats ?? 1000, p.fundingSource.coins)
+  }
   const internal = await tryFundInternal(wallet, p)
   return internal ?? await fundFromReserve(wallet, p, p.feeHeadroomSats ?? 1000)
 }
@@ -80,42 +144,71 @@ export async function buildHtlcLockViaWallet(wallet: WalletInterface, p: WalletH
  *  vout 0. Returns null on INSUFFICIENT-FUNDS (no selectable change yet) so the caller falls to the reserve bootstrap;
  *  any other failure throws (fail-closed). */
 async function tryFundInternal(wallet: WalletInterface, p: WalletHtlcLockParams): Promise<PreparedWalletLock | null> {
+  // Only createAction's own insufficient-funds refusal means "no selectable change": a throw after it returned a
+  // signed noSend action must never read as "nothing was created" (callers then fall to, or decline on, the reserve).
+  let car: Awaited<ReturnType<WalletInterface['createAction']>>
   try {
-    const car = await wallet.createAction({
+    car = await wallet.createAction({
       description: 'fund:BSV HTLC lock (wallet change)',
       labels: [HTLC_LOCK_FUND_LABEL], // so a crash-stranded noSend lock is reconcilable by label
       outputs: [{ lockingScript: p.htlcScriptHex, satoshis: p.amountSats, outputDescription: 'BSV HTLC lock' }],
       options: { randomizeOutputs: false, signAndProcess: true, noSend: true, acceptDelayedBroadcast: false, returnTXIDOnly: false },
     })
-    if (!car.tx) throw new WalletHtlcLockError(`createAction(internal) returned no signed tx (keys: ${Object.keys(car).join(',')})`)
-    // Self-funded (no external input) → the abort reference IS the txid (offer-wallet self-funded precedent); pass
-    // null and let finalizeLock use lockTxid.
-    return await finalizeLock(wallet, Transaction.fromAtomicBEEF(car.tx), p, null, null)
   } catch (e) {
     if (e instanceof Error && /insufficient/i.test(e.message)) return null // no selectable change → fall to reserve
     throw e
   }
+  if (!car.tx) throw new WalletHtlcLockError(`createAction(internal) returned no signed tx (keys: ${Object.keys(car).join(',')})`)
+  // Self-funded (no external input) → the abort reference IS the txid (offer-wallet self-funded precedent); pass
+  // null and let finalizeLock use lockTxid.
+  return await finalizeLock(wallet, Transaction.fromAtomicBEEF(car.tx), p, null, null)
 }
 
 /** RESERVE funding: explicit root-key basketed P2PKH input, EXTERNAL-signed with the root key; HTLC at vout 0. */
-async function fundFromReserve(wallet: WalletInterface, p: WalletHtlcLockParams, headroom: number): Promise<PreparedWalletLock> {
+async function fundFromReserve(wallet: WalletInterface, p: WalletHtlcLockParams, headroom: number, reservedCoins?: ReserveFundingCoin[]): Promise<PreparedWalletLock> {
   const outs = await wallet.listOutputs({ basket: p.reserveBasket, limit: 1000, includeCustomInstructions: true })
-  const funder = outs.outputs
-    .filter((o) => o.spendable === true && o.satoshis > p.amountSats + headroom)
-    .sort((a, b) => a.satoshis - b.satoshis)[0]
-  if (!funder) throw new WalletHtlcLockError(`no spendable '${p.reserveBasket}' output covering ${p.amountSats} + ${headroom} sat (and no wallet change either)`)
-  const [fTxid, fVoutStr] = funder.outpoint.split('.')
-  const fVout = Number(fVoutStr)
+  const spendable = new Map(outs.outputs.filter((o) => o.spendable === true).map((o) => [o.outpoint, o]))
+  const funders = reservedCoins
+    ? reservedCoins.map((coin) => {
+        const row = spendable.get(coin.outpoint)
+        if (!row || row.satoshis !== coin.satoshis) throw new WalletHtlcLockError(`reserved reserve coin ${coin.outpoint} is missing, non-spendable, or value-mismatched`, { noActionCreated: true })
+        return row
+      })
+    : (() => {
+        const one = outs.outputs.filter((o) => o.spendable === true && o.satoshis >= requiredLockFundingSats(p.amountSats, 1, headroom, p.feeSatPerKb ?? DEFAULT_FEE_SAT_PER_KB)).sort((a, b) => a.satoshis - b.satoshis)[0]
+        return one ? [one] : []
+      })()
+  const totalReserved = funders.reduce((sum, funder) => sum + funder.satoshis, 0)
+  if (funders.length === 0 || funders.length > MAX_FUNDING_INPUTS) {
+    throw new WalletHtlcLockError(`reserved '${p.reserveBasket}' source must contain 1..${MAX_FUNDING_INPUTS} inputs`, { noActionCreated: true })
+  }
+  const required = requiredLockFundingSats(p.amountSats, funders.length, headroom, p.feeSatPerKb ?? DEFAULT_FEE_SAT_PER_KB)
+  if (totalReserved < required) {
+    throw new WalletHtlcLockError(`no spendable '${p.reserveBasket}' source covering the shared ${required} sat funding bound (and no wallet change either)`, { noActionCreated: true })
+  }
 
-  const rawBeef = await p.fetchBeef(fTxid)
-  const beef = Beef.fromBinary(rawBeef)
-  if (!beef.findTxid(fTxid)) throw new WalletHtlcLockError(`funding BEEF missing subject tx ${fTxid}`)
+  const mergedBeef = new Beef()
+  const beefByTxid = new Map<string, number[]>()
+  const selected = funders.map((funder) => {
+    const [fTxid, fVoutStr] = funder.outpoint.split('.')
+    const fVout = Number(fVoutStr)
+    return { funder, fTxid, fVout }
+  })
+  for (const { fTxid } of selected) {
+    if (beefByTxid.has(fTxid)) continue
+    const rawBeef = await p.fetchBeef(fTxid)
+    const beef = Beef.fromBinary(rawBeef)
+    if (!beef.findTxid(fTxid)) throw new WalletHtlcLockError(`funding BEEF missing subject tx ${fTxid}`, { noActionCreated: true })
+    beefByTxid.set(fTxid, rawBeef)
+    mergedBeef.mergeBeef(beef)
+  }
+  const inputBEEF = mergedBeef.toBinary()
 
   const car = await wallet.createAction({
     description: 'fund:BSV HTLC lock (reserve)',
     labels: [HTLC_LOCK_FUND_LABEL], // reconcilable by label if a crash strands it before commit
-    inputBEEF: rawBeef,
-    inputs: [{ outpoint: funder.outpoint, inputDescription: 'reserve funding', unlockingScriptLength: 108 }],
+    inputBEEF,
+    inputs: selected.map(({ funder }) => ({ outpoint: funder.outpoint, inputDescription: 'reserve funding', unlockingScriptLength: 108 })),
     outputs: [{ lockingScript: p.htlcScriptHex, satoshis: p.amountSats, outputDescription: 'BSV HTLC lock' }],
     options: { randomizeOutputs: false, signAndProcess: false, noSend: true, acceptDelayedBroadcast: false, returnTXIDOnly: false },
   })
@@ -125,16 +218,27 @@ async function fundFromReserve(wallet: WalletInterface, p: WalletHtlcLockParams,
   // a PreparedWalletLock, abort it so the reserve coin is not leaked (mirrors offer-wallet/accept-wallet).
   try {
     const tx = Transaction.fromAtomicBEEF(signableAtomic)
-    const inIdx = tx.inputs.findIndex((i) => i.sourceTXID === fTxid && i.sourceOutputIndex === fVout)
-    if (inIdx < 0) throw new WalletHtlcLockError(`the reserve funding input is not in the signable tx (inputs: ${tx.inputs.length})`)
-
-    const unlock = new P2PKH().unlock(p.rootKey, 'all', false, funder.satoshis, new P2PKH().lock(p.rootAddress))
-    const unlockingScript = (await unlock.sign(tx, inIdx)).toHex()
-    const signed = await wallet.signAction({ reference, spends: { [inIdx]: { unlockingScript } }, options: { noSend: true, acceptDelayedBroadcast: false, returnTXIDOnly: false } })
+    const expectedOutpoints = new Set(selected.map(({ fTxid, fVout }) => `${fTxid.toLowerCase()}.${fVout}`))
+    const actualOutpoints = tx.inputs.map((input) => `${String(input.sourceTXID).toLowerCase()}.${input.sourceOutputIndex}`)
+    if (actualOutpoints.length !== expectedOutpoints.size || new Set(actualOutpoints).size !== actualOutpoints.length || actualOutpoints.some((outpoint) => !expectedOutpoints.has(outpoint))) {
+      throw new WalletHtlcLockError(`signable transaction inputs do not exactly equal the reserved outpoints (reserved ${expectedOutpoints.size}, actual ${actualOutpoints.length}) — refusing before signature`)
+    }
+    const rootScript = new P2PKH().lock(p.rootAddress)
+    const spends: Record<number, { unlockingScript: string }> = {}
+    const reserveAsserts: ReserveAssert[] = []
+    for (const { funder, fTxid, fVout } of selected) {
+      const inIdx = tx.inputs.findIndex((i) => i.sourceTXID === fTxid && i.sourceOutputIndex === fVout)
+      if (inIdx < 0) throw new WalletHtlcLockError(`reserved input ${funder.outpoint} is not in the signable tx (inputs: ${tx.inputs.length})`)
+      // Exactly one independent root-key signature per reserve input; the SDK owns sighash construction.
+      const unlock = new P2PKH().unlock(p.rootKey, 'all', false, funder.satoshis, rootScript)
+      spends[inIdx] = { unlockingScript: (await unlock.sign(tx, inIdx)).toHex() }
+      reserveAsserts.push({ fTxid, fVout, funderSats: funder.satoshis, rootScriptHex: rootScript.toHex(), rawBeef: beefByTxid.get(fTxid)! })
+    }
+    const signed = await wallet.signAction({ reference, spends, options: { noSend: true, acceptDelayedBroadcast: false, returnTXIDOnly: false } })
     if (!signed.tx) throw new WalletHtlcLockError(`signAction returned no tx (keys: ${Object.keys(signed).join(',')})`)
 
     // The reserve action is keyed by its signableTransaction `reference` for abort (offer-wallet SELL precedent).
-    return await finalizeLock(wallet, Transaction.fromAtomicBEEF(signed.tx), p, { fTxid, fVout, funderSats: funder.satoshis, rootScriptHex: new P2PKH().lock(p.rootAddress).toHex(), rawBeef }, reference)
+    return await finalizeLock(wallet, Transaction.fromAtomicBEEF(signed.tx), p, reserveAsserts, reference)
   } catch (e) {
     try { await wallet.abortAction({ reference }) } catch { /* best-effort — releasing a reservation we could not finalize */ }
     throw e
@@ -148,18 +252,20 @@ interface ReserveAssert { fTxid: string; fVout: number; funderSats: number; root
  *  Runs on the signed-but-NOSEND tx — BEFORE any broadcast — then returns a {@link PreparedWalletLock} whose `commit`
  *  broadcasts it (wallet-owned) and `abort` releases the reservation. `abortRef` is the action's abort key (the
  *  reserve path's signableTransaction reference, or null → use the txid for the self-funded internal path). */
-async function finalizeLock(wallet: WalletInterface, lockTx: Transaction, p: WalletHtlcLockParams, reserve: ReserveAssert | null, abortRef: string | null): Promise<PreparedWalletLock> {
+async function finalizeLock(wallet: WalletInterface, lockTx: Transaction, p: WalletHtlcLockParams, reserve: ReserveAssert[] | null, abortRef: string | null): Promise<PreparedWalletLock> {
   const out0 = lockTx.outputs[0]
   if (!out0 || out0.lockingScript.toHex() !== p.htlcScriptHex) throw new WalletHtlcLockError('HTLC is not the vout-0 output (script mismatch) — refusing')
   if (out0.satoshis !== p.amountSats) throw new WalletHtlcLockError(`HTLC output value ${out0.satoshis} ≠ amountSats ${p.amountSats} — refusing`)
 
   if (reserve) {
-    // The external-signed reserve coin's ACTUAL on-chain script+value (from its BEEF) must match the basket row.
-    if (!lockTx.inputs.some((i) => i.sourceTXID === reserve.fTxid && i.sourceOutputIndex === reserve.fVout)) throw new WalletHtlcLockError('signed tx does not spend the selected reserve outpoint — refusing')
-    const fout = Transaction.fromAtomicBEEF(reserve.rawBeef).outputs[reserve.fVout]
-    if (!fout) throw new WalletHtlcLockError(`funding BEEF has no output #${reserve.fVout} — refusing`)
-    if (fout.satoshis !== reserve.funderSats) throw new WalletHtlcLockError(`stale/corrupt basket row: says ${reserve.funderSats} sat, chain says ${fout.satoshis} — refusing`)
-    if (fout.lockingScript.toHex() !== reserve.rootScriptHex) throw new WalletHtlcLockError('funding output is not the root-key P2PKH we external-sign — refusing')
+    // EVERY external-signed reserve coin's actual on-chain script+value (from its own BEEF) must match its basket row.
+    for (const coin of reserve) {
+      if (!lockTx.inputs.some((i) => i.sourceTXID === coin.fTxid && i.sourceOutputIndex === coin.fVout)) throw new WalletHtlcLockError('signed tx does not spend every selected reserve outpoint — refusing')
+      const fout = Beef.fromBinary(coin.rawBeef).findTxid(coin.fTxid)?.tx?.outputs[coin.fVout]
+      if (!fout) throw new WalletHtlcLockError(`funding BEEF has no output #${coin.fVout} — refusing`)
+      if (fout.satoshis !== coin.funderSats) throw new WalletHtlcLockError(`stale/corrupt basket row: says ${coin.funderSats} sat, chain says ${fout.satoshis} — refusing`)
+      if (fout.lockingScript.toHex() !== coin.rootScriptHex) throw new WalletHtlcLockError('funding output is not the root-key P2PKH we external-sign — refusing')
+    }
   }
 
   if (!(await lockTx.verify('scripts only'))) throw new WalletHtlcLockError('scripts-only verification FAILED on the signed lock — refusing')
@@ -173,7 +279,8 @@ async function finalizeLock(wallet: WalletInterface, lockTx: Transaction, p: Wal
   const lockTxid = lockTx.id('hex') as string
   const changeSats = lockTx.outputs.slice(1).reduce((s, o) => s + (o.satoshis ?? 0), 0)
   const first = lockTx.inputs[0]
-  const fundingOutpoint = reserve ? `${reserve.fTxid}.${reserve.fVout}` : `${first?.sourceTXID}.${first?.sourceOutputIndex}`
+  const fundingOutpoints = reserve ? reserve.map((coin) => `${coin.fTxid}.${coin.fVout}`) : [`${first?.sourceTXID}.${first?.sourceOutputIndex}`]
+  const fundingOutpoint = fundingOutpoints[0]
   const reference = abortRef ?? lockTxid // self-funded internal action aborts by txid (offer-wallet precedent)
   // This is deliberately a synchronous, one-way choice made before either wallet call can yield. A commit which
   // reaches the broadcaster while abortAction is still pending would otherwise let abort free a possibly-spent coin.
@@ -210,11 +317,11 @@ async function finalizeLock(wallet: WalletInterface, lockTx: Transaction, p: Wal
     await wallet.abortAction({ reference })
   }
 
-  return { lockTx, lockTxid, fundingOutpoint, changeSats, commit, abort }
+  return { lockTx, lockTxid, fundingOutpoint, fundingOutpoints, changeSats, commit, abort }
 }
 
 /** Config for {@link makeWalletFundHtlcLock} — everything the funder needs except the per-lock (script, amount). */
-export type WalletFundHtlcLockOpts = Omit<WalletHtlcLockParams, 'htlcScriptHex' | 'amountSats'>
+export type WalletFundHtlcLockOpts = Omit<WalletHtlcLockParams, 'htlcScriptHex' | 'amountSats' | 'fundingSource'>
 
 /** Operator-readable identity evidence for a quarantined action with toolbox's empty-txid sentinel. */
 export interface TxidlessLockAttention { status: string; description: string; inputOutpoints: string[] }
@@ -222,8 +329,8 @@ export interface TxidlessLockAttention { status: string; description: string; in
 export function makeWalletFundHtlcLock(
   wallet: WalletInterface,
   opts: WalletFundHtlcLockOpts,
-): (p: { htlcScriptHex: string; amountSats: number }) => Promise<PreparedWalletLock> {
-  return (p) => buildHtlcLockViaWallet(wallet, { ...opts, htlcScriptHex: p.htlcScriptHex, amountSats: p.amountSats })
+): (p: { htlcScriptHex: string; amountSats: number; fundingSource?: ReservedFundingSource }) => Promise<PreparedWalletLock> {
+  return (p) => buildHtlcLockViaWallet(wallet, { ...opts, htlcScriptHex: p.htlcScriptHex, amountSats: p.amountSats, fundingSource: p.fundingSource })
 }
 
 /**

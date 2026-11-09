@@ -2,6 +2,8 @@ import type { ConvertRequest, PetaSats, Quote, SwapResult } from '../convert'
 import type { SettlementState } from '../../bridge/settlement-session'
 import type { Transaction } from '@bsv/sdk'
 
+export const COOPERATIVE_REFUND_REASON = "The market maker declined; USDC came back through the cooperative refund."
+
 export type SettlementSpeed = 'standard' | 'fast'
 export type SettlementMode = 'confirmed' | 'fast'
 export type AgreedSettlementMode = 'pending' | SettlementMode
@@ -95,6 +97,11 @@ export interface BuyerExecutor {
     revealed?: boolean
     /** The executor proved its pre-lock USDC checkpoint was cleared after the exact lock tuple was absent. */
     nothingLocked?: boolean
+    cooperativeRefunded?: boolean
+    /** Finalized Refund event transaction for a cooperative refund. */
+    baseRefundTxid?: string
+    /** A finalized exact-tuple Claim was observed before reveal; do not infer a safe outcome. */
+    resolutionNeedsAttention?: boolean
     settlementModeUsed?: SettlementModeUsed
     settlementModeDowngradeReason?: string
   }>

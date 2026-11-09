@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto'
 import { isAddress } from 'viem'
 import { isBsv, isErc20, type ConvertRequest, type Quote, type SwapResult } from '../convert'
-import type { BuyerBaseWallet, BuyerKit, BuyerKitConfig, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, BuyerStore, BuyerWallet, DoorClient, BuyerExecutor, StartSwapRequest, BuyerWithdrawalCancelResult, BuyerWithdrawalIntents, BuyerWithdrawalReconcileOutcome } from './types'
+import { COOPERATIVE_REFUND_REASON, type BuyerBaseWallet, type BuyerKit, type BuyerKitConfig, type BuyerQuote, type BuyerSwapRecord, type BuyerSwapStage, type BuyerStore, type BuyerWallet, type DoorClient, type BuyerExecutor, type StartSwapRequest, type BuyerWithdrawalCancelResult, type BuyerWithdrawalIntents, type BuyerWithdrawalReconcileOutcome } from './types'
 import { isBaseInsufficientFunds } from './withdrawal-intent'
 import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
@@ -174,7 +174,19 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         const reason = result.nothingLocked
           ? fastNegotiationFailureReason(record, result.reason ?? 'v2 settlement handshake failed')
           : result.reason ?? 'swap did not complete'
-        await write(record, result.nothingLocked ? 'failed' : result.revealed ? 'claiming' : settlementAttached || !!result.baseLockTxid ? 'refund_waiting' : 'failed', { baseLockTxid: result.baseLockTxid, bsvClaimTxid: result.bsvClaimTxid, bsvClaimPayoutSats: result.bsvClaimPayoutSats, reason, settlementModeUsed: result.settlementModeUsed ?? (result.revealed ? admittedMode : 'not_revealed'), settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? downgradeReason })
+        const cooperative = result.cooperativeRefunded === true
+        const attention = result.resolutionNeedsAttention === true
+        const saved = await write(record, cooperative ? 'refunded' : attention ? 'needs_attention' : result.nothingLocked ? 'failed' : result.revealed ? 'claiming' : settlementAttached || !!result.baseLockTxid ? 'refund_waiting' : 'failed', {
+          baseLockTxid: result.baseLockTxid,
+          ...(result.baseRefundTxid ? { baseRefundTxid: result.baseRefundTxid } : {}),
+          bsvClaimTxid: result.bsvClaimTxid,
+          bsvClaimPayoutSats: result.bsvClaimPayoutSats,
+          ...(cooperative ? { settlementState: 'refunded' as const } : {}),
+          reason: cooperative ? COOPERATIVE_REFUND_REASON : reason,
+          settlementModeUsed: result.settlementModeUsed ?? (result.revealed ? admittedMode : 'not_revealed'),
+          settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? downgradeReason,
+        })
+        if (cooperative) await deps.executor.acknowledgeTerminal?.(saved)
         return
       }
       record = await write(record, 'claimed', { baseLockTxid: result.baseLockTxid, bsvClaimTxid: result.bsvClaimTxid, bsvClaimPayoutSats: result.bsvClaimPayoutSats, settlementState: 'settled', settlementModeUsed: result.settlementModeUsed ?? admittedMode, settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? downgradeReason })
@@ -191,7 +203,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         if (!settlementAttached && !record.settlementHashHex) reason = fastNegotiationFailureReason(record, reason)
         // The engine only emits this after the reverted receipt's exact tuple has been proven absent and its pre-lock
         // checkpoint cleared.  It is the one exception to the normal "a checkpoint means refund" rule.
-        await write(record, reason === 'the USDC lock reverted; nothing was locked' ? 'failed' : record.settlementState === 'revealed' ? 'claiming' : settlementAttached || record.settlementHashHex ? 'refund_waiting' : 'failed', { reason, settlementModeUsed: record.settlementState === 'revealed' ? record.settlementModeUsed ?? (record.agreedSettlementMode === 'fast' ? 'fast' : 'confirmed') : record.settlementModeUsed === 'fast' || record.settlementModeUsed === 'confirmed' ? record.settlementModeUsed : 'not_revealed' })
+        await write(record, reason === COOPERATIVE_REFUND_REASON ? 'refunded' : reason.startsWith('RECOVERY NEEDS ATTENTION:') ? 'needs_attention' : reason === 'the USDC lock reverted; nothing was locked' ? 'failed' : record.settlementState === 'revealed' ? 'claiming' : settlementAttached || record.settlementHashHex ? 'refund_waiting' : 'failed', { ...(reason === COOPERATIVE_REFUND_REASON ? { settlementState: 'refunded' as const } : {}), reason, settlementModeUsed: record.settlementState === 'revealed' ? record.settlementModeUsed ?? (record.agreedSettlementMode === 'fast' ? 'fast' : 'confirmed') : record.settlementModeUsed === 'fast' || record.settlementModeUsed === 'confirmed' ? record.settlementModeUsed : 'not_revealed' })
       } catch (writeError) {
         log(`could not persist swap failure for ${record.swapId}; settlement recovery remains armed: ${writeError instanceof Error ? writeError.message : String(writeError)}`)
       }

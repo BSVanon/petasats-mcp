@@ -158,6 +158,8 @@ export interface BridgeInitiatorConfig {
    *  for the pilot to demand corroboration. */
   zeroConfMinArcProviders?: number
   claimBudgetBaseBlocks?: number
+  /** Buyer-only: validate the tuple against its configured (shorter) BSV window instead of the shared maximum. */
+  assertTimelocksAgainstConfiguredBsvWindow?: boolean
   /** Vestigial (Step E): the swap is COVENANT-ONLY — the taker DEFERS to `quote.htlcKind` (CVN-6) and refuses any
    *  non-covenant quote. The covenant claim is a forced payout with NO refund round-trip (the responder's refund is
    *  MM-alone, committed in-script — HIGH#1). Field retained until E-3 removes it fleet-wide. */
@@ -330,6 +332,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
   if (!posInt(confs)) throw new Error(`initiator-executor: bsvConfirmations must be a positive integer ≥ 1 (got ${confs})`)
   assertInitiatorTimelocks({
     baseTimelockBlocks: cfg.baseTimelockBlocks,
+    ...(cfg.assertTimelocksAgainstConfiguredBsvWindow ? { bsvRefundBlocks: cfg.bsvRefundBlocks } : {}),
     claimBudgetBaseBlocks: cfg.claimBudgetBaseBlocks ?? DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS,
   })
   const lockLandDeadlineMs = cfg.lockLandDeadlineMs ?? DEFAULT_EVM_LOCK_LAND_DEADLINE_MS

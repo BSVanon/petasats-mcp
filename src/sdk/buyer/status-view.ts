@@ -1,4 +1,4 @@
-import type { BuyerSwapRecord } from './types'
+import { COOPERATIVE_REFUND_REASON, type BuyerSwapRecord } from './types'
 import { MIN_REVEAL_CONFIRM_BUDGET_BLOCKS } from '../../bridge/responder-ordering'
 import { BASE_BLOCK_SECS_FLOOR } from '../../bridge/base-block-time'
 
@@ -22,7 +22,9 @@ const etaMinutes = (stage: string): number => {
 }
 
 export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown> {
-  const info = stages[record.stage] ?? { label: 'Older or unknown record', step: null }
+  const info = record.stage === 'refunded' && record.reason === COOPERATIVE_REFUND_REASON
+    ? { label: "The market maker declined; USDC came back", step: null }
+    : stages[record.stage] ?? { label: 'Older or unknown record', step: null }
   const delivery = !!record.deliverTo
   const terminal = ['settled', 'delivered', 'refunded', 'failed'].includes(record.stage)
   const unknown = !(record.stage in stages)
