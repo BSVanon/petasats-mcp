@@ -30,6 +30,31 @@ export interface AnvilChaintracks {
   isValidRootForHeight(root: string, height: number): Promise<boolean>
 }
 
+/** Project Babbage's public chaintracks header service. It speaks this same API and is run by an operator independent
+ * of Anvil (which syncs headers from BSV P2P peers) and WhatsOnChain: the third BSV header and tip source. */
+export const BSV_MAINNET_CHAINTRACKS_URL = 'https://mainnet-chaintracks.babbage.systems'
+
+/**
+ * Throw unless every BSV header source is on a different host. The quorums count sources, so one service reached
+ * through two configured URLs would cast two votes and turn two-of-three into a single source. Two URLs on one host are
+ * one service whatever their scheme, port, path, letter case or trailing dot. A URL cannot prove more than that: a
+ * CNAME or a proxy in front of another source is the operator's to avoid, and each box's install check shows which
+ * sources answered. Errors name the sources by label only, never by URL.
+ */
+export function assertDistinctBsvSources(sources: Array<{ label: string; url: string }>): void {
+  const seen = new Map<string, string>()
+  for (const { label, url } of sources) {
+    let host = ''
+    try {
+      host = new URL(url).hostname.toLowerCase().replace(/\.+$/, '')
+    } catch { /* reported below */ }
+    if (host === '') throw new Error(`BSV source ${label} does not have a valid URL`)
+    const other = seen.get(host)
+    if (other !== undefined) throw new Error(`BSV sources ${other} and ${label} are the same service; each source must be a different service`)
+    seen.set(host, label)
+  }
+}
+
 /**
  * Build an Anvil-backed `ChaintracksClientApi` for mainnet headers. The toolbox does not root-export its client
  * interface, so this adapter exposes its concrete supported surface. Only `getPresentHeight`, `findHeaderForHeight`,
@@ -59,7 +84,7 @@ export function makeAnvilChaintracks(baseUrl: string, deps: AnvilChaintracksDeps
 
   const getPresentHeight = async (signal?: AbortSignal): Promise<number> => {
     const h = Number(await getValue<number>('/getPresentHeight', 'getPresentHeight', signal))
-    if (!Number.isInteger(h) || h <= 0) throw new Error(`anvil-chaintracks getPresentHeight: bad height ${h}`)
+    if (!Number.isSafeInteger(h) || h <= 0) throw new Error(`anvil-chaintracks getPresentHeight: bad height ${h}`)
     return h
   }
 
@@ -72,7 +97,7 @@ export function makeAnvilChaintracks(baseUrl: string, deps: AnvilChaintracksDeps
       if (e instanceof Error && /HTTP 404|no value/.test(e.message)) return undefined
       throw e
     }
-    if (!hdr || typeof hdr.merkleRoot !== 'string' || hdr.merkleRoot.length !== 64) {
+    if (!hdr || typeof hdr.merkleRoot !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hdr.merkleRoot)) {
       throw new Error(`anvil-chaintracks findHeaderForHeight(${height}): missing/invalid merkleRoot`)
     }
     return {

@@ -1,8 +1,8 @@
 import { Transaction, type ChainTracker } from '@bsv/sdk'
 import type { BridgeInitiatorBsvRails } from '../../../bridge/initiator-executor'
 import type { RecoveryBsvRails } from '../../../bridge/in-process-recovery'
-import { makeAnvilChaintracks } from '../../../wallet/anvil-chaintracks'
-import { makeWocChaintracks } from '../../../wallet/woc-chaintracks'
+import { BSV_MAINNET_CHAINTRACKS_URL, assertDistinctBsvSources, makeAnvilChaintracks } from '../../../wallet/anvil-chaintracks'
+import { WOC_API_ORIGIN, makeWocChaintracks } from '../../../wallet/woc-chaintracks'
 import { makeQuorumChainTracker } from '../../../wallet/quorum-chaintracks'
 import { makeBsvHeightReader } from '../../../wallet/bsv-height'
 import { broadcast, clearTaalApiKey, getMultiArcTxStatuses, getTxStatus, setAnvilNode } from '../../../wallet/broadcast'
@@ -43,11 +43,20 @@ export function makeBuyerBsvRails(opts: BuyerBsvRailsOptions = {}): BuyerBsvRail
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch
   const timeoutMs = opts.timeoutMs ?? 12_000
   const anvilBaseUrl = opts.anvilBaseUrl ?? DEFAULT_BUYER_ANVIL_BASE_URL
+  assertDistinctBsvSources([
+    { label: 'Anvil', url: anvilBaseUrl },
+    { label: 'WhatsOnChain', url: WOC_API_ORIGIN },
+    { label: 'chaintracks', url: BSV_MAINNET_CHAINTRACKS_URL },
+  ])
   const anvil = makeAnvilChaintracks(anvilBaseUrl, { fetchImpl, timeoutMs })
   const woc = makeWocChaintracks('main', { fetchImpl, timeoutMs })
-  // New risk and SPV finality are always two-of-two: own/open Anvil and WoC.
-  const chainTracker = makeQuorumChainTracker([anvil as unknown as ChainTracker, woc as unknown as ChainTracker], 2)
-  const heights = makeBsvHeightReader([anvil, woc], { env: {} })
+  // A third party's service: it gets no credentials, like every buyer read.
+  const chaintracks = makeAnvilChaintracks(BSV_MAINNET_CHAINTRACKS_URL, { fetchImpl, timeoutMs })
+  // New risk and SPV proofs need two of three independent sources (open Anvil, WoC and the chaintracks service), so one
+  // source outage cannot stop a buyer, and a synced source holding a different header fails a proof closed (one
+  // that merely lacks the header is tolerated, like an outage).
+  const chainTracker = makeQuorumChainTracker([anvil, woc, chaintracks] as unknown as ChainTracker[], 2)
+  const heights = makeBsvHeightReader([anvil, woc, chaintracks], { env: {} })
   const unspent = makeMultiSourceUnspentFetcher({ fetchImpl, perSourceTimeoutMs: timeoutMs })
 
   // These are globals in the legacy ladder. Clear both possible inherited

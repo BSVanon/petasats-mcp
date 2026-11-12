@@ -65,17 +65,48 @@ export function resolveMakerChainTrackerRecheck(env: Record<string, string | und
 }
 
 /**
- * Wrap N independent {@link ChainTracker}s into one that clears a root only when ≥ `minAgree` of them CONFIRM it. With
- * `minAgree === trackers.length` (the full-pilot default of 2-of-2) every source must agree. A single source is allowed
- * (`minAgree === 1`, one tracker) for the legacy/testnet single-source posture — but ≥2 independent sources with
- * `minAgree ≥ 2` is what defends the compromised-source threat.
+ * What a source that rejected a root holds at that height. It is read only to classify the rejection, never to confirm:
+ * 'different' = a well-formed header for exactly that height whose root differs; 'missing' = no header there (a gap or
+ * lag in its index, like an outage); 'match' = it now holds the root (it caught up); 'unknown' = it cannot say.
  */
+type RejectionKind = 'different' | 'missing' | 'match' | 'unknown'
+
+async function classifyRejection(tracker: ChainTracker, root: string, height: number): Promise<RejectionKind> {
+  try {
+    const find = (tracker as { findHeaderForHeight?: unknown }).findHeaderForHeight
+    if (typeof find !== 'function') return 'unknown'
+    const header = (await find.call(tracker, height)) as { merkleRoot?: unknown; height?: unknown } | undefined | null
+    if (header === undefined || header === null) return 'missing'
+    if (typeof header.merkleRoot !== 'string' || !/^[0-9a-fA-F]{64}$/.test(header.merkleRoot)) return 'unknown'
+    if (header.height !== undefined && Number(header.height) !== height) return 'unknown'
+    return header.merkleRoot.toLowerCase() === root.toLowerCase() ? 'match' : 'different'
+  } catch {
+    return 'unknown'
+  }
+}
+
+async function tipOf(tracker: ChainTracker): Promise<number | undefined> {
+  try {
+    const value = await tracker.currentHeight()
+    return Number.isSafeInteger(value) ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Read each rejecting source's tip and what it holds at `height`, together. An unreadable tip reads as undefined. */
+async function readRejections(trackers: ChainTracker[], idx: number[], root: string, height: number): Promise<Array<{ i: number; tip?: number; kind: RejectionKind }>> {
+  return Promise.all(idx.map(async (i) => {
+    const [tip, kind] = await Promise.all([tipOf(trackers[i]), classifyRejection(trackers[i], root, height)])
+    return { i, tip, kind }
+  }))
+}
+
 export function makeQuorumChainTracker(trackers: ChainTracker[], minAgree: number, deps: QuorumChainTrackerDeps = {}): ChainTracker {
   if (!Array.isArray(trackers) || trackers.length === 0) throw new Error('makeQuorumChainTracker: at least one ChainTracker is required')
   if (!Number.isInteger(minAgree) || minAgree < 1) throw new Error(`makeQuorumChainTracker: minAgree must be an integer ≥ 1 (got ${minAgree})`)
   if (minAgree > trackers.length) throw new Error(`makeQuorumChainTracker: minAgree ${minAgree} exceeds the ${trackers.length} configured source(s) — an unsatisfiable quorum`)
   const log = deps.log ?? ((): void => {})
-
   // Sanitize the recheck knobs at the primitive's trust boundary (defense-in-depth vs. a garbage/Infinity/NaN value from
   // ANY caller's env parsing): a non-finite or negative value degrades to the SAFE default — maxRechecks→0 (strict, no
   // loop), delayMs→20s, shallowReorgDepth→2. This forbids `Infinity` (would make the recheck loop non-terminating) and
@@ -104,26 +135,54 @@ export function makeQuorumChainTracker(trackers: ChainTracker[], minAgree: numbe
             log(`chaintrack-quorum: source ${i} errored on root@${height} (fail-closed, no-confirm): ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`)
           }
         })
-        if (confirms >= minAgree) return true
+        if (confirms >= minAgree) {
+          if (disagreeIdx.length === 0) return true
+          // Enough sources confirm, but another one rejected the root. Only a source that is well past this height
+          // (its tip beyond the shallow reorg zone) AND holds a well-formed DIFFERENT header for it is a definitive
+          // conflict (a forged proof or a deep reorg): the root then fails closed however many others confirm. A
+          // source that is behind, has no header there (a gap in its index), has since caught up, or cannot say is
+          // tolerated, like a source that errored.
+          const rejections = await readRejections(trackers, disagreeIdx, root, height)
+          const conflict = rejections.find((r) => r.kind === 'different' && r.tip !== undefined && r.tip - shallowReorgDepth > height)
+          rejections.filter((r) => r.kind === 'missing' && r.tip !== undefined && r.tip - shallowReorgDepth > height).forEach((r) => {
+            log(`chaintrack-quorum: source ${r.i} has no header at ${height} though its tip ${r.tip} is past it — a gap in its index, tolerated while ${confirms} source(s) confirm`)
+          })
+          if (!conflict) return true
+          log(`chaintrack-quorum: source ${conflict.i} holds a different header at ${height} and its tip is >${shallowReorgDepth} blocks past it while ${confirms} source(s) confirm — definitive conflict, fail-closed`)
+          return false
+        }
 
-        // Classify the shortfall: is it a TRANSIENT lag / shallow reorg (wait and recheck) or a HARD fork/forgery (fail
-        // now)? A disagreeing source that has already synced MORE than `shallowReorgDepth` blocks PAST `height` and STILL
-        // rejects the root can never be reconciled by waiting → fail-closed immediately, no retry. Only checked when
-        // rechecks are enabled (default keeps the strict, immediate fail-closed path byte-identical to before).
+        // Classify the shortfall: is it a TRANSIENT lag / shallow reorg (wait and recheck) or HARD (fail now)? A
+        // disagreeing source that has already synced MORE than `shallowReorgDepth` blocks PAST `height` and still rejects
+        // the root can never be reconciled by waiting → fail-closed immediately, no retry — unless it now holds the root
+        // (it caught up). A gap in its index at a buried height is HARD too: waiting does not fill it, and a proof that
+        // lacks its quorum must not hold a caller (the watchtower's startup checks run one after another) for the whole
+        // recheck schedule. A source that cannot say what it holds stays HARD, as before. Only checked when rechecks are
+        // enabled (default keeps the strict, immediate fail-closed path byte-identical to before).
         let hardDisagreement = false
+        let hardWhy = ''
         if (maxRechecks > 0 && disagreeIdx.length > 0) {
-          const tips = await Promise.allSettled(disagreeIdx.map((i) => trackers[i].currentHeight()))
-          tips.forEach((t, k) => {
-            if (t.status === 'fulfilled' && Number.isInteger(t.value) && t.value - shallowReorgDepth > height) {
-              hardDisagreement = true
-              log(`chaintrack-quorum: source ${disagreeIdx[k]} rejects root@${height} though its tip ${t.value} is >${shallowReorgDepth} blocks past it — HARD fork/forgery, fail-closed (no retry)`)
+          const rejections = await readRejections(trackers, disagreeIdx, root, height)
+          rejections.forEach((r) => {
+            if (r.tip === undefined || r.tip - shallowReorgDepth <= height) return
+            if (r.kind === 'match') {
+              log(`chaintrack-quorum: source ${r.i} rejected root@${height} with its tip ${r.tip} past it, but now holds the root — transient`)
+              return
             }
+            hardDisagreement = true
+            if (r.kind === 'missing') {
+              hardWhy ||= 'index gap at a buried height'
+              log(`chaintrack-quorum: source ${r.i} has no header at ${height} though its tip ${r.tip} is >${shallowReorgDepth} blocks past it — a gap in its index that waiting will not fill; fail-closed (no retry)`)
+              return
+            }
+            hardWhy = 'deep fork/forgery'
+            log(`chaintrack-quorum: source ${r.i} rejects root@${height} though its tip ${r.tip} is >${shallowReorgDepth} blocks past it — HARD fork/forgery, fail-closed (no retry)`)
           })
         }
 
         const canRetry = maxRechecks > 0 && attempt < maxRechecks && !hardDisagreement
         if (!canRetry) {
-          log(`chaintrack-quorum: root@${height} NOT corroborated — ${confirms}/${minAgree} confirmations (${disagreements} disagreed, ${errors} errored)${attempt > 0 ? ` after ${attempt} recheck(s)` : ''}${hardDisagreement ? ' [hard disagreement — deep fork/forgery]' : ''} — REFUSING (fail-closed)`)
+          log(`chaintrack-quorum: root@${height} NOT corroborated — ${confirms}/${minAgree} confirmations (${disagreements} disagreed, ${errors} errored)${attempt > 0 ? ` after ${attempt} recheck(s)` : ''}${hardDisagreement ? ` [hard disagreement — ${hardWhy}]` : ''} — REFUSING (fail-closed)`)
           return false
         }
         log(`chaintrack-quorum: root@${height} short ${confirms}/${minAgree} — TRANSIENT (source lag / ≤${shallowReorgDepth}-deep reorg zone); recheck ${attempt + 1}/${maxRechecks} in ${recheckDelayMs}ms`)
@@ -133,11 +192,14 @@ export function makeQuorumChainTracker(trackers: ChainTracker[], minAgree: numbe
     currentHeight: async (): Promise<number> => {
       const results = await Promise.allSettled(trackers.map((t) => t.currentHeight()))
       const heights = results
-        .filter((r): r is PromiseFulfilledResult<number> => r.status === 'fulfilled' && Number.isInteger(r.value) && r.value > 0)
+        .filter((r): r is PromiseFulfilledResult<number> => r.status === 'fulfilled' && Number.isSafeInteger(r.value) && r.value > 0)
         .map((r) => r.value)
       if (heights.length < minAgree) throw new Error(`chaintrack-quorum currentHeight: only ${heights.length}/${minAgree} source(s) returned a height (fail-closed)`)
-      // Conservative: the height ALL quorum sources have reached — a lagging source counts FEWER confirmations, never more.
-      return Math.min(...heights)
+      // Conservative: the highest height at least two answering sources (or minAgree, if more) have reached. With two
+      // sources this is the minimum, as before: a lagging source counts FEWER confirmations, never more. With three,
+      // one stale source cannot hold the tip back and one ahead source cannot add confirmations.
+      const descending = [...heights].sort((a, b) => b - a)
+      return descending[Math.max(minAgree, Math.min(2, descending.length)) - 1]
     },
   }
 }

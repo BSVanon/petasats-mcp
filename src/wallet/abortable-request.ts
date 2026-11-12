@@ -18,15 +18,31 @@ export async function withRequestTimeout<T>(
     controller.signal.addEventListener('abort', onRequestAbort, { once: true })
     if (controller.signal.aborted) onRequestAbort()
   })
+  let succeeded = false
+  let lastValue: unknown
   try {
     // Some defence-in-depth callers wrap clients whose method cannot consume AbortSignal. The race enforces the local
     // bound even for such a non-cooperative request; cooperative fetch clients still receive the same signal as before.
-    return await Promise.race([request(controller.signal), aborted])
+    const value = await Promise.race([request(controller.signal), aborted])
+    succeeded = true
+    lastValue = value
+    return value
   } finally {
-    clearTimeout(timer)
     lifecycle?.removeEventListener('abort', onAbort)
     if (onRequestAbort) controller.signal.removeEventListener('abort', onRequestAbort)
-    controller.abort()
+    if (succeeded && typeof Response !== 'undefined' && lastValue instanceof Response) {
+      // A fetch Response's body is read AFTER this returns and stays tied to this signal, so aborting here would abort
+      // that read. Leave the deadline running, unref'd like AbortSignal.timeout, so it still bounds the body read
+      // without holding the process open; aborting an exchange whose body was already read is a no-op. A lifecycle
+      // stop no longer reaches that body read (its listener is gone); the deadline alone bounds it, as in 6876de9.
+      timer.unref()
+    } else if (succeeded) {
+      // Any other result is complete: nothing is left for the deadline to bound, so release it now.
+      clearTimeout(timer)
+    } else {
+      clearTimeout(timer)
+      controller.abort()
+    }
   }
 }
 

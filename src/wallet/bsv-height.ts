@@ -2,7 +2,6 @@ export type BsvHeightPurpose = 'risk' | 'recovery' | 'finality'
 export interface BsvHeightSource {
   currentHeight(signal?: AbortSignal): Promise<number>
 }
-
 export interface BsvHeightReader {
   readBsvHeight(purpose: BsvHeightPurpose, signal?: AbortSignal): Promise<number>
 }
@@ -57,6 +56,14 @@ export function makeBsvHeightReader(sources: BsvHeightSource[], deps: BsvHeightR
       log(`ALERT: ${message}`)
     }
   }
+  // A separate limiter, so a degraded-but-served notice never hides a refusal alert.
+  let lastDegradedAt = Number.NEGATIVE_INFINITY
+  const degraded = (message: string): void => {
+    if (now() - lastDegradedAt >= ALERT_INTERVAL_MS) {
+      lastDegradedAt = now()
+      log(`ALERT: ${message}`)
+    }
+  }
 
   return {
     readBsvHeight: async (purpose: BsvHeightPurpose, signal?: AbortSignal): Promise<number> => {
@@ -70,23 +77,35 @@ export function makeBsvHeightReader(sources: BsvHeightSource[], deps: BsvHeightR
         if (heights.length === 0) throw new Error('BSV recovery height: no source returned a valid height')
         return Math.max(...heights)
       }
+      const descending = [...heights].sort((a, b) => b - a)
       if (purpose === 'finality') {
         // Height zero is not a valid BSV tip. It is the intentional sentinel
         // for "not final yet": a finality caller must keep waiting rather than
         // let one surviving (possibly ahead) source terminalise a recovery.
-        return heights.length >= 2 ? Math.min(...heights) : 0
+        // The tip is the highest height at least two sources have reached
+        // (the minimum of two sources), so one stale source cannot hold back
+        // burial depth and one ahead source cannot add to it.
+        return descending.length >= 2 ? descending[1] : 0
       }
-      if (heights.length < 2) {
-        const message = `BSV risk height: only ${heights.length}/2 independent source(s) returned a valid height; refusing new risk`
+      if (descending.length < 2) {
+        const message = `BSV risk height: only ${descending.length}/2 independent source(s) returned a valid height; refusing new risk`
         alert(message)
         throw new Error(message)
       }
-      const maximum = Math.max(...heights)
-      const minimum = Math.min(...heights)
-      if (maximum - minimum > maxSkew) {
-        const message = `BSV risk height: independent sources differ by ${maximum - minimum} blocks (maximum ${maxSkew}); refusing new risk`
+      // Anchor on the highest valid tip and require a second source within the
+      // skew of it. A LOW outlier (stale, or a dead source) is ignored, which
+      // can only make the tip read higher, the conservative side for new risk;
+      // a HIGH tip no second source corroborates refuses. With two sources this
+      // is exactly "both within the skew, use the maximum".
+      const maximum = descending[0]
+      const corroborated = descending.filter((height) => maximum - height <= maxSkew).length
+      if (corroborated < 2) {
+        const message = `BSV risk height: independent sources differ by ${maximum - descending[1]} blocks (maximum ${maxSkew}); refusing new risk`
         alert(message)
         throw new Error(message)
+      }
+      if (corroborated < sources.length) {
+        degraded(`BSV risk height: ${corroborated}/${sources.length} sources agree at ${maximum}; ${sources.length - corroborated} failed or lag by more than ${maxSkew} blocks`)
       }
       return maximum
     },

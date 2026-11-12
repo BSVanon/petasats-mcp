@@ -63,6 +63,9 @@ export interface WocChaintracks {
   isValidRootForHeight(root: string, height: number): Promise<boolean>
 }
 
+/** The service every WhatsOnChain read uses. */
+export const WOC_API_ORIGIN = 'https://api.whatsonchain.com'
+
 /**
  * Build a WoC-backed `ChaintracksClientApi` for the given chain. The toolbox does not export its client interface
  * from its root, so this adapter exposes its concrete supported surface. Only `getPresentHeight`,
@@ -71,7 +74,7 @@ export interface WocChaintracks {
 export function makeWocChaintracks(chain: 'test' | 'main', deps: WocChaintracksDeps = {}): WocChaintracks {
   const fetchImpl = deps.fetchImpl ?? fetch
   const timeoutMs = deps.timeoutMs ?? 8_000
-  const base = `https://api.whatsonchain.com/v1/bsv/${chain}`
+  const base = `${WOC_API_ORIGIN}/v1/bsv/${chain}`
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (deps.apiKey && deps.apiKey.trim() !== '') headers['woc-api-key'] = deps.apiKey
 
@@ -90,7 +93,7 @@ export function makeWocChaintracks(chain: 'test' | 'main', deps: WocChaintracksD
     if (!res.ok) throw new Error(`woc-chaintracks getPresentHeight HTTP ${res.status}`)
     const data = (await res.json()) as Array<{ height?: unknown }>
     const h = Array.isArray(data) ? Number(data[0]?.height) : NaN
-    if (!Number.isInteger(h) || h <= 0) throw new Error('woc-chaintracks getPresentHeight: bad /block/headers response')
+    if (!Number.isSafeInteger(h) || h <= 0) throw new Error('woc-chaintracks getPresentHeight: bad /block/headers response')
     return h
   }
 
@@ -106,7 +109,7 @@ export function makeWocChaintracks(chain: 'test' | 'main', deps: WocChaintracksD
     if (res.status === 404) return undefined
     if (!res.ok) throw new Error(`woc-chaintracks findHeaderForHeight(${height}) HTTP ${res.status}`)
     const d = (await res.json()) as WocHeader
-    if (typeof d?.merkleroot !== 'string' || d.merkleroot.length !== 64) {
+    if (typeof d?.merkleroot !== 'string' || !/^[0-9a-fA-F]{64}$/.test(d.merkleroot)) {
       throw new Error(`woc-chaintracks findHeaderForHeight(${height}): missing/invalid merkleroot`)
     }
     return {
@@ -141,7 +144,7 @@ export function makeWocChaintracks(chain: 'test' | 'main', deps: WocChaintracksD
     if (!Number.isSafeInteger(d.height) || d.height <= 0) {
       throw new Error(`woc-chaintracks findHeaderForBlockHash(${hash}): missing/invalid height`)
     }
-    if (typeof d.merkleroot !== 'string' || d.merkleroot.length !== 64) {
+    if (typeof d.merkleroot !== 'string' || !/^[0-9a-fA-F]{64}$/.test(d.merkleroot)) {
       throw new Error(`woc-chaintracks findHeaderForBlockHash(${hash}): missing/invalid merkleroot`)
     }
     return {

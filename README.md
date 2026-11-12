@@ -17,31 +17,31 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.18`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
+Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.19`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
 
 ```sh
-claude mcp add petasats -- npx -y petasats-mcp@0.2.18
+claude mcp add petasats -- npx -y petasats-mcp@0.2.19
 ```
 
 Claude Desktop (`claude_desktop_config.json`), Cursor (`~/.cursor/mcp.json`):
 
 ```json
-{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.18"]}}}
+{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.19"]}}}
 ```
 
 VS Code (`.vscode/mcp.json`):
 
 ```json
-{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.18"]}}}
+{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.19"]}}}
 ```
 
 Codex (CLI, IDE extension, or app):
 
 ```sh
-codex mcp add petasats -- npx -y petasats-mcp@0.2.18
+codex mcp add petasats -- npx -y petasats-mcp@0.2.19
 ```
 
-Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.18`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
+Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.19`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
 
 ## Fund the kit
 
@@ -78,9 +78,9 @@ You can create `~/.petasats/limits.json` to restrict where an AI may send funds 
 }
 ```
 
-Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.18 limits` to inspect it.
+Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.19 limits` to inspect it.
 
-`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.18 resume`; recovery for swaps already started keeps working.
+`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.19 resume`; recovery for swaps already started keeps working.
 
 `allowFastSettlement: false` forbids fast settlement for new swaps. If the field is missing, an explicitly requested fast swap is permitted to negotiate it; standard remains the default.
 
@@ -106,9 +106,9 @@ The npm package is built by GitHub Actions from a tagged commit and published wi
 
 ## Files, status, and recovery
 
-The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.18 status` for status and `npx petasats-mcp@0.2.18 recover` after interruption.
+The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.19 status` for status and `npx petasats-mcp@0.2.19 recover` after interruption.
 
-A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.18 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.18 withdrawal <hash> sent` or `npx petasats-mcp@0.2.18 withdrawal <hash> not-sent`.
+A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.19 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.19 withdrawal <hash> sent` or `npx petasats-mcp@0.2.19 withdrawal <hash> not-sent`.
 
 Repeating the same Base withdrawal (same asset, amount, and address) within an hour is refused as a likely retry. Do not run two AI apps using the kit on the same folder at the same time.
 
@@ -119,6 +119,11 @@ A swap started with version 0.2.0 or 0.2.1 whose USDC lock never landed can stay
 `busy`, `limit`, `rate_limited`, `unavailable`, and `declined` mean nothing was locked. If keys-file permissions are wrong, restore owner-only access. For RPC trouble, check your network connection and retry.
 
 ## Release notes
+
+0.2.19:
+
+- Fixes 0.2.18, which could not complete a swap. It cancelled each network request just after it succeeded, before reading the reply, so every BSV height, block-header and proof read failed with the error "The operation was aborted." Every swap was therefore refused before anything was locked, with a reason that includes "only 0/2 independent source(s)". Do not use 0.2.18.
+- The kit now reads BSV block heights and headers from three independent sources: Anvil, WhatsOnChain and Project Babbage’s public chaintracks service. Two must agree on a height, and on the header behind a proof. A new swap starts only when two sources are within 3 blocks of the highest height. If a source that is more than 2 blocks past a block reports a different header for it, the proof check fails, however many other sources agree. If one of the three is down, new swaps and proof checks still go ahead. A source that has no header for that block counts as down.
 
 0.2.18:
 
