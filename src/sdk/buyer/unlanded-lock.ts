@@ -76,9 +76,10 @@ export async function resolveUnlandedLock(record: SettlementRecord, deps: {
       if (!current || !sameRecord(current, record) || deps.isExecuting?.(record.hashHex)) return undefined
       // After the reads and immediately before the terminal write; a throw means "try later", like a read error.
       await deps.assertPoolSafe()
+      const at = Math.max(Math.floor(deps.now() / 1000), current.history.at(-1)?.at ?? 0)
       const next: SettlementRecord = {
         ...current, state: 'aborted', abortReason: UNLANDED_LOCK_ABORT_REASON,
-        history: [...current.history, { state: 'aborted', at: Math.floor(deps.now() / 1000) }],
+        history: [...current.history, { state: 'aborted', at }],
       }
       deps.persist(next)
       return next

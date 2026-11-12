@@ -68,6 +68,18 @@ describe('buyer cooperative refund recovery', () => {
     expect(writes).eq(0)
   })
 
+  it('I4: cooperative-refund helper clamps both manual history edges to the previous timestamp', async () => {
+    let current = record({ history: [{ state: 'created', at: 10 }, { state: 'base-locked', at: 20 }] })
+    const result = await resolveCooperativeRefund(current, {
+      evm: rails(), now: () => 9_000, reread: () => current,
+      persist: (next) => { current = next }, assertPoolSafe: () => {},
+    })
+    expect(result.kind).to.equal('refunded')
+    expect(current.history.slice(-2)).to.deep.equal([
+      { state: 'refunding', at: 20 }, { state: 'refunded', at: 20 },
+    ])
+  })
+
   it('K-I2: a locked tuple, unavailable finalized read, unresolved event, or unsafe pool never changes the record', async () => {
     for (const scenario of [
       { name: 'still locked', rails: rails({ locked: true }), safe: () => {} },

@@ -1,5 +1,6 @@
 import type { SettlementState } from '../../bridge/settlement-session'
 import type { BuyerExecutor, BuyerQuote, BuyerSwapRecord, BuyerSwapStage, DoorClient, SettlementMode, SettlementModeUsed, SettlementSpeed, StartSwapRequest } from './types'
+import { callDoorWithRetry, type DoorRetryOptions } from './door-retry'
 
 type WriteRecord = (record: BuyerSwapRecord, stage: BuyerSwapStage, extra?: Partial<BuyerSwapRecord>) => Promise<BuyerSwapRecord>
 
@@ -27,10 +28,13 @@ export function createInitialSettlementRecord(input: { request: StartSwapRequest
   return { schemaVersion: 3, swapId: input.swapId, requestId: input.requestId, stage: 'quoted', amountIn: input.request.amountIn.toString(), quote: input.quote, deliverTo: input.request.deliverTo, requestedSpeed: input.requestedSpeed, agreedSettlementMode: settlement.eligible ? 'pending' : 'confirmed', settlementModeUsed: 'pending', fastSettlementAllowedSnapshot: input.fastSettlementAllowedSnapshot, settlementModeDowngradeReason: settlement.downgradeReason, createdAtMs: input.now, updatedAtMs: input.now }
 }
 
-export async function negotiateSettlementMode(record: BuyerSwapRecord, deps: { door: DoorClient; now: () => number; write: WriteRecord }): Promise<{ record: BuyerSwapRecord; admission: Awaited<ReturnType<DoorClient['admit']>>; admittedMode: SettlementMode; admittedCap: string; downgradeReason?: string } | undefined> {
+export async function negotiateSettlementMode(record: BuyerSwapRecord, deps: { door: DoorClient; now: () => number; write: WriteRecord; retry?: Omit<DoorRetryOptions, 'stage' | 'canWait'> }): Promise<{ record: BuyerSwapRecord; admission: Awaited<ReturnType<DoorClient['admit']>>; admittedMode: SettlementMode; admittedCap: string; downgradeReason?: string } | undefined> {
   // The admission request is intentionally persisted before the executor can lock USDC.
   const requestedMode = requestedSettlementMode(record)
-  const admission = await deps.door.admit(record.quote.doorQuoteId, BigInt(record.amountIn), record.requestId, requestedMode)
+  const admit = () => deps.door.admit(record.quote.doorQuoteId, BigInt(record.amountIn), record.requestId, requestedMode)
+  const admission = deps.retry
+    ? await callDoorWithRetry(admit, { ...deps.retry, stage: 'admission', canWait: (waitMs) => record.quote.expiry * 1_000 > deps.now() + waitMs + 5_000 })
+    : await admit()
   if (admission.handshakeDeadlineMs <= deps.now()) throw new Error('market maker admission expired before the handshake began')
   const admittedMode = admission.settlementMode ?? 'confirmed'
   const admittedCap = admission.fastCapUsdcBaseUnits ?? '0'

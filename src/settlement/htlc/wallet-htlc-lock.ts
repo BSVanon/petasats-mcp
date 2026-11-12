@@ -196,8 +196,14 @@ async function fundFromReserve(wallet: WalletInterface, p: WalletHtlcLockParams,
   })
   for (const { fTxid } of selected) {
     if (beefByTxid.has(fTxid)) continue
-    const rawBeef = await p.fetchBeef(fTxid)
-    const beef = Beef.fromBinary(rawBeef)
+    let rawBeef: number[]
+    let beef: Beef
+    try {
+      rawBeef = await p.fetchBeef(fTxid)
+      beef = Beef.fromBinary(rawBeef)
+    } catch (error) {
+      throw new WalletHtlcLockError(`could not fetch funding BEEF for ${fTxid}: ${error instanceof Error ? error.message : String(error)}`, { noActionCreated: true })
+    }
     if (!beef.findTxid(fTxid)) throw new WalletHtlcLockError(`funding BEEF missing subject tx ${fTxid}`, { noActionCreated: true })
     beefByTxid.set(fTxid, rawBeef)
     mergedBeef.mergeBeef(beef)

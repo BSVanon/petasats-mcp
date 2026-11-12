@@ -43,6 +43,8 @@ export interface BridgeQuote {
   htlcKind?: BsvHtlcKind
   bsvClaimFeeBudgetSats?: number
   bsvRefundFeeBudgetSats?: number
+  /** Restock compatibility capability: only an advertising responder accepts the initiator's wait field. */
+  acceptsBsvLockWaitMs?: true
 }
 
 export interface BridgeQuoteV2 extends BridgeQuote {
@@ -60,7 +62,7 @@ export interface BridgeQuoteV2 extends BridgeQuote {
 export interface FundBsvBridgeCoordinator {
   recvIntent(): Promise<BridgeIntent>
   sendQuote(q: BridgeQuote): Promise<void>
-  recvBaseLocked(): Promise<{ txHash: `0x${string}`; blockNumber: number }>
+  recvBaseLocked(): Promise<{ txHash: `0x${string}`; blockNumber: number; bsvLockWaitMs?: number }>
   sendRefundSkeleton(m: { htlc: BsvHtlcUtxo; refundLocktime: number; toAddress: string; feeRate: number }): Promise<void>
   recvRefundSigA(): Promise<{ sigA: number[] }>
   sendBsvLocked(m: { bsvLockTxid: string; htlcScriptHex: string }): Promise<void>
@@ -75,6 +77,8 @@ export interface FundBsvBridgeCoordinator {
 
 export interface SwapRecordSink {
   write(record: SettlementRecord): void
+  /** Optional durable first-lock fence read. File stores implement it; simple test/drill sinks may omit it. */
+  read?(swapId: string): SettlementRecord | undefined
   /** Optional expected snapshot makes recovery cleanup compare-and-clear; ordinary settled writers may omit it. */
   clear(swapId: string, expected?: SettlementRecord): void
 }

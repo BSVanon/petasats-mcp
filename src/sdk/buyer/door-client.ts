@@ -4,16 +4,18 @@ import { DOOR_QUOTE_BOX_PREFIX, DOOR_SWAP_BOX_PREFIX, decodeDoorQuoteReply, deco
 import { DOOR_CAPABILITIES_BOX_PREFIX, DOOR_QUOTE_V2_BOX_PREFIX, DOOR_SWAP_V2_BOX_PREFIX, decodeDoorCapabilitiesReply, decodeDoorQuoteReplyV2, decodeDoorSwapReplyV2, encodeDoorV2, type DoorCapabilitiesReply, type DoorQuoteReplyV2, type DoorSwapReplyV2 } from '../../transport/door-protocol-v2'
 import { makeMessageBoxRequestReplyRequester } from '../../transport/messagebox-request-reply'
 import type { DoorClient } from './types'
+import { parseRetryAfter } from '../../transport/door-retry-after'
 
-export interface DoorDecline { code: 'busy' | 'limit' | 'rate_limited' | 'unavailable' | 'declined'; retry_hint: string; message: string; nothing_locked: true }
+export interface DoorDecline { code: 'busy' | 'limit' | 'rate_limited' | 'unavailable' | 'declined'; retry_after_s?: number; retry_hint: string; message: string; nothing_locked: true }
 export function mapDoorDecline(reason: string): DoorDecline {
-  const value = reason.toLowerCase()
+  const parsed = parseRetryAfter(reason)
+  const value = parsed.base.toLowerCase()
   const code = /global (?:count|usd)|in-flight|admissions\/hour/.test(value) ? 'busy'
     : /per-swap|identity (?:count|usd)/.test(value) ? 'limit'
       : /quote.*rate|rate.*quote/.test(value) ? 'rate_limited'
         : /kill-switch|quote (?:error|unavailable)|pricing|pricer declined quote|pricer did not bind the requested usdc amount|swap admission unavailable|admission store write failed/.test(value) ? 'unavailable' : 'declined'
-  const retry_hint = code === 'busy' ? 'retry later' : code === 'rate_limited' ? 'wait before requesting another quote' : code === 'unavailable' ? 'retry later' : code === 'limit' ? 'use a smaller amount or retry tomorrow' : 'request a new quote and retry'
-  return { code, retry_hint, message: `The market maker declined this request: ${reason}. Nothing was locked.`, nothing_locked: true }
+  const retry_hint = parsed.retryAfterS === undefined ? code === 'busy' ? 'retry later' : code === 'rate_limited' ? 'wait before requesting another quote' : code === 'unavailable' ? 'retry later' : code === 'limit' ? 'use a smaller amount or retry tomorrow' : 'request a new quote and retry' : `retry after ${parsed.retryAfterS}s`
+  return { code, ...(parsed.retryAfterS === undefined ? {} : { retry_after_s: parsed.retryAfterS }), retry_hint, message: `The market maker declined this request: ${reason}. Nothing was locked.`, nothing_locked: true }
 }
 export class DoorDeclineError extends Error {
   constructor(readonly decline: DoorDecline) { super(decline.message); this.name = 'DoorDeclineError' }

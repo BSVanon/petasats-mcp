@@ -50,7 +50,7 @@ export type SettlementState =
   | 'settled' // both legs claimed — success (terminal)
   | 'refunding' // a timeout hit; refund in flight
   | 'refunded' // funds recovered (terminal)
-  | 'aborted' // pre-lock guard refused / never started (terminal)
+  | 'aborted' // first lock never broadcast: pre-lock refusal or prepared-lock commit decline (terminal)
 
 const TERMINAL: ReadonlySet<SettlementState> = new Set(['settled', 'refunded', 'aborted'])
 
@@ -58,7 +58,7 @@ const TERMINAL: ReadonlySet<SettlementState> = new Set(['settled', 'refunded', '
 const ALLOWED: Record<SettlementState, ReadonlySet<SettlementState>> = {
   created: new Set(['base-locked', 'aborted']),
   'base-locked': new Set(['bsv-locked', 'revealed', 'refunding', 'aborted']), // a finalized Base Claim can reveal s even if the local BSV-lock observation was lost
-  'bsv-locked': new Set(['revealed', 'refunding']),
+  'bsv-locked': new Set(['revealed', 'refunding', 'aborted']), // aborted is only for a prepared first lock declined before its first broadcast
   revealed: new Set(['settled', 'refunding']),
   refunding: new Set(['settled', 'refunded']), // a competing reveal can win while a recovered refund is in flight
   settled: new Set(),
@@ -145,6 +145,19 @@ export interface SettlementRecord extends SettlementParams {
   baseLockBlock?: number
   /** Unix timestamp of the Base lock block, when the observing rail can provide it. */
   baseLockTimestamp?: number
+  /** Absolute wall-clock ceiling for all initiator pre-reveal waits, computed once when its Base lock lands. */
+  preRevealWaitDeadlineMs?: number
+  /** Terminal first-publication refusal. Only a revealed initiator can carry it; rehydration never clears it. */
+  claimPublicationRefused?: { atMs: number; reason: string }
+  /** Routing evidence only: a fresh read must re-prove this covenant refund before any Base refund send. */
+  bsvLockRefundEvidence?: { spenderTxid: string; observedAtMs: number }
+  /** Durable refusal fence written before declining a responder BSV lock at/after the peer's advertised cutoff. */
+  neverLock?: { cutoffMs: number; decidedAtMs: number; reason?: string }
+  /** Unique owner of a validated-restock pre-sign record. A later writer may supersede that evidence only when it
+   * carries the same marker; restart reconciliation uses its presence to distinguish new proof from legacy records. */
+  restockPreSignSessionId?: string
+  /** A locally signed/funded first-lock transaction. Presence permanently forbids the no-lock cooperative release. */
+  bsvLockIntentTxid?: string
   /** Pre-signed BSV refund tx hex (§12.3 — the BSV side IS pre-signable). */
   bsvRefundTxHex?: string
   /** BR-H3: the initiator's already-broadcast BSV claim txid. The raw transaction is persisted below so a
@@ -174,6 +187,11 @@ export interface SettlementRecord extends SettlementParams {
   /** §12.14: the confirmation target in force WHEN the refund was broadcast — persisted so a restart
    *  under different config can't LOWER the bar and mark recovered early. */
   refundConfirmationTarget?: number
+  /** Finalized cooperative Refund + full pinned-token payment evidence for an initiator's Base lock. */
+  cooperativeRefundTxid?: string
+  cooperativeRefundBlock?: number
+  /** Finalized canonical Base Claim/Refund evidence discovered after the exact live tuple was no longer locked. */
+  baseResolution?: BaseTerminalResolution
   /** Why the session aborted, if it did. */
   abortReason?: string
   /** Transition log (`at` from the injected clock). */
@@ -189,6 +207,14 @@ export interface CompetingResolution {
   eventTxid: string
   /** Bare 32-byte preimage revealed by a competing Claim. */
   preimageHex?: string
+  /** A Refund event without the exact full token transfer is retained as attention, never success. */
+  cause?: 'malformed-refund'
+}
+
+export interface BaseTerminalResolution {
+  outcome: 'claimed' | 'refunded'
+  eventTxid: string
+  eventBlock: number
 }
 
 export interface GuardResult {
@@ -259,8 +285,9 @@ function validateCompetingResolution(rec: SettlementRecord): void {
   if (!EVM_TX_HASH.test(resolution.eventTxid)) {
     throw new Error('SettlementRecord: competingResolution.eventTxid must be a 0x-prefixed 32-byte EVM tx hash')
   }
+  const malformedInitiatorRefund = rec.role === 'initiator' && resolution.outcome === 'refunded' && resolution.cause === 'malformed-refund'
   const expectedOutcome = rec.role === 'initiator' ? 'claimed' : 'refunded'
-  if (resolution.outcome !== expectedOutcome) {
+  if (resolution.outcome !== expectedOutcome && !malformedInitiatorRefund) {
     throw new Error(`SettlementRecord: competingResolution '${resolution.outcome}' is not competing for role '${rec.role}'`)
   }
   if (TERMINAL.has(rec.state)) {
@@ -279,6 +306,35 @@ function validateCompetingResolution(rec: SettlementRecord): void {
     }
   } else if (resolution.preimageHex !== undefined) {
     throw new Error('SettlementRecord: a refunded competingResolution must not carry preimageHex')
+  }
+  if (resolution.cause !== undefined && !malformedInitiatorRefund) throw new Error('SettlementRecord: invalid competingResolution cause')
+}
+
+function validateInitiatorRecoveryEvidence(rec: SettlementRecord): void {
+  const refusal = rec.claimPublicationRefused
+  if (refusal !== undefined && (rec.role !== 'initiator' || !['revealed', 'refunding', 'refunded', 'settled'].includes(rec.state) ||
+      typeof refusal !== 'object' || refusal === null || !Number.isSafeInteger(refusal.atMs) || refusal.atMs < 0 ||
+      typeof refusal.reason !== 'string' || refusal.reason.length === 0)) {
+    throw new Error('SettlementRecord: claimPublicationRefused requires an initiator recovery state, non-negative safe-integer atMs, and non-empty reason')
+  }
+  const evidence = rec.bsvLockRefundEvidence
+  if (evidence !== undefined && (rec.role !== 'initiator' || !['revealed', 'refunding', 'refunded'].includes(rec.state) ||
+      typeof evidence !== 'object' || evidence === null || !HEX32.test(evidence.spenderTxid) ||
+      !Number.isSafeInteger(evidence.observedAtMs) || evidence.observedAtMs < 0)) {
+    throw new Error('SettlementRecord: bsvLockRefundEvidence requires an initiator recovery state, exact spender txid, and non-negative safe-integer observedAtMs')
+  }
+}
+
+function validateBaseTerminalResolution(rec: SettlementRecord): void {
+  const resolution = rec.baseResolution
+  if (resolution === undefined) return
+  if (rec.role !== 'initiator' || (resolution.outcome !== 'claimed' && resolution.outcome !== 'refunded') ||
+      !EVM_TX_HASH.test(resolution.eventTxid) || !Number.isSafeInteger(resolution.eventBlock) || resolution.eventBlock < 1 ||
+      (resolution.outcome === 'claimed' ? rec.state !== 'settled' : rec.state !== 'refunded')) {
+    throw new Error('SettlementRecord: Base terminal resolution requires an initiator terminal state with a claimed/refunded event txid and positive block')
+  }
+  if (resolution.outcome === 'claimed' && !rec.secretHex) {
+    throw new Error('SettlementRecord: claimed Base terminal resolution requires the event preimage')
   }
 }
 
@@ -376,6 +432,29 @@ export function validateSettlementRecord(rec: SettlementRecord): void {
   if (rec.baseLockTimestamp !== undefined && (!Number.isSafeInteger(rec.baseLockTimestamp) || rec.baseLockTimestamp < 0)) {
     throw new Error('SettlementRecord: baseLockTimestamp must be a non-negative safe integer when set')
   }
+  if (rec.preRevealWaitDeadlineMs !== undefined && (rec.role !== 'initiator' || !Number.isSafeInteger(rec.preRevealWaitDeadlineMs) || rec.preRevealWaitDeadlineMs < 0)) {
+    throw new Error('SettlementRecord: preRevealWaitDeadlineMs must be a non-negative safe-integer millisecond deadline on an initiator record')
+  }
+  if (rec.neverLock !== undefined && (!Number.isSafeInteger(rec.neverLock.cutoffMs) || rec.neverLock.cutoffMs < 0 ||
+      !Number.isSafeInteger(rec.neverLock.decidedAtMs) || rec.neverLock.decidedAtMs < rec.neverLock.cutoffMs || rec.state !== 'aborted' ||
+      (rec.neverLock.reason !== undefined && (typeof rec.neverLock.reason !== 'string' || rec.neverLock.reason.length === 0)))) {
+    throw new Error('SettlementRecord: neverLock must be an aborted at/after-cutoff durable tombstone')
+  }
+  if (rec.restockPreSignSessionId !== undefined && !/^[0-9a-f]{32}$/i.test(rec.restockPreSignSessionId)) {
+    throw new Error('SettlementRecord: restockPreSignSessionId must be a 16-byte hex session marker when set')
+  }
+  if (rec.bsvLockIntentTxid !== undefined && !HEX32.test(rec.bsvLockIntentTxid)) {
+    throw new Error('SettlementRecord: bsvLockIntentTxid must be a 32-byte hex txid when set')
+  }
+  const preparedNeverBroadcast = rec.neverLock !== undefined && rec.restockPreSignSessionId !== undefined &&
+    rec.bsvLockIntentTxid !== undefined && rec.bsvLockOutpoint !== undefined && rec.bsvRefundTxHex !== undefined
+  const abortedPreparedLock = rec.state === 'aborted' && rec.history.at(-2)?.state === 'bsv-locked'
+  if (abortedPreparedLock && !preparedNeverBroadcast) {
+    throw new Error('SettlementRecord: bsv-locked may abort only as a prepared never-broadcast restock lock')
+  }
+  if (rec.neverLock !== undefined && (rec.bsvLockOutpoint !== undefined || rec.bsvRefundTxHex !== undefined) && !preparedNeverBroadcast) {
+    throw new Error('SettlementRecord: neverLock with BSV lock artifacts requires a restock pre-sign owner and signed-lock intent')
+  }
   if (rec.bsvRefundTxHex !== undefined && !NON_EMPTY_BYTE_HEX.test(rec.bsvRefundTxHex)) {
     throw new Error('SettlementRecord: bsvRefundTxHex must be non-empty byte-aligned hex when set')
   }
@@ -398,10 +477,17 @@ export function validateSettlementRecord(rec: SettlementRecord): void {
     const valid = rec.role === 'initiator' ? EVM_TX_HASH.test(rec.refundTxid) : HEX32.test(rec.refundTxid)
     if (!valid) throw new Error(`SettlementRecord: refundTxid has the wrong format for role '${rec.role}'`)
   }
+  if ((rec.cooperativeRefundTxid !== undefined || rec.cooperativeRefundBlock !== undefined) &&
+      (rec.role !== 'initiator' || rec.state !== 'refunded' || !rec.cooperativeRefundTxid || !EVM_TX_HASH.test(rec.cooperativeRefundTxid) ||
+       !Number.isSafeInteger(rec.cooperativeRefundBlock) || rec.cooperativeRefundBlock! < 1)) {
+    throw new Error('SettlementRecord: cooperative refund evidence requires an initiator refunded state with txid and positive block')
+  }
+  validateBaseTerminalResolution(rec)
   if (rec.abortReason !== undefined && typeof rec.abortReason !== 'string') {
     throw new Error('SettlementRecord: abortReason must be a string when set')
   }
   validateCompetingResolution(rec)
+  validateInitiatorRecoveryEvidence(rec)
 }
 
 /** Bare lowercase hex (strip an optional `0x`) — for hash + address equality. */
@@ -436,6 +522,8 @@ export class SettlementSession {
     // The competing marker itself controls whether recovery stops, so validate that new control field everywhere.
     validateOptionalClaimArtifactHex(rec)
     validateCompetingResolution(rec)
+    validateInitiatorRecoveryEvidence(rec)
+    validateBaseTerminalResolution(rec)
     return new SettlementSession({ ...rec, history: [...rec.history] })
   }
 
@@ -577,6 +665,86 @@ export class SettlementSession {
     if (obs.blockNumber !== undefined) this.rec.baseLockBlock = obs.blockNumber
   }
 
+  recordBaseLockTimestamp(timestampSeconds: number): void {
+    if (this.rec.state !== 'base-locked' || !Number.isSafeInteger(timestampSeconds) || timestampSeconds < 0) {
+      throw new Error('recordBaseLockTimestamp: base-locked state and a non-negative integer timestamp are required')
+    }
+    this.rec.baseLockTimestamp = timestampSeconds
+  }
+
+  /** Set once at Base-lock landing. Rehydrated sessions retain the exact deadline; callers never extend it. */
+  recordPreRevealWaitDeadline(deadlineMs: number): number {
+    if (this.rec.preRevealWaitDeadlineMs !== undefined) return this.rec.preRevealWaitDeadlineMs
+    if (this.rec.role !== 'initiator' || this.rec.state !== 'base-locked' || !Number.isSafeInteger(deadlineMs) || deadlineMs < 0) {
+      throw new Error('recordPreRevealWaitDeadline: a base-locked initiator and non-negative safe-integer millisecond deadline are required')
+    }
+    this.rec.preRevealWaitDeadlineMs = deadlineMs
+    return deadlineMs
+  }
+
+  /** Latch a terminal refusal once. A restart retains the original reason/time and cannot re-open publication. */
+  recordClaimPublicationRefused(atMs: number, reason: string): void {
+    if (this.rec.claimPublicationRefused) return
+    if (this.rec.role !== 'initiator' || this.rec.state !== 'revealed' || !Number.isSafeInteger(atMs) || atMs < 0 || !reason) {
+      throw new Error('recordClaimPublicationRefused: a revealed initiator, non-negative safe-integer atMs, and reason are required')
+    }
+    this.rec.claimPublicationRefused = { atMs, reason }
+  }
+
+  /** Persist routing evidence; authorization is always a separate fresh chain proof immediately before refund send. */
+  recordBsvLockRefundEvidence(spenderTxid: string, observedAtMs: number): void {
+    if (this.rec.role !== 'initiator' || this.rec.state !== 'revealed' || !HEX32.test(spenderTxid) ||
+        !Number.isSafeInteger(observedAtMs) || observedAtMs < 0) {
+      throw new Error('recordBsvLockRefundEvidence: a revealed initiator, exact spender txid, and non-negative safe-integer observedAtMs are required')
+    }
+    const prior = this.rec.bsvLockRefundEvidence
+    if (prior && prior.spenderTxid.toLowerCase() !== spenderTxid.toLowerCase()) {
+      throw new Error('recordBsvLockRefundEvidence: conflicting spender evidence already exists')
+    }
+    this.rec.bsvLockRefundEvidence = { spenderTxid: spenderTxid.toLowerCase(), observedAtMs }
+  }
+
+  recordRestockPreSignEvidence(sessionId: string): void {
+    if (this.rec.state !== 'base-locked' || this.rec.neverLock || this.rec.bsvLockIntentTxid ||
+        this.rec.bsvLockOutpoint || this.rec.bsvRefundTxHex || !/^[0-9a-f]{32}$/i.test(sessionId)) {
+      throw new Error('recordRestockPreSignEvidence: clean base-locked state and a 16-byte hex session marker are required')
+    }
+    this.rec.restockPreSignSessionId = sessionId.toLowerCase()
+  }
+
+  recordBsvLockIntent(txid: string): void {
+    if (this.rec.state !== 'base-locked' || this.rec.neverLock || !HEX32.test(txid)) {
+      throw new Error('recordBsvLockIntent: active base lock, no tombstone, and a 32-byte txid are required')
+    }
+    this.rec.bsvLockIntentTxid = txid.toLowerCase()
+  }
+
+  markNeverLock(cutoffMs: number, decidedAtMs: number, reason: string): void {
+    if (this.rec.state !== 'base-locked' || this.rec.bsvLockOutpoint || this.rec.bsvRefundTxHex) {
+      throw new Error('markNeverLock: only a not-yet-broadcast base-locked responder record can be tombstoned')
+    }
+    if (!Number.isSafeInteger(cutoffMs) || !Number.isSafeInteger(decidedAtMs) || decidedAtMs < cutoffMs) {
+      throw new Error('markNeverLock: decision must be at or after a valid cutoff')
+    }
+    this.rec.neverLock = { cutoffMs, decidedAtMs, reason }
+    this.abort(reason, Math.floor(decidedAtMs / 1000))
+  }
+
+  /** Mark a fully prepared first lock as deliberately never broadcast. The caller must hold the noSend reservation
+   * and invoke this before its first commit attempt; retaining every artifact makes the decline auditable while the
+   * neverLock fence prevents a restart from publishing it. */
+  markPreparedLockNeverBroadcast(cutoffMs: number, decidedAtMs: number, reason: string): void {
+    if (this.rec.state !== 'bsv-locked' || this.rec.neverLock || !this.rec.restockPreSignSessionId ||
+        !this.rec.bsvLockIntentTxid || !this.rec.bsvLockOutpoint || !this.rec.bsvRefundTxHex) {
+      throw new Error('markPreparedLockNeverBroadcast: a prepared restock lock with durable intent and refund is required')
+    }
+    if (!Number.isSafeInteger(cutoffMs) || !Number.isSafeInteger(decidedAtMs) || decidedAtMs < cutoffMs) {
+      throw new Error('markPreparedLockNeverBroadcast: decision must be at or after a valid cutoff')
+    }
+    this.rec.neverLock = { cutoffMs, decidedAtMs, reason }
+    this.abort(reason, Math.floor(decidedAtMs / 1000))
+  }
+
   /** After the lock's receipt returns, record the REAL txid + block (review 4576b3 MED). The pre-lock observe (review
    *  fde1afe HIGH-1) uses a PLACEHOLDER txid so a receipt-wait crash still leaves an actionable 'base-locked' record;
    *  this restores the true txid + the Claim-scan lower bound once the receipt lands. Refund is params-keyed, so this
@@ -674,6 +842,19 @@ export class SettlementSession {
 
   markSettled(now: number): void {
     this.transition('settled', now)
+  }
+
+  markCooperativeRefunded(txid: string, blockNumber: number, now: number): void {
+    if (this.rec.role !== 'initiator' || (this.rec.state !== 'base-locked' && this.rec.state !== 'refunding') ||
+        this.rec.secretHex || this.rec.bsvClaimTxid || this.rec.bsvClaimTxHex || this.rec.bsvClaimBeefHex ||
+        this.rec.baseRecoveryClaimTxid || this.rec.competingResolution || !EVM_TX_HASH.test(txid) || !Number.isSafeInteger(blockNumber) || blockNumber < 1) {
+      throw new Error('markCooperativeRefunded: exact initiator refund evidence without reveal/claim is required')
+    }
+    if (this.rec.state !== 'refunding') this.beginRefund(now)
+    this.rec.refundTxid = txid
+    this.rec.cooperativeRefundTxid = txid
+    this.rec.cooperativeRefundBlock = blockNumber
+    this.markRefunded(now)
   }
 
   /**
@@ -783,6 +964,34 @@ export class SettlementSession {
     this.transition('refunded', now)
   }
 
+  /** Converge an inactive initiator Base lock only from a finalized, tuple-bound Claim/Refund event. */
+  markBaseResolutionTerminal(resolution: BaseTerminalResolution, preimageHex: string | undefined, now: number): void {
+    if (this.rec.role !== 'initiator' || (this.rec.state !== 'base-locked' && this.rec.state !== 'revealed' && this.rec.state !== 'refunding') ||
+        !EVM_TX_HASH.test(resolution.eventTxid) || !Number.isSafeInteger(resolution.eventBlock) || resolution.eventBlock < 1) {
+      throw new Error('markBaseResolutionTerminal: locked initiator record and exact finalized event evidence are required')
+    }
+    if (resolution.outcome === 'claimed') {
+      if (!preimageHex) throw new Error('markBaseResolutionTerminal: claimed outcome requires its preimage')
+      if (this.rec.claimPublicationRefused || this.rec.bsvLockRefundEvidence) {
+        throw new Error('markBaseResolutionTerminal: Base claim contradicts durable publication-refusal/covenant-refund evidence')
+      }
+      if (this.rec.state === 'refunding') this.noteCompetingRevealWhileRefunding(preimageHex)
+      else this.observeReveal(preimageHex, now)
+      this.rec.baseResolution = { outcome: resolution.outcome, eventTxid: resolution.eventTxid, eventBlock: resolution.eventBlock }
+      this.markSettled(now)
+    } else {
+      const hasClaimOrReveal = preimageHex !== undefined || !!this.rec.bsvClaimTxid || !!this.rec.bsvClaimTxHex ||
+        !!this.rec.bsvClaimBeefHex
+      if (hasClaimOrReveal && !this.rec.bsvLockRefundEvidence) {
+        throw new Error('markBaseResolutionTerminal: refund evidence conflicts with a durable BSV claim/reveal')
+      }
+      if (this.rec.state !== 'refunding') this.beginRefund(now)
+      this.rec.baseResolution = { outcome: resolution.outcome, eventTxid: resolution.eventTxid, eventBlock: resolution.eventBlock }
+      this.markRefunded(now)
+    }
+    validateBaseTerminalResolution(this.rec)
+  }
+
   /**
    * Phase 2c-A reorg observation: a terminal recovery record is deliberately retained on disk. If its canonical
    * finality proof later disappears during that window, restore only the immediately-preceding recovery state while
@@ -800,7 +1009,8 @@ export class SettlementSession {
     }
     const prior = terminalIndex > 0 ? this.rec.history[terminalIndex - 1]?.state : undefined
     if (terminal === 'refunded') {
-      if (prior !== 'refunding' || !this.rec.refundTxid) {
+      const hasRefundEvidence = !!this.rec.refundTxid || this.rec.baseResolution?.outcome === 'refunded'
+      if (prior !== 'refunding' || !hasRefundEvidence) {
         throw new Error('rearmAfterTerminalReorg: refunded record lacks its immediately-prior refunding state/txid')
       }
     } else {
@@ -810,19 +1020,29 @@ export class SettlementSession {
       const hasBsvClaim = this.rec.role === 'initiator' && !!this.rec.bsvClaimTxid &&
         (!!this.rec.bsvClaimTxHex || !!this.rec.bsvClaimBeefHex) && !!this.rec.secretHex
       const hasBaseClaim = this.rec.role === 'responder' && !!this.rec.baseRecoveryClaimTxid && !!this.rec.secretHex
-      if (!hasBsvClaim && !hasBaseClaim) {
+      const hasObservedBaseClaim = this.rec.role === 'initiator' && this.rec.baseResolution?.outcome === 'claimed' && !!this.rec.secretHex
+      if (!hasBsvClaim && !hasBaseClaim && !hasObservedBaseClaim) {
         throw new Error('rearmAfterTerminalReorg: settled record lacks a persisted recovery claim artifact')
       }
     }
-    this.rec.state = prior
+    const candidate: SettlementRecord = {
+      ...this.rec,
+      state: prior,
+      history: this.rec.history.slice(0, -1),
+    }
+    delete candidate.baseResolution
+    validateInitiatorRecoveryEvidence(candidate)
+    this.rec = candidate
     // Remove the now-invalid terminal edge. Appending terminal→prior would manufacture a transition forbidden by
     // the state table and make the durable record fail its own complete history validation on the next scan.
-    this.rec.history.pop()
     void now
   }
 
-  /** Abort before locking (guard refusal / never started). */
+  /** Abort before first-lock broadcast (guard refusal / never started, or a prepared lock fenced by neverLock). */
   abort(reason: string, now: number): void {
+    if (this.rec.state === 'bsv-locked' && !this.rec.neverLock) {
+      throw new Error('abort: a bsv-locked session may abort only behind a prepared never-broadcast tombstone')
+    }
     this.transition('aborted', now)
     this.rec.abortReason = reason
   }
@@ -863,7 +1083,8 @@ export class SettlementSession {
       throw new Error(`SettlementSession: illegal transition ${from} → ${to}`)
     }
     this.rec.state = to
-    this.rec.history.push({ state: to, at: now })
+    const priorAt = this.rec.history[this.rec.history.length - 1]?.at ?? now
+    this.rec.history.push({ state: to, at: Math.max(now, priorAt) })
   }
 }
 

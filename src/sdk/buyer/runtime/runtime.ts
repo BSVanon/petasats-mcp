@@ -41,6 +41,10 @@ export interface BuyerRuntimeFactories {
 export interface CreateBuyerRuntimeOptions {
   home?: string
   log?: (message: string) => void
+  /** Internal deterministic-clock seam; production keeps wall time. */
+  now?: () => number
+  /** Internal concurrency-test seam; production keeps the kit's single-active-swap default. */
+  maxActiveSwaps?: number
   newWallet?: boolean
   /** Resolve stuck swaps written by kits before 0.2.2. Default: PETASATS_RESOLVE_OLD_STUCK_SWAPS=1. */
   resolveOldStuckSwaps?: boolean
@@ -87,6 +91,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
   const keys = readBuyerKeys(paths)
   const f = { ...standardFactories, ...options.factories }
   const log = makeRuntimeLog(options.log)
+  const now = options.now ?? Date.now
   const identity = f.makeIdentityOnlyWallet(PrivateKey.fromWif(keys.identityWif))
   const comms = f.makeAnvilMessageBoxComms({ wallet: identity, host: config.anvilHost })
   const door = f.makeMessageBoxDoorClient({ comms, doorIdentity: config.doorIdentity })
@@ -103,7 +108,7 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
   const engine = f.makeBuyerEngine({
     comms, doorIdentity: config.doorIdentity, evm: guardBuyerEvmWrites(evmRails.client, async () => { await evmRails.assertSafeForNewLock() }), bsv: bsv as any,
     chainTracker: bsv.chainTracker, bsvReservePub: bsvKey.toPublicKey(), settlementDir: paths.settlementDir,
-    usdcTokenAddress: BASE_USDC, capUsdPerSwap: config.capUsdPerSwap, now: Date.now,
+    usdcTokenAddress: BASE_USDC, capUsdPerSwap: config.capUsdPerSwap, now,
     sleep: (ms, signal) => new Promise((resolve, reject) => {
       const onAbort = (): void => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(signal?.reason) }
       const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
@@ -176,11 +181,12 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     },
     priceEthTransfer: async (to: `0x${string}`) => evmRails.client.priceNativeTransfer(to),
   }
-  const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, Date.now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') }, log })
-  const kit = createBuyerKit({ capUsdPerSwap: config.capUsdPerSwap, baseWithdrawalForbidden: [ERC20_SWAP.deployments.baseMainnet.address, BASE_USDC], newWallet: options.newWallet, keysPath: paths.keysPath }, {
+  const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') }, log })
+  const retryLifecycle = new AbortController()
+  const kit = createBuyerKit({ capUsdPerSwap: config.capUsdPerSwap, maxActiveSwaps: options.maxActiveSwaps, baseWithdrawalForbidden: [ERC20_SWAP.deployments.baseMainnet.address, BASE_USDC], newWallet: options.newWallet, keysPath: paths.keysPath, now }, {
     door, executor: engine, store: makeFileBuyerStore(paths), wallet,
     beforeNewSwap: async () => { await evmRails.assertSafeForNewLock() }, limits: () => readBuyerLimits(paths), spendingStopped: () => readSpendingStop(paths), withdrawalIntents,
-    stopSpending: (reason) => stopSpending(paths, reason), log,
+    stopSpending: (reason) => stopSpending(paths, reason), retrySignal: retryLifecycle.signal, log,
   })
-  return { kit, paths, config, close: () => engine.close?.() }
+  return { kit, paths, config, close: () => { retryLifecycle.abort(); engine.close?.() } }
 }

@@ -1,7 +1,7 @@
 import { PublicKey, Utils, type Transaction, type ChainTracker, type MerklePath } from '@bsv/sdk'
 import { isAddress } from 'viem'
 import { newHtlcSecret, type BsvHtlcUtxo } from '../settlement/htlc'
-import { SettlementSession, DEFAULT_COVENANT_FEE_BUDGET_SATS, fastAtomicEligible, type SettlementParams, type SettlementRecord, type ObservedBaseLock, type BsvHtlcKind, type SettlementMode, type SettlementModeUsed } from './settlement-session'
+import { SettlementSession, DEFAULT_COVENANT_FEE_BUDGET_SATS, fastAtomicEligible, guardInitiatorRevealRunway, type SettlementParams, type SettlementRecord, type ObservedBaseLock, type BsvHtlcKind, type SettlementMode, type SettlementModeUsed } from './settlement-session'
 import { isPublicDoorQuoteId, publicSettlementModeAndCapAreConsistent } from './settlement-mode'
 import { buildBridgeCovenantClaimTx, sizeCovenantFeeBudgetSats, type BridgeCovenantTerms } from '../settlement/htlc/bridge-covenant'
 import { assertTokenAllowedAndDecimals } from './evm/token-allowlist'
@@ -13,6 +13,23 @@ import { assertInitiatorTimelocks, DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } 
 import { baseAvailableSecsForBlocks, baseRequiredSecsForBlocks } from './base-block-time'
 import { makePreRevealHeightRead } from './pre-reveal-height'
 import { waitForLockTx } from './lock-tx-wait'
+import { retryOnSchedule } from '../wallet/bounded-retry'
+import { AmbiguousBsvLockError } from './bsv-lock-discovery'
+import { abortableSleep, withRequestTimeout } from '../wallet/abortable-request'
+import { COOPERATIVE_REFUND_REASON } from './initiator-outcomes'
+import {
+  FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS,
+  FIRST_PUBLICATION_READ_TIMEOUT_MS,
+  PRE_REVEAL_WAIT_BACKSTOP_MS,
+  assertPreRevealWaitCeiling,
+  baseSafeRevealCutoff,
+  computePreRevealWaitDeadlineMs,
+  guardFirstClaimPublication,
+  guardObservedLockBaseSafety,
+} from './first-publication-guard'
+
+export { FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS, PRE_REVEAL_WAIT_BACKSTOP_MS, baseSafeRevealCutoff, computePreRevealWaitDeadlineMs } from './first-publication-guard'
+
 /** The concrete swap the initiator runs: deliver an allowlisted ERC-20, receive BSV. */
 export interface BridgeDeliverErc20Spec {
   /** The ERC-20 the initiator delivers (locks on Base). Validated against the allowlist. */
@@ -44,13 +61,24 @@ interface SentTx { hash: string; status: 'success' | 'reverted' | 'pending'; blo
 type LockAttempt = { hash: `0x${string}`; signedTx: `0x${string}`; nonce: number }
 
 export const DEFAULT_EVM_LOCK_LAND_DEADLINE_MS = 120_000
+/** Existing default BSV confirmation target before the initiator reveals its secret. */
+export const DEFAULT_INITIATOR_BSV_CLAIM_CONFIRMATIONS = 1
 const EVM_LOCK_LAND_POLL_MS = 2_000
-
+export const BASE_LOCK_NOTIFY_RETRY_DELAYS_MS: readonly number[] = [1_000, 3_000, 7_000]
+export const BSV_LOCK_DISCOVERY_POLL_MS = 30_000
+const BSV_LOCK_WAIT_LOG_HEARTBEAT_MS = 10 * 60_000
 /** A double-spend is the one 0-conf refusal that must never take the confirmation fallback. */
 class ZeroConfDoubleSpendSignal extends Error {
   constructor() {
     super('0-conf monitor: DOUBLE-SPEND detected on the BSV lock — refusing to reveal')
     this.name = 'ZeroConfDoubleSpendSignal'
+  }
+}
+
+class FirstPublicationTerminalError extends Error {
+  constructor(reason: string) {
+    super(reason)
+    this.name = 'FirstPublicationTerminalError'
   }
 }
 
@@ -73,22 +101,30 @@ export interface BridgeInitiatorBsvRails {
   /** Broadcast via the mainnet ladder — the RAW tx (raw-only tiers) + optional ATOMIC BEEF (BEEF-capable tiers carry
    *  the 0-conf lock ancestry). Returns the txid. */
   broadcast(rawTx: string, atomicBeefHex?: string): Promise<string>
-  chainHeight(): Promise<number>
+  chainHeight(signal?: AbortSignal): Promise<number>
   /** Existing-lock/deadline reads may continue with one independent source. */
-  readBsvHeight?(purpose: 'recovery'): Promise<number>
+  readBsvHeight?(purpose: 'recovery', signal?: AbortSignal): Promise<number>
   /** Confirmations on the responder's BSV lock (the initiator waits before revealing). */
-  txConfirmations(txid: string): Promise<number>
+  txConfirmations(txid: string, signal?: AbortSignal): Promise<number>
   /**
    * Fetch a tx so the initiator can VERIFY the responder's BSV lock OUTPUT on-chain before revealing the secret
    * (review 772f17b8 HIGH). A `bsv-locked` MESSAGE + a confirmed txid are NOT proof the negotiated HTLC output exists
    * — a lying/buggy responder could name any confirmed txid. This fetch lets the executor prove vout 0 has the exact
    * expected script + satoshis before it builds/broadcasts a claim carrying `s`. null ⇒ not found ⇒ do NOT reveal.
    */
-  fetchTx(txid: string): Promise<Transaction | null>
+  fetchTx(txid: string, signal?: AbortSignal): Promise<Transaction | null>
   /** Lock-announcement-only lookup; may accept a locally served unproven transaction. */
-  fetchLockTx?(txid: string): Promise<Transaction | null>
+  fetchLockTx?(txid: string, signal?: AbortSignal): Promise<Transaction | null>
+  /**
+   * Optional exact-script chain discovery. It runs beside the coordinator wait so a delivered `base-locked` message
+   * followed by a lost `bsv-locked` reply cannot strand both legs. The returned transaction is still subjected to
+   * every existing txid/vout-0/script/amount/finality/SPV/reveal guard below.
+   */
+  findLockTxByScript?: ((lockingScriptHex: string, expectedSatoshis: number, signal?: AbortSignal, opts?: { forceHistory?: boolean }) => Promise<Transaction | null>) & {
+    release?(lockingScriptHex: string, expectedSatoshis: number): void
+  }
   
-  fetchBeef?(txid: string): Promise<Transaction | null>
+  fetchBeef?(txid: string, signal?: AbortSignal): Promise<Transaction | null>
 }
 
 /**
@@ -99,13 +135,245 @@ export interface BridgeInitiatorBsvRails {
 export interface BridgeInitiatorCoordinator {
   sendIntent(intent: BridgeIntent): Promise<void>
   recvQuote(): Promise<BridgeQuote>
-  sendBaseLocked(m: { txHash: `0x${string}`; blockNumber: number }): Promise<void>
+  sendBaseLocked(m: { txHash: `0x${string}`; blockNumber: number; bsvLockWaitMs?: number }): Promise<void>
   recvRefundSkeleton(): Promise<{ htlc: BsvHtlcUtxo; refundLocktime: number; toAddress: string; feeRate: number }>
   sendRefundSigA(m: { sigA: number[] }): Promise<void>
-  recvBsvLocked(): Promise<{ bsvLockTxid: string; htlcScriptHex: string }>
+  recvBsvLocked(signal?: AbortSignal): Promise<{ bsvLockTxid: string; htlcScriptHex: string }>
   /** OPTIONAL 0-conf fast hint to the responder: a pointer to our BSV claim tx (still verified on-chain). */
   sendRevealHint?(m: { bsvClaimTxid: string }): Promise<void>
 }
+
+type BsvLockedNotice = Awaited<ReturnType<BridgeInitiatorCoordinator['recvBsvLocked']>>
+interface BsvLockObservation {
+  notice: BsvLockedNotice
+  assertNoConflict(): void
+  latchQualifiedTxid(txid: string): void
+  finish(): void
+}
+
+type MessageLockEvent =
+  | { kind: 'message'; notice: BsvLockedNotice }
+  | { kind: 'message-error'; error: unknown }
+type ChainLockEvent =
+  | { kind: 'chain'; notice: BsvLockedNotice }
+  | { kind: 'chain-miss' }
+  | { kind: 'chain-error'; error: unknown }
+
+type LockHeightEvent = { kind: 'height'; value: number } | { kind: 'height-error'; error: unknown }
+
+function combinedSignal(parent: AbortSignal | undefined, local: AbortSignal): AbortSignal {
+  return parent ? AbortSignal.any([parent, local]) : local
+}
+
+// Built from the one reason constant so a renamed public-kit literal still matches exactly.
+const COOPERATIVE_REFUND_PATTERN = COOPERATIVE_REFUND_REASON.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const FINALIZED_BASE_OUTCOME = new RegExp(
+  `^(?:${COOPERATIVE_REFUND_PATTERN}|RECOVERY NEEDS ATTENTION: finalized Base (?:Claim|Refund)\\b)`,
+)
+
+function finalizedBaseOutcomeError(error: unknown): Error | undefined {
+  const message = error instanceof Error ? error.message : String(error)
+  return FINALIZED_BASE_OUTCOME.test(message) ? (error instanceof Error ? error : new Error(message)) : undefined
+}
+
+/** Race the established message fast path with exact-script chain discovery under the coordinator's existing bound. */
+async function observeBsvLock(opts: {
+  coordinator: BridgeInitiatorCoordinator
+  bsv: BridgeInitiatorBsvRails
+  expectedScript: string
+  expectedSatoshis: number
+  bsvRefundLocktime: number
+  waitDeadlineMs: number
+  readHeight: (maxRetryWaitMs?: number, signal?: AbortSignal) => Promise<number>
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>
+  nowMs: () => number
+  signal?: AbortSignal
+  log: (message: string) => void
+}): Promise<BsvLockObservation> {
+  const controller = new AbortController()
+  const signal = combinedSignal(opts.signal, controller.signal)
+  let messageNotice: BsvLockedNotice | undefined
+  let chainNotice: BsvLockedNotice | undefined
+  let messageTerminalError: Error | undefined
+  let chainDiscoveryDisabled = false
+  const qualifiedTxids = new Set<string>()
+  const finish = (): void => {
+    controller.abort()
+    opts.bsv.findLockTxByScript?.release?.(opts.expectedScript, opts.expectedSatoshis)
+  }
+
+  const assertCeiling = (): void => {
+    if (opts.nowMs() >= opts.waitDeadlineMs) throw new Error(`pre-reveal wait ceiling ${opts.waitDeadlineMs} reached; ending before reveal with the Base refund record intact`)
+  }
+  const remainingWaitMs = (): number => {
+    assertCeiling()
+    return Math.max(1, opts.waitDeadlineMs - opts.nowMs())
+  }
+  const latchQualifiedTxid = (txid: string): void => {
+    qualifiedTxids.add(txid.toLowerCase())
+    if (qualifiedTxids.size > 1) throw new AmbiguousBsvLockError(qualifiedTxids.size)
+  }
+
+  const stateLogger = (label: string) => {
+    let errorState: string | undefined
+    let lastLoggedAt = Number.NEGATIVE_INFINITY
+    return {
+      failed(error: unknown): void {
+        const next = error instanceof Error ? error.message : String(error)
+        const at = opts.nowMs()
+        if (next !== errorState || at - lastLoggedAt >= BSV_LOCK_WAIT_LOG_HEARTBEAT_MS) {
+          opts.log(`${label}; message path remains active: ${next}`)
+          lastLoggedAt = at
+        }
+        errorState = next
+      },
+      recovered(): void {
+        if (errorState !== undefined) opts.log(`${label.replace(' failed', '')} recovered; message path remains active`)
+        errorState = undefined
+        lastLoggedAt = Number.NEGATIVE_INFINITY
+      },
+    }
+  }
+  const discoveryState = stateLogger('exact-script lock discovery failed')
+  const heightState = stateLogger('BSV height unavailable during lock wait')
+  const disableAmbiguousChainCandidates = (error: AmbiguousBsvLockError): void => {
+    if (!chainDiscoveryDisabled) opts.log(`${error.message}; ending before reveal`)
+    chainDiscoveryDisabled = true
+    chainNotice = undefined
+  }
+
+  const assertNoConflict = (): void => {
+    if (messageTerminalError) throw messageTerminalError
+    if (messageNotice && messageNotice.htlcScriptHex !== opts.expectedScript) {
+      throw new Error("responder's BSV HTLC script does not match the negotiated hashlock/keys")
+    }
+    if (messageNotice && chainNotice && messageNotice.bsvLockTxid.toLowerCase() !== chainNotice.bsvLockTxid.toLowerCase()) {
+      throw new Error(`coordinator and BSV chain named different responder locks (${messageNotice.bsvLockTxid} != ${chainNotice.bsvLockTxid}) - refusing to reveal`)
+    }
+  }
+
+  const message: Promise<MessageLockEvent> = opts.coordinator.recvBsvLocked(signal).then(
+    (notice) => { messageNotice = notice; return { kind: 'message' as const, notice } },
+    (error: unknown) => {
+      messageTerminalError = finalizedBaseOutcomeError(error)
+      return { kind: 'message-error' as const, error }
+    },
+  )
+
+  const pause = (): Promise<{ kind: 'pause' }> => {
+    assertCeiling()
+    return opts.sleep(Math.min(BSV_LOCK_DISCOVERY_POLL_MS, opts.waitDeadlineMs - opts.nowMs()), signal).then(
+    () => ({ kind: 'pause' as const }),
+    (error: unknown) => { throw error },
+    )
+  }
+  // Zero budget deliberately means one physical height read. A failure belongs to this 30-second discovery cycle and
+  // is retried in the next one; the pre-reveal reader's longer retry schedule remains unchanged everywhere else.
+  const height = (): Promise<LockHeightEvent> => withRequestTimeout(remainingWaitMs(), signal, (requestSignal) => opts.readHeight(0, requestSignal)).then(
+    (value) => ({ kind: 'height' as const, value }),
+    (error: unknown) => ({ kind: 'height-error' as const, error }),
+  )
+
+  const acceptMessage = async (event: MessageLockEvent): Promise<BsvLockObservation> => {
+    if (event.kind === 'message-error') throw event.error
+    await Promise.resolve() // let an already-completed chain observation publish its conflict state
+    assertNoConflict()
+    return { notice: event.notice, assertNoConflict, latchQualifiedTxid, finish }
+  }
+
+  const assertHeightEvent = (event: LockHeightEvent): void => {
+    if (event.kind === 'height-error') {
+      heightState.failed(event.error)
+      return
+    }
+    heightState.recovered()
+    const gate = guardInitiatorRevealRunway(opts.bsvRefundLocktime, event.value)
+    if (!gate.ok) throw new Error(`BSV lock wait stopped: reveal gate refused: ${gate.reason}`)
+  }
+
+  try {
+    // Preserve the established path byte-for-byte for test/injected rails that do not offer exact-script discovery:
+    // the coordinator owns the same timeout and no extra height read or timer is introduced.
+    if (!opts.bsv.findLockTxByScript) {
+      const only = await message
+      if (only.kind === 'message-error') throw only.error
+      assertNoConflict()
+      return { notice: only.notice, assertNoConflict, latchQualifiedTxid, finish }
+    }
+
+    for (;;) {
+      signal.throwIfAborted()
+      assertCeiling()
+      let chainEvent: ChainLockEvent | undefined
+      let heightEvent: LockHeightEvent | undefined
+      const chain: Promise<ChainLockEvent> | undefined = chainDiscoveryDisabled ? undefined : withRequestTimeout(
+        remainingWaitMs(), signal,
+        (requestSignal) => opts.bsv.findLockTxByScript!(opts.expectedScript, opts.expectedSatoshis, requestSignal),
+      ).then(
+        (tx) => {
+          if (!tx) return { kind: 'chain-miss' as const }
+          const nextNotice = { bsvLockTxid: tx.id('hex'), htlcScriptHex: opts.expectedScript }
+          if (chainNotice && chainNotice.bsvLockTxid.toLowerCase() !== nextNotice.bsvLockTxid.toLowerCase()) {
+            const error = new AmbiguousBsvLockError(2)
+            disableAmbiguousChainCandidates(error)
+            return { kind: 'chain-error' as const, error }
+          }
+          chainNotice = nextNotice
+          try {
+            latchQualifiedTxid(nextNotice.bsvLockTxid)
+          } catch (error) {
+            const ambiguous = error instanceof AmbiguousBsvLockError ? error : new AmbiguousBsvLockError(qualifiedTxids.size)
+            disableAmbiguousChainCandidates(ambiguous)
+            return { kind: 'chain-error' as const, error: ambiguous }
+          }
+          return { kind: 'chain' as const, notice: chainNotice }
+        },
+        (error: unknown) => {
+          if (error instanceof AmbiguousBsvLockError) disableAmbiguousChainCandidates(error)
+          return { kind: 'chain-error' as const, error }
+        },
+      )
+      const heightRead = height()
+
+      // One exact-script read and one height read make a cycle. The message receive is a separate, continuously-active
+      // fast path. A closed runway wins immediately; an open height cannot accept a chain candidate until the current
+      // discovery result proves that it is still the only qualifying match.
+      while (!heightEvent || (chain !== undefined && !chainEvent)) {
+        const pending: Array<Promise<MessageLockEvent | ChainLockEvent | LockHeightEvent>> = [message]
+        if (!heightEvent) pending.push(heightRead)
+        if (chain !== undefined && !chainEvent) pending.push(chain)
+        const event = await Promise.race(pending)
+        if (event.kind === 'message' || event.kind === 'message-error') return acceptMessage(event)
+        if (event.kind === 'height' || event.kind === 'height-error') {
+          heightEvent = event
+          assertHeightEvent(event)
+        } else {
+          chainEvent = event
+          if (event.kind === 'chain-error') {
+            if (event.error instanceof AmbiguousBsvLockError) throw event.error
+            discoveryState.failed(event.error)
+          } else discoveryState.recovered()
+        }
+      }
+
+      if (heightEvent.kind === 'height' && chainEvent?.kind === 'chain') {
+        await Promise.resolve()
+        assertNoConflict()
+        return { notice: chainEvent.notice, assertNoConflict, latchQualifiedTxid, finish }
+      }
+
+      // A miss, transient read failure, ambiguous set, or failed height changes no money state. The coordinator's own
+      // wall bound remains authoritative and is raced during the full 30-second interval.
+      const waited = await Promise.race([message, pause()])
+      if (waited.kind !== 'pause') return acceptMessage(waited)
+      assertCeiling()
+    }
+  } catch (error) {
+    finish()
+    throw error
+  }
+}
+
 export interface BridgeInitiatorConfig {
   erc20SwapAddress: `0x${string}`
   baseChainId: number
@@ -116,6 +384,8 @@ export interface BridgeInitiatorConfig {
   bsvFeeRate: number
   /** Confirmations required on the responder's BSV lock before revealing. Default 1. */
   bsvConfirmations?: number
+  /** Restock-only advertised wait. It is put on base-locked only when the responder explicitly supports it. */
+  bsvLockWaitMs?: number
   
   requireLockMerkleProof?: boolean
   /** Bounds on the merkle-proof fetch (the proof can lag the confirmation slightly). Defaults 10 tries / 3s. */
@@ -162,7 +432,8 @@ export interface BridgeInitiatorConfig {
   assertTimelocksAgainstConfiguredBsvWindow?: boolean
   /** Vestigial (Step E): the swap is COVENANT-ONLY — the taker DEFERS to `quote.htlcKind` (CVN-6) and refuses any
    *  non-covenant quote. The covenant claim is a forced payout with NO refund round-trip (the responder's refund is
-   *  MM-alone, committed in-script — HIGH#1). Field retained until E-3 removes it fleet-wide. */
+   *  MM-alone and its spending transaction carries `nLockTime` + non-final `nSequence` — HIGH#1). Field retained until
+   *  E-3 removes it fleet-wide. */
   htlcKind?: BsvHtlcKind
   bsvClaimFeeBudgetSats?: number
   bsvRefundFeeBudgetSats?: number
@@ -191,6 +462,8 @@ export interface BridgeInitiatorDeps {
   zeroConfArcStatuses?: FetchArcStatuses
   /** Persist the at-risk USDC session so the Base watchtower can refund at the timelock. */
   persist?(rec: SettlementRecord): void
+  /** Synchronous authoritative read at the write-ahead boundary. A missing wiring fails closed before publication. */
+  readPersistedRecord?(swapId: string): SettlementRecord | undefined
   /**
    * Durably link an application row to the hashlock before the first settlement record is written.  This closes the
    * crash window between an admitted request and its write-ahead recovery record.
@@ -207,6 +480,8 @@ export interface BridgeInitiatorDeps {
   sleep?(ms: number, signal?: AbortSignal): Promise<void>
   /** Optional lifecycle cancellation for the buyer kit's long lock-discovery wait. */
   signal?: AbortSignal
+  /** Per-read defence-in-depth cap. Tests may shorten it; production defaults to 15 seconds. */
+  requestTimeoutMs?: number
   log?(tag: string, msg: string): void
   /** Restock-only signer arbitration: acquire reveal before the irreversible write-ahead and BSV broadcast. */
   acquireRevealSide?(hashHex: string): Promise<void>
@@ -223,9 +498,9 @@ function validateResponderQuote(quote: BridgeQuote): void {
     if (PublicKey.fromString(quote.responderBsvPubKeyHex).toAddress().toString() !== quote.responderBsvAddress) fail()
   } catch { fail() }
 }
+
 // The BSV claim reveals the secret — the money-critical broadcast. Anvil is an SPV node with no UTXO set: it verifies
 // the spend from the lock's merkle proof carried in a BEEF, and REJECTS a bare tx (HTTP 422, BEEF parse-fail at byte 0;
-
 // block. The reveal-safety gate is re-read from a FRESH BSV height before every attempt, so the retry/backoff window
 // cannot carry a once-safe claim past its margin. `revealed` + the exact raw claim are persisted write-ahead before
 // broadcast; an all-fail/ambiguous attempt therefore remains claim-recoverable and never becomes Base-refundable.
@@ -285,15 +560,19 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
 } {
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000))
   const nowMs = deps.nowMs ?? Date.now
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  const sleep = deps.sleep ?? abortableSleep
   const log = deps.log ?? (() => {})
   const { bsvReservePub, evm, bsv, coordinator: coord, config: cfg } = deps
+  const requestTimeoutMs = deps.requestTimeoutMs ?? FIRST_PUBLICATION_READ_TIMEOUT_MS
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1) {
+    throw new Error(`initiator-executor: requestTimeoutMs must be a positive safe integer (got ${String(requestTimeoutMs)})`)
+  }
   const bsvPub = bsvReservePub
-  const recoveryHeight = (): Promise<number> => bsv.readBsvHeight ? bsv.readBsvHeight('recovery') : bsv.chainHeight()
-  const confs = cfg.bsvConfirmations ?? 1
+  const recoveryHeight = (): Promise<number> => bsv.readBsvHeight ? bsv.readBsvHeight('recovery', deps.signal) : bsv.chainHeight(deps.signal)
+  const confs = cfg.bsvConfirmations ?? DEFAULT_INITIATOR_BSV_CLAIM_CONFIRMATIONS
   // The claim recovery record pins the burial bar in force at first broadcast. One confirmation matches the
   // watchtower refund default and the executor's existing claim-burial success condition.
-  const claimConfs = 1
+  const claimConfs = DEFAULT_INITIATOR_BSV_CLAIM_CONFIRMATIONS
   // A proof discovery source can index a newly-mined block a few seconds before the independent header source does.
   // Keep this state per executor so a prolonged header lag emits one useful line per proof height, not one per poll.
   const headerLagLoggedAt = new Set<number>()
@@ -344,6 +623,11 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
   // (to obtain the proof) must be present.
   if (cfg.requireLockMerkleProof && (!deps.chainTracker || typeof bsv.fetchBeef !== 'function')) {
     throw new Error('initiator-executor: requireLockMerkleProof is set but no chainTracker dep and/or fetchBeef rail is wired — refusing to run without the SPV lock-proof gate')
+  }
+  // G2: every acceptance path must perform the same exact-script uniqueness re-read immediately before reveal.
+  // Refuse at construction rather than discover the missing safety rail after the initiator has locked USDC.
+  if (typeof bsv.findLockTxByScript !== 'function') {
+    throw new Error('initiator-executor: findLockTxByScript is required for the fresh pre-reveal duplicate-lock guard')
   }
   // LEVER B #1 (review 85decdb MED): the proof-fetch knobs govern the post-USDC-lock retry loop — a bad value can't
   // steal funds but can fail EVERY swap after the lock (or, negative/NaN, spin) → capital stranded for the watchtower.
@@ -409,6 +693,14 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
       // escaped, so every failure result carries it and no caller can mistake an ambiguous attempt for a refund path.
       let durableClaimTxid: string | undefined
       let liveSession: SettlementSession | undefined
+      let lockObservation: BsvLockObservation | undefined
+      let preRevealWaitDeadlineMs: number | undefined
+      const boundedPreRevealCall = <T>(call: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+        const remaining = preRevealWaitDeadlineMs === undefined
+          ? requestTimeoutMs
+          : Math.max(1, preRevealWaitDeadlineMs - nowMs())
+        return withRequestTimeout(Math.min(requestTimeoutMs, remaining), deps.signal, call)
+      }
       try {
         // 1. Allowlist + LIVE decimals cross-check on the token we're about to lock (fail-closed).
         const token = await assertTokenAllowedAndDecimals(cfg.baseChainId, spec.erc20TokenAddress, (a) => evm.tokenDecimals(a), true) // LEVER-B HIGH-1: bridge = $1-pegged only
@@ -421,8 +713,8 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         evmPreimageHash = H // doc 25 change D: surfaced in the result once known
 
         // 3. On-chain timelock heights (block-native, both legs) from the negotiated deltas.
-        const baseNow = Number(await evm.currentBlockNumber())
-        const bsvNow = await bsv.chainHeight()
+        const baseNow = Number(await boundedPreRevealCall(() => evm.currentBlockNumber()))
+        const bsvNow = await bsv.chainHeight(deps.signal)
         const legacyIntent: BridgeIntent = {
           hashHex,
           usdcAmount: spec.deliverAmount.toString(),
@@ -454,8 +746,9 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           if (q.settlementMode === 'fast' && (cfg.agreedSettlementMode !== 'fast' || q.fastCapUsdcBaseUnits !== cfg.fastCapUsdcBaseUnits)) throw new Error('v2 BridgeQuote fast mode/cap differs from durable admission')
           if (q.settlementMode === 'confirmed' && q.fastCapUsdcBaseUnits !== '0') throw new Error('v2 confirmed BridgeQuote must echo cap 0')
         }
-        // COVENANT-ONLY (Step E): the taker refuses any non-covenant quote. The responder's BSV refund is MM-alone +
-        // committed in-script (no 2-of-2 round-trip), so a legacy/undefined quote can never originate a swap here.
+        // COVENANT-ONLY (Step E): the taker refuses any non-covenant quote. The responder's BSV refund is MM-alone and
+        // its spend carries nLockTime + non-final nSequence (no 2-of-2 round-trip), so a legacy/undefined quote can
+        // never originate a swap here.
         if (quote.htlcKind !== 'covenant') throw new Error(`initiator-executor is COVENANT-ONLY — quote.htlcKind=${quote.htlcKind ?? 'legacy(default)'} refused (Step E)`)
         // LEVER-B HIGH-2 (red-team 2026-09-04, symmetric floor added by the 2026-09-05 re-red-team): the covenant claim
         // FORCES output[0] = htlcSats - bsvClaimFeeBudgetSats to the taker and returns the unused budget as the taker's
@@ -480,7 +773,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         const session = SettlementSession.create(paramsFrom(intent, quote, token.decimals, cfg, now()), 'initiator', now())
         liveSession = session
         session.holdSecret(Utils.toHex(secret))
-        const revealHeight = makePreRevealHeightRead({ read: () => bsv.chainHeight(), revealed: () => session.state === 'revealed', sleep, log: (m) => log('bsv', m) })
+        const revealHeight = makePreRevealHeightRead({ read: (signal) => bsv.chainHeight(signal), revealed: () => session.state === 'revealed', sleep, signal: deps.signal, log: (m) => log('bsv', m) })
 
         // 5. Lock USDC on Base (approve → wait allowance → lock).
         const evmParams: Erc20SwapParams = {
@@ -490,6 +783,53 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           claimAddress: quote.responderEvmAddr,
           refundAddress: evm.address() as `0x${string}`,
           timelock: BigInt(intent.baseTimelockBlock),
+        }
+        const assertPreRevealCeiling = (): void => assertPreRevealWaitCeiling(preRevealWaitDeadlineMs, nowMs)
+        const sleepWithinPreReveal = async (ms: number): Promise<void> => {
+          assertPreRevealCeiling()
+          await sleep(Math.min(ms, preRevealWaitDeadlineMs! - nowMs()), deps.signal)
+          assertPreRevealCeiling()
+        }
+        const pausePreRevealCycle = (): Promise<void> => sleepWithinPreReveal(BSV_LOCK_DISCOVERY_POLL_MS)
+        const requireFirstPublicationGuard = async (label: string, lockTxid: string, observation: BsvLockObservation): Promise<void> => {
+          for (;;) {
+            const record = session.toRecord()
+            const guardedRecord: SettlementRecord = record.bsvLockOutpoint
+              ? record
+              : { ...record, bsvLockOutpoint: `${lockTxid}_0` }
+            const result = await guardFirstClaimPublication(guardedRecord, {
+              findLockTxByScript: bsv.findLockTxByScript,
+              isSwapLocked: (params) => evm.isSwapLocked(params),
+              currentBaseHeight: () => evm.currentBlockNumber(),
+              // Keep the executor's existing bounded height retry schedule. Recovery performs one read per
+              // watchtower poll; this attended attempt exhausts its established schedule before yielding.
+              currentBsvHeight: (signal) => durableClaimTxid === undefined ? revealHeight(undefined, signal) : bsv.chainHeight(signal),
+              nowMs,
+              signal: durableClaimTxid === undefined ? deps.signal : undefined,
+              readTimeoutMs: requestTimeoutMs,
+              log,
+              assertNoConflict: observation.assertNoConflict,
+              observeQualifiedLockTxid: observation.latchQualifiedTxid,
+            }, label)
+            if (result.ok) return
+            if (result.terminal) throw new FirstPublicationTerminalError(result.reason)
+            if (result.reason.startsWith('first-publication live BSV height read failed') || result.reason.includes('request timed out')) throw new Error(result.reason)
+            await pausePreRevealCycle()
+          }
+        }
+        const requireObservedLockBaseSafety = async (label: string, observation: BsvLockObservation): Promise<void> => {
+          for (;;) {
+            const result = await guardObservedLockBaseSafety(session.toRecord(), {
+              isSwapLocked: (params) => evm.isSwapLocked(params),
+              currentBaseHeight: () => evm.currentBlockNumber(),
+              nowMs, signal: deps.signal, readTimeoutMs: requestTimeoutMs, log,
+              assertNoConflict: observation.assertNoConflict,
+            }, label)
+            if (result.ok) return
+            if (result.terminal) throw new FirstPublicationTerminalError(result.reason)
+            if (result.reason.includes('request timed out')) throw new Error(result.reason)
+            await pausePreRevealCycle()
+          }
         }
         if (!cfg.approveOnlyBelowAllowance || (await evm.allowance(spec.erc20TokenAddress)) < spec.deliverAmount) {
           const approval = await evm.approve(spec.erc20TokenAddress, spec.deliverAmount)
@@ -553,7 +893,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           }
           if (!lk.blockNumber || lk.blockNumber <= 0n) throw kept('without a receipt block to check the tuple at')
           let locked: boolean
-          try { locked = await evm.isSwapLocked(evmParams, { blockNumber: lk.blockNumber }) }
+          try { locked = await boundedPreRevealCall(() => evm.isSwapLocked(evmParams, { blockNumber: lk.blockNumber })) }
           catch (error) { throw kept(`and the tuple check at block ${lk.blockNumber} failed (${error instanceof Error ? error.message : String(error)})`) }
           if (locked) throw kept('but the exact tuple is locked on-chain — an earlier broadcast landed')
           deps.clearRecord?.(hashHex)
@@ -565,13 +905,44 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         }
         baseLockTxid = lk.hash
         session.noteBaseLockLanded(lk.hash, Number(lk.blockNumber ?? 0)) // MED (review 4576b3): record the REAL txid/block (the pre-lock observe used a placeholder)
+        const landedAtMs = nowMs()
+        const receiptHeight = Number(lk.blockNumber ?? 0)
+        preRevealWaitDeadlineMs = session.recordPreRevealWaitDeadline(computePreRevealWaitDeadlineMs({
+          landedAtMs,
+          // A successful receipt is the closest height to landing. The pre-lock live height is the conservative
+          // fallback for legacy/injected rails which omit it; neither value is ever re-read on restart.
+          baseHeightAtLanding: Math.max(baseNow, Number.isSafeInteger(receiptHeight) && receiptHeight > 0 ? receiptHeight : baseNow),
+          baseTimelockBlock: intent.baseTimelockBlock,
+          claimBudgetBaseBlocks: cfg.claimBudgetBaseBlocks ?? DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS,
+        }))
         deps.persist?.(session.toRecord()) // re-persist post-lock with the real txid/block (state unchanged; refund is params-keyed)
-        await coord.sendBaseLocked({ txHash: lk.hash as `0x${string}`, blockNumber: Number(lk.blockNumber ?? 0) })
+        const baseLockedMessage = {
+          txHash: lk.hash as `0x${string}`,
+          blockNumber: Number(lk.blockNumber ?? 0),
+          ...((quote.acceptsBsvLockWaitMs === true && cfg.bsvLockWaitMs !== undefined)
+            ? { bsvLockWaitMs: cfg.bsvLockWaitMs }
+            : {}),
+        }
+        // POST-LOCK invariant: a send timeout/5xx/network error is AMBIGUOUS (the message may already be stored).
+        // Re-send the identical idempotent body on a bounded schedule, then continue regardless: the at-risk USDC
+        // record is already durable and the responder's BSV lock is observable both by message and exact script.
+        try {
+          await retryOnSchedule(() => boundedPreRevealCall(() => coord.sendBaseLocked(baseLockedMessage)), {
+            delaysMs: BASE_LOCK_NOTIFY_RETRY_DELAYS_MS,
+            sleep: (ms) => sleep(Math.min(ms, Math.max(1, preRevealWaitDeadlineMs! - nowMs())), deps.signal),
+            retryable: () => true,
+            log: (message) => log('msg', message),
+            what: 'base-locked notify failed after the USDC lock landed (delivery outcome ambiguous)',
+            again: 'sending the identical body again',
+          })
+        } catch (error) {
+          log('msg', `base-locked notify still failed after ${BASE_LOCK_NOTIFY_RETRY_DELAYS_MS.length + 1} attempts; continuing to the bounded BSV lock wait (USDC refund remains armed): ${error instanceof Error ? error.message : String(error)}`)
+        }
         log('evm', `USDC LOCKED ${lk.hash.slice(0, 12)}… — recoverable at Base block ${intent.baseTimelockBlock}`)
 
         // 6. The expected on-chain BSV HTLC script — rebuilt from the SESSION (covenant: forced payout→taker on the
-        //    secret reveal, refund→MM@T_bsv committed in-script). COVENANT-ONLY (Step E): there is NO refund round-trip
-        //    — the taker signs NOTHING; the responder's refund is MM-alone (HIGH#1). Used below to bind the responder's
+        //    secret reveal; the MM-alone refund transaction carries `nLockTime` + non-final `nSequence`). COVENANT-ONLY
+        //    (Step E): there is NO refund round-trip — the taker signs NOTHING (HIGH#1). Used below to bind the responder's
         //    advertised + on-chain BSV lock to the negotiated hashlock/keys before revealing.
         const expectScript = session.bsvHtlcScriptHex()
 
@@ -581,7 +952,18 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         //    negotiated HTLC (our claim key + amount) BEFORE building/broadcasting a claim that reveals `s` — else we
         //    could leak `s` against a non-existent output (a broadcaster/relay echoing the claim), letting the
         //    responder claim our USDC for nothing, or strand our USDC until the Base refund.
-        const bsvLocked = await coord.recvBsvLocked()
+        const activeLockObservation = await observeBsvLock({
+          coordinator: coord, bsv, expectedScript: expectScript, expectedSatoshis: Number(spec.receiveBsvSats),
+          bsvRefundLocktime: intent.bsvRefundLocktime, waitDeadlineMs: preRevealWaitDeadlineMs!, readHeight: revealHeight, sleep, nowMs,
+          signal: deps.signal, log: (message) => log('bsv', message),
+        })
+        lockObservation = activeLockObservation
+        const bsvLocked = activeLockObservation.notice
+        // A latched finalized message outcome wins even when the chain candidate arrived first. The shared ordered
+        // source-independent guard runs at the final reversible boundary, after the named transaction is verified.
+        activeLockObservation.assertNoConflict()
+        await requireObservedLockBaseSafety('post-lock-source Base guard', activeLockObservation)
+        activeLockObservation.assertNoConflict()
         // The responder's HTLC must pay OUR claim key (else the claim we build can't spend it). Fail-closed.
         // (expectScript was computed + used to bind the refund skeleton in step 6.)
         if (bsvLocked.htlcScriptHex !== expectScript) throw new Error("responder's BSV HTLC script does not match the negotiated hashlock/keys")
@@ -589,19 +971,22 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // throttle for seconds (2026-09-27 D1c: a real, later-mined lock missed on the one immediate fetch). A miss or a
         // fetch error is therefore re-checked for a bounded window; everything below still verifies what is fetched.
         const lockTx = await waitForLockTx({
-          txid: bsvLocked.bsvLockTxid, fetchTx: (bsv.fetchLockTx ?? bsv.fetchTx).bind(bsv),
+          txid: bsvLocked.bsvLockTxid, fetchTx: (txid, signal) => (bsv.fetchLockTx ?? bsv.fetchTx).call(bsv, txid, signal),
           fastMaxTries: cfg.lockTxFetchMaxTries ?? 40, fastRetryMs: cfg.lockTxFetchRetryMs ?? 3_000,
           untilRevealRunway: cfg.lockTxFetchUntilRevealRunway === true,
-          slowRetryMs: cfg.lockTxFetchSlowRetryMs ?? 30_000, maxWaitMs: cfg.lockTxFetchMaxWaitMs ?? 4 * 60 * 60_000,
+          slowRetryMs: cfg.lockTxFetchSlowRetryMs ?? 30_000,
+          maxWaitMs: Math.max(1, Math.min(cfg.lockTxFetchMaxWaitMs ?? PRE_REVEAL_WAIT_BACKSTOP_MS, preRevealWaitDeadlineMs! - nowMs())),
           bsvRefundLocktime: intent.bsvRefundLocktime, revealHeight, nowMs, sleep, signal: deps.signal,
           log: (message) => log('bsv', message),
         })
         deps.signal?.throwIfAborted()
+        activeLockObservation.assertNoConflict()
         if (lockTx.id('hex') !== bsvLocked.bsvLockTxid) throw new Error(`fetched tx id ${lockTx.id('hex')} ≠ named BSV lock ${bsvLocked.bsvLockTxid} — refusing to reveal`)
         const out0 = lockTx.outputs[0]
         if (!out0) throw new Error(`BSV lock ${bsvLocked.bsvLockTxid} has no output 0 — refusing to reveal`)
         if (out0.lockingScript?.toHex() !== expectScript) throw new Error(`BSV lock ${bsvLocked.bsvLockTxid} vout 0 script ≠ the negotiated HTLC — refusing to reveal`)
         if (out0.satoshis !== Number(spec.receiveBsvSats)) throw new Error(`BSV lock ${bsvLocked.bsvLockTxid} vout 0 = ${String(out0.satoshis)} sat ≠ negotiated ${Number(spec.receiveBsvSats)} — refusing to reveal`)
+        activeLockObservation.latchQualifiedTxid(bsvLocked.bsvLockTxid)
         // The claim spends the VERIFIED on-chain outpoint (its proven script + satoshis), never the advertised values.
         const htlc: BsvHtlcUtxo = { txid: bsvLocked.bsvLockTxid, vout: 0, satoshis: out0.satoshis, scriptHex: expectScript }
         session.observeBsvLock({ outpoint: `${bsvLocked.bsvLockTxid}_0` }, now())
@@ -617,14 +1002,15 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         let useZeroConfFastPath = zeroConfEligible
         const confirmLockAndVerify = async (): Promise<void> => {
           for (let i = 0; ; i++) {
+            assertPreRevealCeiling()
             // A lock that never confirms must not strand this executor (or its restock tick) indefinitely. The same
             // reveal runway applies before every confirmation poll, whether this is the direct confirmed path or a
             // 0-conf fallback.
             const waitGate = session.guardInitiatorCanReveal(await revealHeight())
             if (!waitGate.ok) throw new Error(`confirmed-path lock wait stopped: reveal gate refused: ${waitGate.reason}`)
-            if ((await bsv.txConfirmations(bsvLocked.bsvLockTxid)) >= confs) break
+            if ((await bsv.txConfirmations(bsvLocked.bsvLockTxid, deps.signal)) >= confs) break
             log('bsv', `waiting BSV lock conf ${i + 1}/${confs}…`)
-            await sleep(15_000)
+            await sleepWithinPreReveal(15_000)
           }
           
           //     above is a TRUSTED rail read; this replaces "the rail says N confs" with "a merkle path to a block header
@@ -637,7 +1023,8 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             const retryMs = cfg.lockProofRetryMs ?? 3_000
             let proven = false
             for (let i = 0; i < maxTries && !proven; i++) {
-              const beefTx = await bsv.fetchBeef(bsvLocked.bsvLockTxid).catch(() => null)
+              assertPreRevealCeiling()
+              const beefTx = await bsv.fetchBeef(bsvLocked.bsvLockTxid, deps.signal).catch(() => null)
               const mp = beefTx?.merklePath
               if (mp) {
                 // A valid path must be FOR this txid AND its root must sit under a header the ChainTracker accepts.
@@ -649,11 +1036,11 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
                   proven = true
                   log('bsv', `SPV ✅ lock ${bsvLocked.bsvLockTxid.slice(0, 12)}… merkle-proof VERIFIED vs ChainTracker (block ${mp.blockHeight})`)
                 } else if (i < maxTries - 1) {
-                  await sleep(retryMs)
+                  await sleepWithinPreReveal(retryMs)
                 }
               } else {
                 log('bsv', `waiting for the lock's merkle proof to be servable (${i + 1}/${maxTries})…`)
-                await sleep(retryMs)
+                await sleepWithinPreReveal(retryMs)
               }
             }
             if (!proven) throw new Error(`LEVER B #1: no servable merkle proof for the responder's BSV lock ${bsvLocked.bsvLockTxid} after ${maxTries} tries — refusing to reveal (fail-closed)`)
@@ -707,13 +1094,14 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             // is itself unconfirmed re-opens the inherited-ancestor RBF risk Boltz closes). chainTracker + fetchBeef are
             // guaranteed present (construction requires them when cap>0).
             for (let vin = 0; vin < lockTx.inputs.length; vin++) {
+              assertPreRevealCeiling()
               const parentTxid = lockTx.inputs[vin].sourceTXID
               if (!parentTxid) throw new Error(`LEVER B #2: lock ${bsvLocked.bsvLockTxid} input ${vin} has no sourceTXID — cannot prove it spends a confirmed coin; refusing to reveal`)
               const maxTries = cfg.lockProofMaxTries ?? 10
               const retryMs = cfg.lockProofRetryMs ?? 3_000
               let parentProven = false
               for (let i = 0; i < maxTries && !parentProven; i++) {
-                const parent: Transaction | null = await bsv.fetchBeef!(parentTxid).catch(() => null)
+                const parent: Transaction | null = await bsv.fetchBeef!(parentTxid, deps.signal).catch(() => null)
                 const pmp = parent?.merklePath
                 if (!parent || !pmp) throw new Error(`LEVER B #2: lock input ${vin} parent ${parentTxid} is not mined/servable (unconfirmed input) — refusing 0-conf reveal (Boltz confirmed-inputs)`)
                 if (parent.id('hex') !== parentTxid) throw new Error(`LEVER B #2: fetched parent ${parent.id('hex')} ≠ requested ${parentTxid} — refusing to attach a mismatched ancestor`)
@@ -723,7 +1111,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
                   lockTx.inputs[vin].sourceTransaction = parent // proven confirmed ancestry → completes the claim BEEF below
                   parentProven = true
                 } else if (i < maxTries - 1) {
-                  await sleep(retryMs)
+                  await sleepWithinPreReveal(retryMs)
                 }
               }
               if (!parentProven) throw new Error(`LEVER B #2: lock input ${vin} parent ${parentTxid} header source did not catch up after ${maxTries} tries — refusing 0-conf reveal`)
@@ -735,6 +1123,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           }
         }
         if (!useZeroConfFastPath) await confirmLockAndVerify()
+        activeLockObservation.assertNoConflict()
         const gate = session.guardInitiatorCanReveal(await revealHeight())
         if (!gate.ok) throw new Error(`reveal gate refused: ${gate.reason}`)
 
@@ -816,6 +1205,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         const preRevealSession = SettlementSession.fromRecord(session.toRecord())
         let revealSideAcquired = false
         for (let attempt = 1; attempt <= CLAIM_BROADCAST_ATTEMPTS; attempt++) {
+          if (durableClaimTxid === undefined) assertPreRevealCeiling()
           // HTLC-H1: retries/backoff can span new BSV blocks. The gate above protects entry into the reveal path, but
           // its height becomes stale while a broadcaster or /beef indexer is failing. Re-read the live height before
           // EVERY irreversible broadcast attempt and abort outside the retryable-error catch once the safety margin is
@@ -826,6 +1216,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           }
           await freshDsRecheckBeforeBroadcast() // OUTSIDE the try: a DS/visibility-loss throw ABORTS, never a retryable broadcast error
           let revealIntentFailure = false
+          let terminalPreRevealFailure = false
           try {
             if (useZeroConfFastPath) {
               // LEVER B #3/#2: the 0-conf lock is UNMINED — no merkle proof exists (fetchBeef is mined-only → 404).
@@ -836,7 +1227,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
               if (htlcInIdx >= 0) claimTx.inputs[htlcInIdx].sourceTransaction = lockTx
               claimAtomicBeefHex = Utils.toHex(claimTx.toAtomicBEEF())
             } else if (bsv.fetchBeef) {
-              const lockWithProof = await bsv.fetchBeef(bsvLocked.bsvLockTxid)
+              const lockWithProof = await bsv.fetchBeef(bsvLocked.bsvLockTxid, deps.signal)
               if (!lockWithProof || lockWithProof.id('hex') !== bsvLocked.bsvLockTxid) throw new Error(`lock merkle proof (BEEF) not yet servable for ${bsvLocked.bsvLockTxid}`)
               if (htlcInIdx >= 0) claimTx.inputs[htlcInIdx].sourceTransaction = lockWithProof
               claimAtomicBeefHex = Utils.toHex(claimTx.toAtomicBEEF())
@@ -859,9 +1250,50 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             // Shutdown stops a reveal until its write-ahead has been persisted; a claim already durable always finishes.
             // (An in-memory 'revealed' session whose persist threw is not durable, so it is still stoppable.)
             if (durableClaimTxid === undefined) deps.signal?.throwIfAborted()
+            // G2 + G1 at the last reversible boundary: refresh BOTH script histories with the same exact finder, then
+            // prove the exact Base tuple is still locked and below the negotiated responder-claim cutoff. A failed
+            // read waits one cycle and retries without writing `s`; an ambiguity/final outcome/cutoff ends pre-reveal.
+            try {
+              const current = session.toRecord()
+              if (current.claimPublicationRefused) {
+                throw new FirstPublicationTerminalError(`first publication was durably refused at ${current.claimPublicationRefused.atMs}: ${current.claimPublicationRefused.reason}`)
+              }
+              activeLockObservation.assertNoConflict()
+              // This ordered guard is the LAST awaited operation before the synchronous write-ahead + broadcast.
+              await requireFirstPublicationGuard(`final pre-reveal Base guard (${FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS}-block bounded-read margin)`, bsvLocked.bsvLockTxid, activeLockObservation)
+              activeLockObservation.assertNoConflict()
+              if (!deps.persist || !deps.readPersistedRecord) {
+                throw new FirstPublicationTerminalError('durable initiator record write/read wiring is unavailable at the write-ahead boundary; refusing first publication fail-closed')
+              }
+              let persisted: SettlementRecord | undefined
+              try { persisted = deps.readPersistedRecord(intent.hashHex) }
+              catch (error) {
+                throw new FirstPublicationTerminalError(`durable initiator record re-read failed at the write-ahead boundary; refusing first publication fail-closed: ${error instanceof Error ? error.message : String(error)}`)
+              }
+              if (!persisted) {
+                throw new FirstPublicationTerminalError('durable initiator record disappeared before the write-ahead; refusing first publication fail-closed')
+              }
+              if (persisted.claimPublicationRefused) {
+                throw new FirstPublicationTerminalError(`first publication was durably refused at ${persisted.claimPublicationRefused.atMs}: ${persisted.claimPublicationRefused.reason}`)
+              }
+              if (durableClaimTxid === undefined) {
+                activeLockObservation.finish()
+                lockObservation = undefined
+              }
+            } catch (error) {
+              terminalPreRevealFailure = error instanceof FirstPublicationTerminalError
+              if (terminalPreRevealFailure && durableClaimTxid !== undefined && session.state === 'revealed' && !session.toRecord().claimPublicationRefused) {
+                const reason = error instanceof Error ? error.message : String(error)
+                session.recordClaimPublicationRefused(nowMs(), reason)
+                deps.persist?.(session.toRecord())
+              }
+              throw error
+            }
             // WRITE-AHEAD: the exact raw claim (and BEEF when available), its deterministic txid, and `revealed`
             // state are durable before bytes leave this process. A crash or ambiguous broadcaster response can only
             // resume the BSV-claim path; it can never resurrect the Base-refund path.
+            
+            // failover daemon latched refusal; that daemon never first-publishes or writes the latch.
             if (session.state !== 'revealed') {
               session.recordSettlementModeUsed(useZeroConfFastPath ? 'fast' : 'confirmed', settlementModeDowngradeReason)
               session.observeReveal(Utils.toHex(secret), now())
@@ -879,11 +1311,13 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           } catch (e) {
             if (durableClaimTxid === undefined) deps.signal?.throwIfAborted()
             if (revealIntentFailure) throw e
+            if (terminalPreRevealFailure) throw e
             const landed = await bsv.fetchTx(claimTxid).catch(() => null)
             if (landed) { bsvClaimTxid = claimTxid; log('bsv', `claim ${claimTxid.slice(0, 12)}… already on-chain — treating as accepted`); break }
             if (attempt >= CLAIM_BROADCAST_ATTEMPTS) throw e
             log('bsv', `claim broadcast attempt ${attempt}/${CLAIM_BROADCAST_ATTEMPTS} failed (${e instanceof Error ? e.message : String(e)}) — retrying in ${Math.round(CLAIM_BROADCAST_BACKOFF_MS / 1000)}s (SPV BEEF; /beef proof may still be indexing)`)
-            await sleep(CLAIM_BROADCAST_BACKOFF_MS)
+            // Once the exact claim is durable, lifecycle cancellation must not strand a committed disclosure.
+            await sleep(CLAIM_BROADCAST_BACKOFF_MS, durableClaimTxid === undefined ? deps.signal : undefined)
           }
         }
         if (bsvClaimTxid === undefined) throw new Error('bsv claim broadcast failed after all retries (SPV BEEF path)')
@@ -983,6 +1417,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         log('done', `BSV CLAIMED ${bsvClaimTxid.slice(0, 12)}… — s revealed on-chain, swap settled ✅`)
         return { ok: true, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: useZeroConfFastPath ? 'fast' as const : 'confirmed' as const, settlementModeDowngradeReason } : {}) }
       } catch (e) {
+        lockObservation?.finish()
         // Before write-ahead, failure remains Base-refund eligible. At/after write-ahead the exact claim may have
         // escaped even when every broadcaster response was an error, so return its id and keep claim recovery alive.
         return { ok: false, baseLockTxid, bsvClaimTxid: durableClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: durableClaimTxid ? undefined : 'not_revealed' as const } : {}), reason: e instanceof Error ? e.message : String(e) }

@@ -3,10 +3,11 @@ import {
   openSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync,
 } from 'fs'
 import { dirname, join } from 'path'
-import type { SettlementRecord } from '../bridge/settlement-session'
+import { validateSettlementRecord, type SettlementRecord } from '../bridge/settlement-session'
 import { MAX_SETTLEMENT_RECORD_BYTES, readSettlementRecordFile, writeSettlementRecordAtomically } from '../bridge/atomic-record-write'
 import type { SwapRecordSink } from '../bridge/settlement-types'
 import { adoptQuarantinedSwapRecords, QUARANTINED_RECORD_NAME, SWAP_CLEAR_QUARANTINE_PREFIX } from './swap-record-quarantine'
+import { preserveInitiatorRecoveryEvidence } from '../bridge/watchtower-record-persistence'
 
 export interface SwapRecordDirs {
   coord: string
@@ -54,6 +55,8 @@ export interface SwapRecordCensusReadOptions {
   onRecord?: (record: SettlementRecord, path: string, source: string) => void
   /** Balance-census only: include compare-and-clear quarantine evidence without adopting or deleting it. */
   includeQuarantine?: boolean
+  /** Status-only strict census: apply the canonical SettlementRecord validator before exposing any field. */
+  validateRecords?: boolean
 }
 
 export function readFileSwapRecordsForCensus(dir: string, opts: SwapRecordCensusReadOptions = {}): SettlementRecord[] {
@@ -70,6 +73,7 @@ export function readFileSwapRecordsForCensus(dir: string, opts: SwapRecordCensus
     try {
       const source = readSettlementRecordFile(path)
       const record = JSON.parse(source) as SettlementRecord & { censusNeedsAttention?: true }
+      if (opts.validateRecords) validateSettlementRecord(record)
       if (path.includes(`${SWAP_CLEAR_QUARANTINE_PREFIX}`)) record.censusNeedsAttention = true
       records.push(record)
       opts.onRecord?.(record, path, source)
@@ -185,6 +189,13 @@ export function makeFileSwapRecordStore(dir: string, opts: FileSwapRecordStoreOp
   }
 
   return {
+    read(swapId: string): SettlementRecord | undefined {
+      const path = fileFor(swapId)
+      if (!existsSync(path)) return undefined
+      const record = JSON.parse(readSettlementRecordFile(path)) as SettlementRecord
+      validateSettlementRecord(record)
+      return record
+    },
     write(record: SettlementRecord): void {
       const path = fileFor(record.hashHex)
       // COLLISION GUARD (re-battery MED): swapId is the taker-chosen hashlock H; two live swaps can share H. If a record
@@ -195,6 +206,25 @@ export function makeFileSwapRecordStore(dir: string, opts: FileSwapRecordStoreOp
         // An unreadable, symlinked, oversized, or non-regular prior record is not permission to overwrite recovery
         // state. Throw before the new lock can be broadcast; an operator must resolve the ambiguous durable state.
         const existing = JSON.parse(readSettlementRecordFile(path)) as SettlementRecord
+        record = preserveInitiatorRecoveryEvidence(existing, record)
+        if (existing.neverLock) {
+          if (fullToken(existing) !== fullToken(record)) {
+            throw new Error(`swap-record: swapId ${record.hashHex.slice(0, 12)}… is durably tombstoned; refusing any non-identical replacement`)
+          }
+          return
+        }
+        if (record.neverLock && (!existing.restockPreSignSessionId ||
+            existing.restockPreSignSessionId !== record.restockPreSignSessionId)) {
+          throw new Error(`swap-record: swapId ${record.hashHex.slice(0, 12)}… tombstone does not own the existing pre-sign evidence; refusing replacement`)
+        }
+        if (record.restockPreSignSessionId && existing.restockPreSignSessionId !== record.restockPreSignSessionId) {
+          throw new Error(`swap-record: swapId ${record.hashHex.slice(0, 12)}… belongs to another durable pre-sign session; refusing replacement`)
+        }
+        for (const field of ['bsvLockIntentTxid', 'bsvLockOutpoint', 'bsvRefundTxHex'] as const) {
+          if (existing[field] && !record[field]) {
+            throw new Error(`swap-record: swapId ${record.hashHex.slice(0, 12)}… replacement would erase ${field}; refusing replacement`)
+          }
+        }
         if (existing?.bsvLockOutpoint && record.bsvLockOutpoint && existing.bsvLockOutpoint !== record.bsvLockOutpoint) {
           throw new Error(`swap-record: swapId ${record.hashHex.slice(0, 12)}… already has a live lock (${existing.bsvLockOutpoint.slice(0, 20)}…) ≠ this one (${record.bsvLockOutpoint.slice(0, 20)}…) — a reused hashlock; refusing to overwrite (fail-closed, no strand)`)
         }
@@ -202,6 +232,7 @@ export function makeFileSwapRecordStore(dir: string, opts: FileSwapRecordStoreOp
 
       // umask-masked, so chmod explicitly to guarantee group-read; best-effort so a perm failure never aborts this
       // fail-closed money write (the owner/watchtower still reads it for recovery regardless of group bits).
+      // standalone failover daemon therefore never first-publishes or writes that latch.
       writeSettlementRecordAtomically(path, JSON.stringify(record), opts.recordMode ?? 0o640, MAX_SETTLEMENT_RECORD_BYTES) // atomic replace — a crash mid-write leaves the prior record (or none) intact
     },
     clear(swapId: string, expected?: SettlementRecord): void {

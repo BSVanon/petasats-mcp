@@ -1,6 +1,10 @@
 import type { CommsLayer, PeerMessage } from '@bsv/sdk'
 /** Default box namespace prefix. Both peers must use the same one (they do, by sharing this default). */
 export const DEFAULT_BOX_PREFIX = 'petasats:swap'
+/** Existing receive cadence, named so timing budgets can audit callers without changing it. */
+export const DEFAULT_MESSAGEBOX_POLL_MS = 2_000
+/** Existing per-message receive horizon, named so timing budgets can audit callers without changing it. */
+export const DEFAULT_MESSAGEBOX_TIMEOUT_MS = 20 * 60_000
 export interface MessageBoxChannelOpts {
   /** The BRC-100 messagebox client, authenticated AS this party (MessageBoxClient in prod; a fake in tests). */
   comms: CommsLayer
@@ -50,8 +54,8 @@ export function makeMessageBoxChannel(opts: MessageBoxChannelOpts): MessageBoxCh
     throw new Error(`messagebox-channel: namespace must be alphanumeric/-/_ ≤64 (got '${namespace}') — it becomes a box name component`)
   }
   const boxPrefix = opts.boxPrefix ?? DEFAULT_BOX_PREFIX
-  const pollMs = opts.pollMs ?? 2000
-  const timeoutMs = opts.timeoutMs ?? 20 * 60_000
+  const pollMs = opts.pollMs ?? DEFAULT_MESSAGEBOX_POLL_MS
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_MESSAGEBOX_TIMEOUT_MS
   const maxPerPoll = opts.maxPerPoll ?? DEFAULT_CHANNEL_MAX_PER_POLL
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_CHANNEL_MAX_BODY_BYTES
   if (!Number.isInteger(maxPerPoll) || maxPerPoll < 1) throw new Error('messagebox-channel: maxPerPoll must be a positive integer')

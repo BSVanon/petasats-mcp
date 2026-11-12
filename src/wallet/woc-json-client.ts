@@ -1,6 +1,8 @@
 /**
  * Fail-closed WhatsOnChain JSON GET client. Endpoint callers retain responsibility for validating successful bodies.
  */
+import { abortableSleep, withRequestTimeout } from './abortable-request'
+
 export interface WocJsonClientOpts {
   /** OPTIONAL WhatsOnChain API key, sent as the `woc-api-key` header. */
   apiKey?: string
@@ -19,7 +21,7 @@ export interface WocJsonClientOpts {
   /** Optional mutable retry-wait budget, shareable by several getters. */
   retryBudget?: { remainingMs: number }
   /** Injectable sleep; production uses `setTimeout`. */
-  sleep?: (ms: number) => Promise<void>
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 export interface WocJsonRequestOpts {
@@ -27,6 +29,8 @@ export interface WocJsonRequestOpts {
   nullOn404?: boolean
   /** Require this exact successful status; other 2xx replies are fail-closed errors. */
   requiredStatus?: number
+  /** Lifecycle cancellation, composed with the client's per-request timeout and retry sleeps. */
+  signal?: AbortSignal
 }
 
 export interface WocJsonGetter {
@@ -66,22 +70,22 @@ export const makeWocJsonGetter = (opts: WocJsonClientOpts): WocJsonGetter => {
   const maxBackoffMs = opts.maxBackoffMs
   const maxRetryAfterMs = opts.maxRetryAfterMs ?? 0
   const retryBudget = opts.retryBudget
-  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const sleep = opts.sleep ?? abortableSleep
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (opts.apiKey && opts.apiKey.trim() !== '') headers['woc-api-key'] = opts.apiKey.trim()
 
   return async (url: string, requestOpts: WocJsonRequestOpts = {}): Promise<unknown | null> => {
+    requestOpts.signal?.throwIfAborted()
     let lastError: unknown
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         let response: Response
         try {
-          response = await fetchImpl(url, {
-            method: 'GET',
-            headers,
-            signal: AbortSignal.timeout(timeoutMs),
-          })
+          response = await withRequestTimeout(timeoutMs, requestOpts.signal, (signal) => fetchImpl(url, {
+            method: 'GET', headers, signal,
+          }))
         } catch (error) {
+          if (requestOpts.signal?.aborted) requestOpts.signal.throwIfAborted()
           throw new RetryableWocError(`WoC fetch failed: ${error instanceof Error ? error.message : String(error)}`)
         }
 
@@ -106,7 +110,7 @@ export const makeWocJsonGetter = (opts: WocJsonClientOpts): WocJsonGetter => {
             : Math.min(Math.max(cappedBackoffMs, error.retryAfterMs), maxRetryAfterMs)
           if (retryBudget !== undefined && retryBudget.remainingMs <= 0) throw error
           const waitedMs = retryBudget === undefined ? delayMs : Math.min(delayMs, retryBudget.remainingMs)
-          await sleep(waitedMs)
+          await sleep(waitedMs, requestOpts.signal)
           if (retryBudget !== undefined) retryBudget.remainingMs -= waitedMs
           continue
         }

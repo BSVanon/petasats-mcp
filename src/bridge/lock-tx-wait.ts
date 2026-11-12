@@ -5,14 +5,14 @@ const SLOW_PROGRESS_INTERVAL_MS = 10 * 60_000
 
 export interface WaitForLockTxOptions {
   txid: string
-  fetchTx: (txid: string) => Promise<Transaction | null>
+  fetchTx: (txid: string, signal?: AbortSignal) => Promise<Transaction | null>
   fastMaxTries: number
   fastRetryMs: number
   untilRevealRunway: boolean
   slowRetryMs: number
   maxWaitMs: number
   bsvRefundLocktime: number
-  revealHeight: (maxRetryWaitMs?: number) => Promise<number>
+  revealHeight: (maxRetryWaitMs?: number, signal?: AbortSignal) => Promise<number>
   nowMs: () => number
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>
   log: (message: string) => void
@@ -92,13 +92,13 @@ export async function waitForLockTx(opts: WaitForLockTxOptions): Promise<Transac
     `responder's BSV lock tx ${opts.txid} not found on-chain after ${tries} tries${lastFetchError ? ` (last error: ${lastFetchError})` : ''} — refusing to reveal`
   const fetchLegacy = async (): Promise<Transaction | null> => {
     attempts += 1
-    return opts.fetchTx(opts.txid).catch((error: unknown) => {
+    return opts.fetchTx(opts.txid, opts.signal).catch((error: unknown) => {
       lastFetchError = error instanceof Error ? error.message : String(error)
       return null
     })
   }
   const fetchBounded = async (): Promise<Transaction | null> => {
-    const result = await boundedRead(() => { attempts += 1; return opts.fetchTx(opts.txid) })
+    const result = await boundedRead((_remaining, signal) => { attempts += 1; return opts.fetchTx(opts.txid, signal) })
     throwIfAborted()
     if (result.kind === 'deadline') { ceiling(); return null }
     if (result.kind === 'error') {
@@ -147,7 +147,7 @@ export async function waitForLockTx(opts: WaitForLockTxOptions): Promise<Transac
 
   let lastProgressAt = Number.NEGATIVE_INFINITY
   const runwayIsOpen = async (): Promise<boolean> => {
-    const result = await boundedRead((remaining) => opts.revealHeight(remaining))
+    const result = await boundedRead((remaining, signal) => opts.revealHeight(remaining, signal))
     throwIfAborted()
     if (result.kind === 'deadline') { ceiling(); return false }
     const height = result.kind === 'value' ? result.value : undefined

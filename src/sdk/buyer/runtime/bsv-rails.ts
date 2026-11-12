@@ -9,6 +9,9 @@ import { broadcast, clearTaalApiKey, getMultiArcTxStatuses, getTxStatus, setAnvi
 import { fetchBeefForTxid, fetchTxHexForTxid } from '../../../wallet/fetch-beef'
 import { makeMultiSourceUnspentFetcher } from '../../../wallet/address-utxo-sources'
 import type { WocUtxo } from '../../../wallet/reserve-basket-sweep'
+import { makeWocScriptHashFetcher } from '../../../wallet/script-utxo-source'
+import { makeWocScriptHistoryReader } from '../../../bridge/bsv-script-history'
+import { makeBsvLockByScriptFinder } from '../../../bridge/bsv-lock-discovery'
 
 export interface BuyerBsvRailsOptions {
   /** Optional public Anvil endpoint. No bearer token is accepted by this API. */
@@ -27,7 +30,7 @@ export interface BuyerStrictRecoveryBsvReads {
   fetchBeefStrict(txid: string): Promise<Transaction | null>
   resolveSpenderStrict(txid: string, vout: number): Promise<string | null>
 }
-export type BuyerBsvRails = Pick<BridgeInitiatorBsvRails, 'broadcast' | 'chainHeight' | 'readBsvHeight' | 'txConfirmations' | 'fetchTx' | 'fetchLockTx' | 'fetchBeef'> &
+export type BuyerBsvRails = Pick<BridgeInitiatorBsvRails, 'broadcast' | 'chainHeight' | 'readBsvHeight' | 'txConfirmations' | 'fetchTx' | 'fetchLockTx' | 'findLockTxByScript' | 'fetchBeef'> &
   Pick<RecoveryBsvRails, 'resolveSpender'> & BuyerStrictRecoveryBsvReads &
   { chainTracker: ChainTracker; zeroConfStatus: typeof getTxStatus; zeroConfArcStatuses: typeof getMultiArcTxStatuses; unspentFor(address: string): Promise<BuyerUnspent[]> }
 
@@ -71,6 +74,23 @@ export function makeBuyerBsvRails(opts: BuyerBsvRailsOptions = {}): BuyerBsvRail
       throw new Error(`buyer BSV chain read unavailable: ${sourceErrors.join('; ')}`)
     }
   }
+  const fetchLockTx = async (txid: string, signal?: AbortSignal): Promise<Transaction | null> => {
+    signal?.throwIfAborted()
+    try {
+      const tx = (await fetchBeefForTxid(txid, { ...rawOptions, acceptUnprovenAnvilBeef: true, signal })).findAtomicTransaction(txid) ?? null
+      signal?.throwIfAborted()
+      return tx?.id('hex') === txid ? tx : null
+    } catch (error) {
+      if (signal?.aborted) signal.throwIfAborted()
+      return null
+    }
+  }
+  const findLockTxByScript = makeBsvLockByScriptFinder({
+    // One cycle is one physical script-index request; the 30-second executor cadence owns retries.
+    readScriptUnspent: makeWocScriptHashFetcher({ chain: 'main', fetchImpl, timeoutMs, maxAttempts: 1 }),
+    readScriptHistory: makeWocScriptHistoryReader({ chain: 'main', fetchImpl, timeoutMs, maxAttempts: 1 }),
+    fetchTx: fetchLockTx,
+  })
   return {
     chainTracker,
     zeroConfStatus: getTxStatus,
@@ -81,30 +101,26 @@ export function makeBuyerBsvRails(opts: BuyerBsvRailsOptions = {}): BuyerBsvRail
       await broadcast(rawTx, atomicBeefHex, { taalApiKey: null, anvilNodeUrl: anvilBaseUrl, anvilAuthToken: null, arcAtomicBeefAsBeef: true })
       return Transaction.fromHex(rawTx).id('hex') as string
     },
-    chainHeight: (): Promise<number> => heights.readBsvHeight('risk'),
-    readBsvHeight: (purpose): Promise<number> => heights.readBsvHeight(purpose),
-    txConfirmations: async (txid: string): Promise<number> => {
+    chainHeight: (signal?: AbortSignal): Promise<number> => heights.readBsvHeight('risk', signal),
+    readBsvHeight: (purpose, signal): Promise<number> => heights.readBsvHeight(purpose, signal),
+    txConfirmations: async (txid: string, signal?: AbortSignal): Promise<number> => {
       try {
-        const beef = await fetchBeefForTxid(txid, proofOptions)
+        const beef = await fetchBeefForTxid(txid, { ...proofOptions, signal })
         const tx = beef.findAtomicTransaction(txid)
         const h = tx?.merklePath?.blockHeight
         if (typeof h !== 'number' || !Number.isSafeInteger(h) || h <= 0) return 0
-        const tip = await heights.readBsvHeight('finality')
+        const tip = await heights.readBsvHeight('finality', signal)
         const confirmations = tip - h + 1
         return Number.isSafeInteger(confirmations) && confirmations > 0 ? confirmations : 0
       } catch { return 0 }
     },
-    fetchTx: async (txid: string): Promise<Transaction | null> => {
-      try { return Transaction.fromHex(await fetchTxHexForTxid(txid, rawOptions)) } catch { return null }
+    fetchTx: async (txid: string, signal?: AbortSignal): Promise<Transaction | null> => {
+      try { return Transaction.fromHex(await fetchTxHexForTxid(txid, { ...rawOptions, signal })) } catch (error) { if (signal?.aborted) signal.throwIfAborted(); return null }
     },
-    fetchLockTx: async (txid: string): Promise<Transaction | null> => {
-      try {
-        const tx = (await fetchBeefForTxid(txid, { ...rawOptions, acceptUnprovenAnvilBeef: true })).findAtomicTransaction(txid) ?? null
-        return tx?.id('hex') === txid ? tx : null
-      } catch { return null }
-    },
-    fetchBeef: async (txid: string): Promise<Transaction | null> => {
-      try { return (await fetchBeefForTxid(txid, proofOptions)).findAtomicTransaction(txid) ?? null } catch { return null }
+    fetchLockTx,
+    findLockTxByScript,
+    fetchBeef: async (txid: string, signal?: AbortSignal): Promise<Transaction | null> => {
+      try { return (await fetchBeefForTxid(txid, { ...proofOptions, signal })).findAtomicTransaction(txid) ?? null } catch (error) { if (signal?.aborted) signal.throwIfAborted(); return null }
     },
     // WoC is the established exact-outpoint reader. A 404 and a read failure
     // are both non-terminal for the live executor, so both conservatively produce null.

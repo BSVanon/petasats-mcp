@@ -19,6 +19,8 @@
  * `ChaintracksChainTracker` wraps either — this is the testnet half of that environment swap (doc 20 §B).
  */
 
+import { withRequestTimeout } from './abortable-request'
+
 /** The BlockHeader shape the toolbox expects (`sdk/WalletServices.interfaces` — not root-exported, mirrored here).
  *  `ChaintracksChainTracker` reads only `.merkleRoot`; the rest are populated for any other reader. */
 interface ToolboxBlockHeader {
@@ -54,10 +56,10 @@ export interface WocChaintracksDeps {
 }
 
 export interface WocChaintracks {
-  getPresentHeight(): Promise<number>
+  getPresentHeight(signal?: AbortSignal): Promise<number>
   findHeaderForHeight(height: number): Promise<ToolboxBlockHeader | undefined>
   findHeaderForBlockHash(hash: string): Promise<ToolboxBlockHeader>
-  currentHeight(): Promise<number>
+  currentHeight(signal?: AbortSignal): Promise<number>
   isValidRootForHeight(root: string, height: number): Promise<boolean>
 }
 
@@ -73,15 +75,16 @@ export function makeWocChaintracks(chain: 'test' | 'main', deps: WocChaintracksD
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (deps.apiKey && deps.apiKey.trim() !== '') headers['woc-api-key'] = deps.apiKey
 
-  const get = (path: string): Promise<Response> =>
-    fetchImpl(`${base}${path}`, { method: 'GET', headers, signal: AbortSignal.timeout(timeoutMs) })
+  const get = (path: string, signal?: AbortSignal): Promise<Response> =>
+    withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(`${base}${path}`, { method: 'GET', headers, signal: requestSignal }))
 
   // Tip height — mirrors @bsv/sdk WhatsOnChain.currentHeight (`/block/headers` → data[0].height).
-  const getPresentHeight = async (): Promise<number> => {
+  const getPresentHeight = async (signal?: AbortSignal): Promise<number> => {
     let res: Response
     try {
-      res = await get('/block/headers')
+      res = await get('/block/headers', signal)
     } catch (e) {
+      if (signal?.aborted) signal.throwIfAborted()
       throw new Error(`woc-chaintracks getPresentHeight fetch failed (fail-closed): ${e instanceof Error ? e.message : String(e)}`)
     }
     if (!res.ok) throw new Error(`woc-chaintracks getPresentHeight HTTP ${res.status}`)

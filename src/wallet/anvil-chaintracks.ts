@@ -1,3 +1,4 @@
+import { withRequestTimeout } from './abortable-request'
 interface ToolboxBlockHeader {
   version: number
   previousHash: string
@@ -22,10 +23,10 @@ export interface AnvilChaintracksDeps {
 }
 
 export interface AnvilChaintracks {
-  getPresentHeight(): Promise<number>
+  getPresentHeight(signal?: AbortSignal): Promise<number>
   findHeaderForHeight(height: number): Promise<ToolboxBlockHeader | undefined>
   findHeaderForBlockHash(hash: string): Promise<ToolboxBlockHeader>
-  currentHeight(): Promise<number>
+  currentHeight(signal?: AbortSignal): Promise<number>
   isValidRootForHeight(root: string, height: number): Promise<boolean>
 }
 
@@ -41,11 +42,12 @@ export function makeAnvilChaintracks(baseUrl: string, deps: AnvilChaintracksDeps
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (deps.authToken && deps.authToken.trim() !== '') headers.Authorization = `Bearer ${deps.authToken}`
 
-  async function getValue<T>(path: string, what: string): Promise<T> {
+  async function getValue<T>(path: string, what: string, signal?: AbortSignal): Promise<T> {
     let res: Response
     try {
-      res = await fetchImpl(`${base}${path}`, { method: 'GET', headers, signal: AbortSignal.timeout(timeoutMs) })
+      res = await withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(`${base}${path}`, { method: 'GET', headers, signal: requestSignal }))
     } catch (e) {
+      if (signal?.aborted) signal.throwIfAborted()
       throw new Error(`anvil-chaintracks ${what} fetch failed (fail-closed): ${e instanceof Error ? e.message : String(e)}`)
     }
     if (!res.ok) throw new Error(`anvil-chaintracks ${what} HTTP ${res.status}`)
@@ -55,8 +57,8 @@ export function makeAnvilChaintracks(baseUrl: string, deps: AnvilChaintracksDeps
     return body.value
   }
 
-  const getPresentHeight = async (): Promise<number> => {
-    const h = Number(await getValue<number>('/getPresentHeight', 'getPresentHeight'))
+  const getPresentHeight = async (signal?: AbortSignal): Promise<number> => {
+    const h = Number(await getValue<number>('/getPresentHeight', 'getPresentHeight', signal))
     if (!Number.isInteger(h) || h <= 0) throw new Error(`anvil-chaintracks getPresentHeight: bad height ${h}`)
     return h
   }

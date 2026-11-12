@@ -1,5 +1,8 @@
 import type { ChainTracker, Transaction } from '@bsv/sdk'
 
+/** Six BSV blocks (~1 hour) is the non-lowerable recovery burial floor. */
+export const DEFAULT_BSV_FINALITY_CONFIRMATIONS = 6
+
 /** Header-validated evidence that a particular BSV transaction was mined. */
 export interface BsvClaimProof { height: number; root?: string }
 

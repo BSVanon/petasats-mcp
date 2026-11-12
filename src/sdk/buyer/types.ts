@@ -2,7 +2,7 @@ import type { ConvertRequest, PetaSats, Quote, SwapResult } from '../convert'
 import type { SettlementState } from '../../bridge/settlement-session'
 import type { Transaction } from '@bsv/sdk'
 
-export const COOPERATIVE_REFUND_REASON = "The market maker declined; USDC came back through the cooperative refund."
+export { COOPERATIVE_REFUND_REASON } from '../../bridge/initiator-outcomes'
 
 export type SettlementSpeed = 'standard' | 'fast'
 export type SettlementMode = 'confirmed' | 'fast'

@@ -6,14 +6,40 @@ import { SettlementSession, type SettlementRecord, type SettlementState } from '
 import type { RecoveryClaimEvm } from './watchtower-adapters'
 import type { Erc20SwapEvmClient } from './evm/client'
 import { watchtowerRecordKey } from './watchtower-record-identity'
-import { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
+import { assertInitiatorRefundSafeOnBsv, type InitiatorRefundSafetyBsvRails } from './initiator-refund-safety'
 import type { BsvHeightPurpose } from '../wallet/bsv-height'
 import { proveBsvClaim } from './bsv-claim-proof'
+import { FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS, guardFirstClaimPublication } from './first-publication-guard'
 export { assertInitiatorRefundSafeOnBsv } from './initiator-refund-safety'
 /** The initiator watchtower's progress line; the default emitter writes it unchanged to stderr. */
 export const formatInitiatorWatchtowerProgress = (s: WatchtowerStatus): string =>
   `  [wt] ${s.action} · ${s.note}${s.gate ? ` (${s.gate.chain} gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`
 const emitInitiatorWatchtowerProgress = (s: WatchtowerStatus): void => console.error(formatInitiatorWatchtowerProgress(s))
+
+export function makeQuietWatchtowerProgressEmitter(
+  log: (message: string) => void,
+  heartbeatSeconds = 10 * 60,
+): (status: WatchtowerStatus) => void {
+  let prior: WatchtowerStatus | undefined
+  let lastEmittedAt = Number.NEGATIVE_INFINITY
+  const emitLine = (status: WatchtowerStatus): void => {
+    try { log(formatInitiatorWatchtowerProgress(status)) } catch { /* recovery never depends on telemetry */ }
+  }
+  return (status): void => {
+    if (!prior) {
+      prior = status
+      lastEmittedAt = status.at
+      if (status.action !== 'wait' && status.action !== 'idle') emitLine(status)
+      return
+    }
+    const changed = status.state !== prior.state || status.action !== prior.action || status.refundTxid !== prior.refundTxid
+    const heartbeat = status.at - lastEmittedAt >= heartbeatSeconds
+    prior = status
+    if (!changed && !heartbeat) return
+    emitLine(status)
+    lastEmittedAt = status.at
+  }
+}
 
 export interface RecoveryBsvRails {
   chainHeight: () => Promise<number>
@@ -24,12 +50,15 @@ export interface RecoveryBsvRails {
   txConfirmations: (txid: string) => Promise<number>
   resolveSpender: (txid: string, vout: number) => Promise<string | null>
   fetchTx: (txid: string) => Promise<Transaction | null>
+  /** Forced all-history exact-script finder used before a private write-ahead claim may be published. */
+  findLockTxByScript?: (lockingScriptHex: string, expectedSatoshis: number, signal?: AbortSignal, opts?: { forceHistory?: boolean }) => Promise<Transaction | null>
   /** Confirmed + mempool history for a record-derived exact locking script. Required only for pre-marker records
    * whose BSV lock outpoint was never persisted. */
   readScriptHistory?: (lockingScriptHex: string) => Promise<string[]>
   /** Corroborated, reorg-aware header root of trust used before any BSV terminal state. */
   chainTracker?: ChainTracker
 }
+
 function recoveryHeight(rails: RecoveryBsvRails): Promise<number> {
   return rails.readBsvHeight ? rails.readBsvHeight('recovery') : rails.chainHeight()
 }
@@ -56,6 +85,18 @@ export function makeValidatedBsvFinality(rails: RecoveryBsvRails): ((txid: strin
   }
 }
 
+/** Reuse the same header-validated proof rail for covenant-refund evidence and every Base-refund send proof. */
+function makeInitiatorRefundSafetyRails(rails: RecoveryBsvRails | undefined): InitiatorRefundSafetyBsvRails | undefined {
+  if (!rails) return undefined
+  const proveFinality = makeValidatedBsvFinality(rails)
+  return {
+    resolveSpender: rails.resolveSpender,
+    fetchTx: rails.fetchTx,
+    ...(rails.readScriptHistory ? { readScriptHistory: rails.readScriptHistory } : {}),
+    ...(proveFinality ? { proveFinality } : {}),
+  }
+}
+
 /** BR-H3: compose the BSV-only recovery used after an initiator has revealed `s`. The persisted claim is kept alive
  * until a header-validated burial; this route deliberately has no EVM/refund capability. */
 export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts: {
@@ -65,12 +106,16 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
   maxPolls?: number
   refundConfs?: number
   bsvRails: RecoveryBsvRails
+  /** Keyless Base reads for the ordered first-publication guard. Missing remains replay-capable but publication-closed. */
+  evm?: Pick<Erc20SwapEvmClient, 'currentBlockNumber' | 'isSwapLocked'>
   beforeSend?: () => void | Promise<void>
   strictPersistedRecordTrust?: boolean
   emitProgress?: (s: WatchtowerStatus) => void
+  now?: () => number
+  firstClaimPublication?: 'disabled'
 }): WatchtowerDeps {
   const { bsvRails } = opts
-  return makeBsvWatchtowerDeps(session, {
+  const deps = makeBsvWatchtowerDeps(session, {
     persistPath: opts.persistPath,
     dry: opts.dry,
     pollMs: opts.pollMs,
@@ -88,7 +133,17 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
     beforeSend: opts.beforeSend,
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
     emit: opts.emitProgress ?? emitInitiatorWatchtowerProgress,
+    now: opts.now,
   })
+  if (opts.firstClaimPublication !== 'disabled') {
+    deps.firstPublicationGuard = (record) => guardFirstClaimPublication(record, {
+      findLockTxByScript: bsvRails.findLockTxByScript,
+      isSwapLocked: opts.evm && ((params) => opts.evm!.isSwapLocked(params)),
+      currentBaseHeight: opts.evm && (() => opts.evm!.currentBlockNumber()),
+      currentBsvHeight: () => recoveryHeight(bsvRails),
+    }, `recovery first-publication Base guard (${FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS}-block bounded-read margin)`)
+  }
+  return deps
 }
 
 export interface SuperviseRecoveryOpts {
@@ -127,6 +182,35 @@ export interface SuperviseRecoveryOpts {
 
 const isTerminal = (s: SettlementState): boolean => s === 'refunded' || s === 'settled' || s === 'aborted'
 const eqAddr = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase()
+
+export function makeOncePerHashlockTerminalObserver(
+  effect: (record: SettlementRecord) => void,
+  log: (message: string) => void = () => {},
+): (record: SettlementRecord) => void {
+  const observed = new Set<string>()
+  return (record) => {
+    const hashHex = record.hashHex.toLowerCase()
+    if (observed.has(hashHex)) return
+    observed.add(hashHex)
+    try { effect(record) }
+    catch (error) {
+      log(`terminal recovery side effect failed for ${hashHex.slice(0, 12)}… (contained): ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+}
+
+function notifyTerminalOutcome(
+  observer: ((record: SettlementRecord) => void) | undefined,
+  record: SettlementRecord,
+  log: (message: string) => void,
+): void {
+  if (record.state !== 'settled' && record.state !== 'refunded') return
+  try { observer?.(record) }
+  catch (error) {
+    // Supervisors must never turn an ancillary hedge/telemetry fault into a recovery failure or a kept-but-idle record.
+    log(`terminal recovery observer failed for ${record.hashHex.slice(0, 12)}… (contained): ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
 
 /**
  * Arm an in-process RESPONDER recovery for one live-lock record, in the BACKGROUND. Returns immediately; the recovery
@@ -169,6 +253,7 @@ export function superviseBsvResponderRecovery(opts: SuperviseRecoveryOpts): void
     evm,
     beforeSend: opts.beforeSend,
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
+    emit: makeQuietWatchtowerProgressEmitter(log),
   })
   const persist = deps.persist
   deps.persist = async (record): Promise<void> => {
@@ -229,6 +314,11 @@ export function makeRecoverySupervisor(base: Omit<SuperviseRecoveryOpts, 'sessio
   recordPathFor: (swapId: string, record?: SettlementRecord) => string
   /** Resolve an optional late-installed capability only when a fresh run is armed. */
   evmProvider?: () => RecoveryClaimEvm | undefined
+  /** A terminal record may carry authority needed by a follow-on recovery action and therefore stay durable. */
+  retainTerminal?: (record: SettlementRecord) => boolean
+  onRetainedTerminal?: (record: SettlementRecord) => void
+  
+  onTerminalOutcome?: (record: SettlementRecord) => void
 }): RecoverySupervisor {
   const armed = new Map<string, ArmedRecovery>()
   const cancelTarget = (swap: string | SettlementRecord, reason = 'cancelled'): void => {
@@ -259,6 +349,11 @@ export function makeRecoverySupervisor(base: Omit<SuperviseRecoveryOpts, 'sessio
         const key = watchtowerRecordKey(rec)
         const current = armed.get(key)
         cancelRecord(rec, `fresh record is terminal (${rec.state})`)
+        notifyTerminalOutcome(base.onTerminalOutcome, rec, base.log)
+        if (base.retainTerminal?.(rec)) {
+          base.onRetainedTerminal?.(rec)
+          continue
+        }
         if (!current?.terminalClearAttempted) {
           if (current) current.terminalClearAttempted = true
           base.clearRecord(rec.hashHex, rec)
@@ -291,7 +386,9 @@ export function makeRecoverySupervisor(base: Omit<SuperviseRecoveryOpts, 'sessio
         onTerminal: (final) => {
           if (run.terminalClearAttempted) return
           run.terminalClearAttempted = true
-          base.clearRecord(final.hashHex, final)
+          notifyTerminalOutcome(base.onTerminalOutcome, final, base.log)
+          if (base.retainTerminal?.(final)) base.onRetainedTerminal?.(final)
+          else base.clearRecord(final.hashHex, final)
           if (armed.get(key) === run) armed.delete(key)
         },
         // Non-terminal / errored: KEEP the record (don't clear) but drop it from `armed` so the next ensure()
@@ -314,6 +411,10 @@ export interface SuperviseInitiatorRecoveryOpts {
   session: SettlementSession
   /** Watchtower progress lines; absent, each is written unchanged to stderr (formatInitiatorWatchtowerProgress). */
   emitProgress?: (s: WatchtowerStatus) => void
+  /** Seconds clock shared with the initiator executor. Defaults to wall time in the watchtower adapters. */
+  now?: () => number
+  
+  firstClaimPublication?: 'disabled'
   /** The record's persistence file (the restock-store path) — the watchtower writes the refund txid + terminal state here. */
   recordPath: string
   /** Keyless-safe EVM reads (current block / tx confirmations / canonical isSwapLocked state) driving the height-gated
@@ -393,9 +494,9 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
       })
   }
 
-  // BR-H3: after reveal, Base refund is categorically unsafe. Route the persisted claim to the BSV watcher using the
-  // exact raw/BEEF artifact and wait for burial. This also closes the flagged in-process BR-H3b follow-on cleanly.
-  if (rec.state === 'revealed') {
+  // BR-H3: after reveal, route the persisted claim to the BSV watcher unless fresh routing evidence proved the
+  // responder's covenant refund already consumed the lock (the narrow Base-refund exception below).
+  if (rec.state === 'revealed' && !rec.bsvLockRefundEvidence) {
     if (!hasPersistedBsvClaimArtifact(rec)) {
       log(`⚠️ in-process initiator recovery for ${id}…: revealed record has no valid persisted BSV claim artifact — SKIPPING fail-closed (manual recovery required)`)
       opts.onNonTerminal?.(rec)
@@ -413,9 +514,12 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
       maxPolls: opts.maxPolls ?? 100_000,
       refundConfs: opts.refundConfs,
       bsvRails: opts.bsvRails,
+      evm: evmReads,
       beforeSend: opts.beforeSend,
       strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
       emitProgress: opts.emitProgress,
+      now: opts.now,
+      firstClaimPublication: opts.firstClaimPublication,
     })
     const persist = deps.persist
     deps.persist = async (record): Promise<void> => {
@@ -472,9 +576,10 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
     refundConfs: opts.refundConfs,
     beforeSend: opts.beforeSend,
     strictPersistedRecordTrust: opts.strictPersistedRecordTrust,
-    assertInitiatorRefundSafe: (record) => assertInitiatorRefundSafeOnBsv(record, opts.bsvRails),
+    assertInitiatorRefundSafe: (record) => assertInitiatorRefundSafeOnBsv(record, makeInitiatorRefundSafetyRails(opts.bsvRails)),
     onInitiatorRefundSafetyResult: opts.onRefundSafetyResult,
     emit: opts.emitProgress ?? emitInitiatorWatchtowerProgress,
+    now: opts.now,
   })
   const persist = deps.persist
   deps.persist = async (record): Promise<void> => {
@@ -498,6 +603,8 @@ export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRec
   /** Resolve late-installed read/signing capabilities only when a fresh run is armed. */
   evmProvider?: () => Erc20SwapEvmClient | undefined
   evmRefundProvider?: () => Pick<RecoveryClaimEvm, 'address' | 'swapAddress' | 'chainId' | 'refund'> | undefined
+  
+  onTerminalOutcome?: (record: SettlementRecord) => void
 }): RecoverySupervisor {
   const armed = new Map<string, ArmedRecovery>()
   const refundSafetyErrors = new Map<string, string>()
@@ -544,6 +651,7 @@ export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRec
       if (isTerminal(recoveryRecord.state)) {
         const current = armed.get(key)
         cancelRecord(rec, `fresh record is terminal (${rec.state})`)
+        notifyTerminalOutcome(base.onTerminalOutcome, rec, base.log)
         if (!current?.terminalClearAttempted) {
           if (current) current.terminalClearAttempted = true
           base.clearRecord(rec.hashHex, rec)
@@ -576,6 +684,7 @@ export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRec
         onTerminal: (final) => {
           if (run.terminalClearAttempted) return
           run.terminalClearAttempted = true
+          notifyTerminalOutcome(base.onTerminalOutcome, final, base.log)
           base.clearRecord(final.hashHex, final)
           if (armed.get(key) === run) armed.delete(key)
         },

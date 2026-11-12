@@ -91,6 +91,15 @@ describe('buyer kit 0.2.2 — unlanded Base lock recovery', () => {
     expect(buyerStageForSettlement(out.result!.state)).to.equal('failed')
   })
 
+  it('I4: unlanded-lock tombstone clamps a regressed clock to the previous history timestamp', async () => {
+    const source = record({
+      baseLockAttempts: [],
+      history: [{ state: 'created', at: 10 }, { state: 'base-locked', at: 20 }],
+    })
+    const out = await evaluate(source)
+    expect(out.current?.history.at(-1)).to.deep.equal({ state: 'aborted', at: 20 })
+  })
+
   it('F5 terminal failed recovery no longer occupies the buyer active slot or blocks a Base withdrawal', async () => {
     const prior: BuyerSwapRecord = {
       swapId: 's'.repeat(32), requestId: 'r'.repeat(16), stage: 'waiting_bsv_lock', amountIn: '10',

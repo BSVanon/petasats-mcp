@@ -36,6 +36,7 @@ export function isBridgeQuote(v: unknown): v is BridgeQuote {
   if (!address(v.responderEvmAddr) || !pubkey(v.responderBsvPubKeyHex) || typeof v.responderBsvAddress !== 'string' || v.responderBsvAddress.length < 1 || v.responderBsvAddress.length > 128) return false
   if (v.htlcKind !== undefined && v.htlcKind !== 'covenant') return false
   if ((v.bsvClaimFeeBudgetSats !== undefined && !n(v.bsvClaimFeeBudgetSats)) || (v.bsvRefundFeeBudgetSats !== undefined && !n(v.bsvRefundFeeBudgetSats))) return false
+  if (v.acceptsBsvLockWaitMs !== undefined && v.acceptsBsvLockWaitMs !== true) return false
   return true
 }
 
@@ -44,7 +45,12 @@ export function isBridgeQuoteV2(v: unknown): v is BridgeQuoteV2 {
   return v.v === 2 && address(v.responderEvmAddr) && pubkey(v.responderBsvPubKeyHex) && typeof v.responderBsvAddress === 'string' && v.responderBsvAddress.length >= 1 && v.responderBsvAddress.length <= 128 && v.htlcKind === 'covenant' && n(v.bsvClaimFeeBudgetSats) && n(v.bsvRefundFeeBudgetSats) && isPublicDoorQuoteId(v.doorQuoteId) && DOOR_REQUEST_ID_RE.test(v.doorQuoteId) && publicSettlementModeAndCapAreConsistent(v.settlementMode, v.fastCapUsdcBaseUnits)
 }
 
-export const isBaseLocked = (v: unknown): v is { txHash: `0x${string}`; blockNumber: number } => exact(v, ['txHash', 'blockNumber']) && hex(v.txHash, 32, true) && n(v.blockNumber)
+export const isBaseLocked = (v: unknown): v is { txHash: `0x${string}`; blockNumber: number; bsvLockWaitMs?: number } => {
+  if (!own(v)) return false
+  const shape = exact(v, ['txHash', 'blockNumber']) || exact(v, ['txHash', 'blockNumber', 'bsvLockWaitMs'])
+  return shape && hex(v.txHash, 32, true) && n(v.blockNumber) &&
+    (v.bsvLockWaitMs === undefined || (n(v.bsvLockWaitMs) && v.bsvLockWaitMs >= 60_000 && v.bsvLockWaitMs <= 24 * 60 * 60_000))
+}
 export const isRefundSigA = (v: unknown): v is { sigA: number[] } => exact(v, ['sigA']) && Array.isArray(v.sigA) && v.sigA.length > 0 && v.sigA.length <= 80 && v.sigA.every((b) => n(b) && b <= 255)
 export const isBsvLocked = (v: unknown): v is { bsvLockTxid: string; htlcScriptHex: string } => exact(v, ['bsvLockTxid', 'htlcScriptHex']) && txid(v.bsvLockTxid) && boundedHex(v.htlcScriptHex, 10_000)
 export const isRevealHint = (v: unknown): v is { bsvClaimTxid: string } => exact(v, ['bsvClaimTxid']) && txid(v.bsvClaimTxid)

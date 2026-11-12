@@ -1,5 +1,5 @@
 import type { Erc20SwapEvmClient } from '../../bridge/evm/client'
-import { baseRefundParamsFromRecord } from '../../bridge/watchtower-adapters'
+import { baseRefundParamsFromRecord, baseResolutionAnchorFromRecord } from '../../bridge/watchtower-adapters'
 import type { SettlementRecord } from '../../bridge/settlement-session'
 
 type CooperativeRefundRails = Pick<Erc20SwapEvmClient, 'finalizedBlockNumber' | 'resolveSwapOutcome'> & {
@@ -28,13 +28,13 @@ export async function resolveCooperativeRefund(record: SettlementRecord, deps: {
     return { kind: 'none', record }
   }
   try {
-    const baseLockBlock = record.baseLockBlock
-    if (typeof baseLockBlock !== 'number' || !Number.isSafeInteger(baseLockBlock) || baseLockBlock <= 0) return { kind: 'none', record }
+    const resolutionAnchor = baseResolutionAnchorFromRecord(record)
+    if (!resolutionAnchor) return { kind: 'none', record }
     const finalized = await deps.evm.finalizedBlockNumber()
     if (typeof finalized !== 'bigint' || finalized <= 0n) return { kind: 'none', record }
     const params = baseRefundParamsFromRecord(record)
     if (await deps.evm.isSwapLocked(params, { blockNumber: finalized })) return { kind: 'none', record }
-    const outcome = await deps.evm.resolveSwapOutcome(params, BigInt(baseLockBlock))
+    const outcome = await deps.evm.resolveSwapOutcome(params, resolutionAnchor)
     if (outcome.kind === 'claimed') return { kind: 'claimed', record, eventTxid: outcome.eventTxid }
     if (outcome.kind !== 'refunded') return { kind: 'none', record }
 
@@ -45,7 +45,7 @@ export async function resolveCooperativeRefund(record: SettlementRecord, deps: {
     await deps.assertPoolSafe()
     const latest = deps.reread(record.hashHex)
     if (!latest || !sameRecord(latest, record) || !mayClassify(latest)) return { kind: 'none', record: latest ?? record }
-    const at = Math.floor(deps.now() / 1000)
+    const at = Math.max(Math.floor(deps.now() / 1000), latest.history.at(-1)?.at ?? 0)
     const refunded: SettlementRecord = {
       ...latest,
       state: 'refunded',

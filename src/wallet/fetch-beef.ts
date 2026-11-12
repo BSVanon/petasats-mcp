@@ -58,6 +58,7 @@
  */
 
 import { Beef, MerklePath, Transaction, Utils } from '@bsv/sdk'
+import { abortableSleep, withRequestTimeout } from './abortable-request'
 
 const WOC_TIMEOUT_MS = 8_000
 const GP_TIMEOUT_MS = 8_000
@@ -133,6 +134,10 @@ export interface FetchBeefForTxidOptions {
   acceptUnprovenAnvilBeef?: boolean
   /** Observe proof-source and raw-fallback errors without changing fetch behavior. */
   onSourceError?: (source: string, message: string) => void
+  /** Lifecycle cancellation, composed with every provider timeout and retry sleep. */
+  signal?: AbortSignal
+  /** Test seam for the retry backoff; production uses an abortable timer. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 
 export async function fetchBeefForTxid(
@@ -145,6 +150,8 @@ export async function fetchBeefForTxid(
   }
 
   const errors: string[] = []
+  opts.signal?.throwIfAborted()
+  const wait = opts.sleep ?? abortableSleep
   const wocTimeoutMs = opts.wocTimeoutMs ?? WOC_TIMEOUT_MS
   const requireProof = opts.requireProof === true
   const acceptUnprovenAnvilBeef = !requireProof && opts.acceptUnprovenAnvilBeef === true
@@ -173,12 +180,13 @@ export async function fetchBeefForTxid(
       try {
         return await fn()
       } catch (e) {
+        if (opts.signal?.aborted) opts.signal.throwIfAborted()
         const source = `${label}${attempt > 0 ? ` (attempt ${attempt + 1})` : ''}`
         const message = (e as Error).message
         errors.push(`${source}: ${message}`)
         try { opts.onSourceError?.(source, message) } catch { /* observers must not affect fetching */ }
         if (attempt < retries - 1) {
-          await sleep(retryDelayMs * Math.pow(2, attempt))
+          await wait(retryDelayMs * Math.pow(2, attempt), opts.signal)
           continue
         }
       }
@@ -200,6 +208,7 @@ export async function fetchBeefForTxid(
         fetchImpl,
         opts.anvilTimeoutMs ?? ANVIL_BEEF_TIMEOUT_MS,
         acceptUnprovenAnvilBeef,
+        opts.signal,
       ),
     )
     if (anvilBeef) {
@@ -210,7 +219,7 @@ export async function fetchBeefForTxid(
 
   // Source 2: WoC /beef (the historical proof-bearing source).
   const wocBeef = await tryProofSource('WoC /beef', () =>
-    fetchBeefFromWoc(txid, fetchImpl, wocTimeoutMs),
+    fetchBeefFromWoc(txid, fetchImpl, wocTimeoutMs, opts.signal),
   )
   if (wocBeef) return wocBeef
 
@@ -229,6 +238,7 @@ export async function fetchBeefForTxid(
       txid,
       fetchImpl,
       opts.bananaBlocksTimeoutMs ?? BANANABLOCKS_BEEF_TIMEOUT_MS,
+      opts.signal,
     ),
   )
   if (bananaBeef) return bananaBeef
@@ -244,12 +254,13 @@ export async function fetchBeefForTxid(
 
   // ── 2. WoC /hex (mempool fallback — single rawTx, no proofs) ──
   try {
-    const beef = await fetchSingleTxBeefFromWoc(txid, fetchImpl, wocTimeoutMs)
+    const beef = await fetchSingleTxBeefFromWoc(txid, fetchImpl, wocTimeoutMs, opts.signal)
     if (beef) {
       if (acceptUnprovenAnvilBeef && !beef.findAtomicTransaction(txid)) throw new Error(`returned transaction id does not match requested ${txid}`)
       return beef
     }
   } catch (e) {
+    if (opts.signal?.aborted) opts.signal.throwIfAborted()
     const source = 'WoC /hex'
     const message = (e as Error).message
     errors.push(`${source}: ${message}`)
@@ -258,12 +269,13 @@ export async function fetchBeefForTxid(
 
   // ── 3. GP /tx/{txid}/raw (secondary raw-tx fallback) ──
   try {
-    const beef = await fetchSingleTxBeefFromGp(txid, fetchImpl, opts.gorillaPoolTimeoutMs ?? GP_TIMEOUT_MS)
+    const beef = await fetchSingleTxBeefFromGp(txid, fetchImpl, opts.gorillaPoolTimeoutMs ?? GP_TIMEOUT_MS, opts.signal)
     if (beef) {
       if (acceptUnprovenAnvilBeef && !beef.findAtomicTransaction(txid)) throw new Error(`returned transaction id does not match requested ${txid}`)
       return beef
     }
   } catch (e) {
+    if (opts.signal?.aborted) opts.signal.throwIfAborted()
     const source = 'GP /tx/raw'
     const message = (e as Error).message
     errors.push(`${source}: ${message}`)
@@ -294,7 +306,7 @@ export async function fetchTxHexForTxid(
   txid: string,
   opts: Pick<
     FetchBeefForTxidOptions,
-    'fetchImpl' | 'anvilNodeUrl' | 'anvilAuthToken' | 'wocTimeoutMs' | 'gorillaPoolTimeoutMs'
+    'fetchImpl' | 'anvilNodeUrl' | 'anvilAuthToken' | 'wocTimeoutMs' | 'gorillaPoolTimeoutMs' | 'signal'
   > = {},
 ): Promise<string> {
   const beef = await fetchBeefForTxid(txid, { ...opts, requireProof: false })
@@ -306,10 +318,6 @@ export async function fetchTxHexForTxid(
     )
   }
   return tx.toHex()
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
@@ -390,14 +398,12 @@ async function fetchBeefFromAnvil(
   fetchImpl: typeof fetch,
   timeoutMs: number,
   acceptUnproven: boolean,
+  signal?: AbortSignal,
 ): Promise<Beef | null> {
   const url = `${anvilNodeUrl.replace(/\/$/, '')}/tx/${txid}/beef`
   const headers: Record<string, string> = {}
   if (anvilAuthToken) headers.Authorization = `Bearer ${anvilAuthToken}`
-  const res = await fetchImpl(url, {
-    headers,
-    signal: AbortSignal.timeout(timeoutMs),
-  })
+  const res = await withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(url, { headers, signal: requestSignal }))
   if (!res.ok) {
     // 404 + terminal client errors → miss + fall through; 429/5xx → throw so
     // the retry loop backs off.
@@ -425,9 +431,10 @@ async function fetchBeefFromBananaBlocks(
   txid: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<Beef | null> {
   const url = `${BANANABLOCKS_BASE}/tx/${txid}/beef`
-  const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+  const res = await withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(url, { signal: requestSignal }))
   if (!res.ok) {
     // 404 (not indexed here) + terminal client errors (the verified 413 some
     // txs return) → miss + fall through, no retry. 429/5xx → throw so the
@@ -445,9 +452,10 @@ async function fetchBeefFromWoc(
   txid: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<Beef | null> {
   const url = `${WOC_BASE}/tx/${txid}/beef`
-  const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+  const res = await withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(url, { signal: requestSignal }))
   if (!res.ok) {
     // 404 (tx not mined yet) + terminal client errors → miss + fall through.
     // 429 (rate limit) + 5xx (server error) are TRANSIENT — throw so the
@@ -485,9 +493,10 @@ async function fetchSingleTxBeefFromWoc(
   txid: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<Beef | null> {
   const url = `${WOC_BASE}/tx/${txid}/hex`
-  const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+  const res = await withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(url, { signal: requestSignal }))
   if (res.status === 404) return null
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`)
@@ -511,6 +520,7 @@ async function fetchSingleTxBeefFromGp(
   txid: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<Beef | null> {
   // GorillaPool's `/api/tx/<txid>/raw` (and `/api/tx/<txid>`) return the
   // raw transaction as binary bytes. Pre-2026-05-08 this called
@@ -520,7 +530,7 @@ async function fetchSingleTxBeefFromGp(
   // solve). Server-side curl probe confirmed the right path returns 200
   // with binary even for txs <60s after broadcast.
   const url = `${GP_BASE}/tx/${txid}/raw`
-  const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+  const res = await withRequestTimeout(timeoutMs, signal, (requestSignal) => fetchImpl(url, { signal: requestSignal }))
   if (res.status === 404) return null
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`)

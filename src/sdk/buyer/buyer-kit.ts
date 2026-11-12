@@ -8,6 +8,7 @@ import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
 import { assertBaseDestination, assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
 import { makeBuyerDelivery } from './delivery'
 import { createInitialSettlementRecord, executeNegotiatedSettlement, makeSettlementAttachment, negotiateSettlementMode, requestedSettlementSpeed } from './settlement-mode'
+import { callDoorWithRetry, waitForDoorRetry, type DoorRetryOptions } from './door-retry'
 const HARD_CAP_USD = 1000
 const DEFAULT_CAP_USD = 100
 const active = new Set<BuyerSwapStage>(['quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'sweeping', 'refund_waiting', 'needs_attention'])
@@ -48,13 +49,18 @@ function fastNegotiationFailureReason(record: BuyerSwapRecord, reason: string): 
  * Stateful USDC→BSV buyer façade.  It owns no transport and no RPC: those are injected by the local runtime, which
  * makes the same lifecycle safe to test on in-memory chains and to resume after process restart.
  */
-export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient; executor: BuyerExecutor; store: BuyerStore; wallet: BuyerWallet & BuyerBaseWallet; /** Checked immediately before the first door call for every new swap. */ beforeNewSwap?: () => void | Promise<void>; limits?: () => BuyerLimits | undefined; spendingStopped?: () => { at: number; reason?: string } | undefined; withdrawalIntents?: BuyerWithdrawalIntents; stopSpending?: (reason?: string) => { alreadyStopped: boolean; at?: number; reason?: string }; log?: (message: string) => void }): BuyerKit {
+export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient; executor: BuyerExecutor; store: BuyerStore; wallet: BuyerWallet & BuyerBaseWallet; /** Checked immediately before the first door call for every new swap. */ beforeNewSwap?: () => void | Promise<void>; limits?: () => BuyerLimits | undefined; spendingStopped?: () => { at: number; reason?: string } | undefined; withdrawalIntents?: BuyerWithdrawalIntents; stopSpending?: (reason?: string) => { alreadyStopped: boolean; at?: number; reason?: string }; retryWait?: DoorRetryOptions['wait']; retrySignal?: AbortSignal; log?: (message: string) => void }): BuyerKit {
   const capUsdPerSwap = config.capUsdPerSwap ?? DEFAULT_CAP_USD
   if (!Number.isFinite(capUsdPerSwap) || capUsdPerSwap <= 0 || capUsdPerSwap > HARD_CAP_USD) throw new Error(`capUsdPerSwap must be > 0 and ≤ ${HARD_CAP_USD}`)
   const maxActive = config.maxActiveSwaps ?? 1
   if (!Number.isInteger(maxActive) || maxActive < 1) throw new Error('maxActiveSwaps must be a positive integer')
   const now = config.now ?? Date.now
   const log = deps.log ?? ((message: string) => console.error(`buyer-kit: ${message}`))
+  const retryStopped = (): boolean => {
+    if (deps.retrySignal?.aborted) return true
+    try { return !!deps.spendingStopped?.() } catch { return true }
+  }
+  const retry = { wait: deps.retryWait ?? waitForDoorRetry, shouldStop: retryStopped, signal: deps.retrySignal, log }
   let reportNewWallet = !!config.newWallet
   // Keep every balance observation and durable admission of a new swap ordered with withdrawals.  The lifecycle that
   // follows the durable row is intentionally not held here: it has its own recovery protocol and may take minutes.
@@ -144,7 +150,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
   const quote = async (amountIn: bigint, forceLegacy = false): Promise<BuyerQuote> => {
     const amountUsd = asUsd(amountIn)
     if (amountIn > BigInt(Math.floor(capUsdPerSwap * 1e6))) throw new Error(`amount exceeds this kit’s $${capUsdPerSwap} per-swap cap`)
-    const reply = await deps.door.quote(amountIn, requestId(), forceLegacy)
+    const reply = await callDoorWithRetry(() => deps.door.quote(amountIn, requestId(), forceLegacy), { ...retry, stage: 'quote' })
     const units = BigInt(reply.usdcBaseUnits)
     if (units !== amountIn) throw new Error('market maker quote does not bind the exact USDC atomic amount requested')
     if (!Number.isSafeInteger(reply.bsvSats) || reply.bsvSats < 1 || reply.expiresAtMs <= now()) throw new Error('market maker returned an invalid or expired quote')
@@ -158,7 +164,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     let settlementAttached = !!record.settlementHashHex
     const attachSettlement = makeSettlementAttachment({ getRecord: () => record, setRecord: (saved) => { record = saved; settlementAttached = true }, write, stageForSettlement: buyerStageForSettlement, log })
     try {
-      const negotiation = await negotiateSettlementMode(record, { door: deps.door, now, write })
+      const negotiation = await negotiateSettlementMode(record, { door: deps.door, now, write, retry })
       if (!negotiation) return
       const { admittedMode, downgradeReason } = negotiation
       record = negotiation.record

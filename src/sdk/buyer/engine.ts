@@ -94,6 +94,8 @@ export interface BuyerEngineDeps {
   capUsdPerSwap: number
   now: () => number
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>
+  /** Internal deterministic-transport seam; production retains the MessageBox default cadence. */
+  messageBoxPollMs?: number
   log: (message: string) => void
   /** Throws while the Base pool is split or unverified; an unlanded-lock tombstone is never written past it. */
   assertEvmPoolSafe: () => void | Promise<void>
@@ -146,6 +148,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
     recordPathFor: (hashHex) => records.pathFor(hashHex),
     pollMs: BUYER_RECOVERY_POLL_MS,
     refundConfs: 1,
+    now: () => Math.floor(deps.now() / 1000),
     onPersist: (record) => mark(record.hashHex, record.state),
   })
   const { acknowledgeTerminalRecord, acknowledgedTerminalTokens } = makeTerminalAcknowledgement({ records, recovery, claimIsBuried })
@@ -160,7 +163,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
   const writeExecutorTombstone = (hashHex: string, abortReason = 'the USDC lock reverted; nothing was locked'): SettlementState | undefined => {
     const current = records.list().records.find((entry) => entry.hashHex === hashHex)
     if (!current) return undefined
-    const at = Math.floor(deps.now() / 1000)
+    const at = Math.max(Math.floor(deps.now() / 1000), current.history.at(-1)?.at ?? 0)
     if (current.state === 'revealed') {
       const tombstone: SettlementRecord = { ...current, state: 'settled', history: [...current.history, { state: 'settled', at }] }
       records.write(tombstone)
@@ -261,6 +264,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       const messageBox = makeMessageBoxInitiatorCoordinator({
         comms: deps.comms, namespace: input.swapNamespace, peerIdentityPubKeyHex: deps.doorIdentity, settlementProtocolVersion: input.quote.doorProtocolVersion === 2 ? 2 : 1, signal: lifecycle.signal,
         bsvLockTimeoutMs: BUYER_BSV_LOCK_POLL_MS, now: deps.now,
+        ...(deps.messageBoxPollMs === undefined ? {} : { pollMs: deps.messageBoxPollMs, sleep: deps.sleep }),
       })
       // Admission is a short-lived reservation at the public door. Refuse before emitting the first settlement message
       // when it has expired, rather than allowing an old admission to create a fresh on-chain lock.
@@ -270,11 +274,11 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           if (deps.now() >= input.handshakeDeadlineMs) throw new Error('market maker admission expired before the swap intent was sent')
           return messageBox.sendIntent(...args)
         },
-        recvBsvLocked: async () => {
+        recvBsvLocked: async (signal?: AbortSignal) => {
           for (;;) {
             let locked
             try {
-              locked = await messageBox.recvBsvLocked()
+              locked = await messageBox.recvBsvLocked(signal)
             } catch (error) {
               const text = error instanceof Error ? error.message : String(error)
               if (!/timed out waiting for 'bsv-locked'/.test(text)) throw error
@@ -326,6 +330,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           records.write(record)
           remember(input.swapId, record, input.onSettlement)
         },
+        readPersistedRecord: records.read,
         onHashlockCreated: async (hashHex) => {
           executingHash = hashHex
           executingHashes.add(hashHex)

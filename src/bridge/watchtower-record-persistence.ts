@@ -18,6 +18,29 @@ import { MAX_SETTLEMENT_RECORD_BYTES, writeSettlementRecordAtomically } from './
 import { validateSettlementRecord, type SettlementRecord } from './settlement-session'
 import { assertSameWatchtowerRecordIdentity } from './watchtower-record-identity'
 
+const PUBLICATION_LATCH_STATES = new Set(['revealed', 'refunding', 'refunded', 'settled'])
+const COVENANT_REFUND_EVIDENCE_STATES = new Set(['revealed', 'refunding', 'refunded'])
+
+/** Recovery evidence is a monotonic disk invariant: an older writer may carry it forward, never erase or replace it. */
+export function preserveInitiatorRecoveryEvidence(current: SettlementRecord, next: SettlementRecord): SettlementRecord {
+  if (current.role !== 'initiator' || (!current.claimPublicationRefused && !current.bsvLockRefundEvidence)) return next
+  assertSameWatchtowerRecordIdentity(current, next, 'initiator recovery evidence')
+  if (next.role !== 'initiator' ||
+      (current.claimPublicationRefused && !PUBLICATION_LATCH_STATES.has(next.state)) ||
+      (current.bsvLockRefundEvidence && !COVENANT_REFUND_EVIDENCE_STATES.has(next.state))) {
+    throw new Error('swap-record: stale replacement cannot preserve durable initiator recovery evidence; refusing overwrite')
+  }
+  if (current.bsvLockRefundEvidence && next.bsvLockRefundEvidence &&
+      current.bsvLockRefundEvidence.spenderTxid.toLowerCase() !== next.bsvLockRefundEvidence.spenderTxid.toLowerCase()) {
+    throw new Error('swap-record: replacement conflicts with durable BSV covenant-refund evidence; refusing overwrite')
+  }
+  return {
+    ...next,
+    ...(current.claimPublicationRefused ? { claimPublicationRefused: current.claimPublicationRefused } : {}),
+    ...(current.bsvLockRefundEvidence ? { bsvLockRefundEvidence: current.bsvLockRefundEvidence } : {}),
+  }
+}
+
 /**
  * Compare-and-replace one recovery record without ever overwriting a different swap tuple.
  *
@@ -48,9 +71,11 @@ export function persistWatchtowerRecordForIdentity(
     const current = JSON.parse(readFileSync(fd, 'utf8')) as SettlementRecord
     validateSettlementRecord(current)
     assertSameWatchtowerRecordIdentity(expectedIdentity, current, 'watchtower persist')
+    const preserved = preserveInitiatorRecoveryEvidence(current, next)
+    if (preserved !== next) validateSettlementRecord(preserved)
     writeSettlementRecordAtomically(
       staged,
-      JSON.stringify(next, null, 2),
+      JSON.stringify(preserved, null, 2),
       mode ?? (opened.mode & 0o777),
       MAX_SETTLEMENT_RECORD_BYTES,
     )
@@ -105,5 +130,26 @@ export function persistWatchtowerAdapterRecord(
   mode?: number,
 ): void {
   if (strict) persistWatchtowerRecordForIdentity(path, identity, next, mode)
-  else writeSettlementRecordAtomically(path, JSON.stringify(next, null, 2), mode, MAX_SETTLEMENT_RECORD_BYTES)
+  else {
+    let fd: number | undefined
+    try {
+      fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+      const opened = fstatSync(fd)
+      if (!opened.isFile() || opened.size > MAX_SETTLEMENT_RECORD_BYTES) {
+        throw new Error(`watchtower persist: ${path} is not a bounded regular record`)
+      }
+      const current = JSON.parse(readFileSync(fd, 'utf8')) as SettlementRecord
+      if (current.role === 'initiator' && (current.claimPublicationRefused || current.bsvLockRefundEvidence)) {
+        validateSettlementRecord(current)
+        assertSameWatchtowerRecordIdentity(identity, current, 'watchtower persist')
+        next = preserveInitiatorRecoveryEvidence(current, next)
+        validateSettlementRecord(next)
+      }
+    }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    finally { if (fd !== undefined) closeSync(fd) }
+    writeSettlementRecordAtomically(path, JSON.stringify(next, null, 2), mode, MAX_SETTLEMENT_RECORD_BYTES)
+  }
 }

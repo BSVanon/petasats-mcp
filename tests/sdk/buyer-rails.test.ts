@@ -132,6 +132,21 @@ describe('buyer runtime rails', () => {
     expect(await rails.fetchTx('ab'.repeat(32))).to.equal(null)
   })
 
+  it('G4: an empty exact-script discovery cycle makes one physical WoC request', async () => {
+    const calls: string[] = []
+    const rails = makeBuyerBsvRails({
+      anvilBaseUrl: 'https://buyer-anvil.invalid',
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        calls.push(String(input))
+        return new Response('synthetic outage', { status: 503 })
+      }) as typeof fetch,
+    })
+    const script = new P2PKH().lock(PrivateKey.fromRandom().toAddress()).toHex()
+    await rejects(() => rails.findLockTxByScript!(script, 10_000), /exact-script indexer unavailable.*HTTP 503/)
+    expect(calls).to.have.length(1)
+    expect(calls[0]).to.include('/script/')
+  })
+
   it('retains zero as the deterministic not-mined/not-indexed answer needed for true eviction recovery', async () => {
     const rails = makeBuyerBsvRails({
       anvilBaseUrl: 'https://buyer-anvil.invalid',

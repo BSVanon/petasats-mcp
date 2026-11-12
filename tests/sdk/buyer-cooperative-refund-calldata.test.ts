@@ -1,6 +1,6 @@
 import { expect } from 'chai'
 import { describe, it } from 'mocha'
-import { encodeEventTopics, encodeFunctionData, parseAbi, type Hex } from 'viem'
+import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, parseAbi, parseAbiParameters, type Hex } from 'viem'
 import { base } from 'viem/chains'
 import { Erc20SwapEvmClient } from '../../src/bridge/evm/client'
 import { encodeRefundCooperative, REFUND_COOPERATIVE_ABI } from '../../src/bridge/evm/cooperative-refund'
@@ -11,6 +11,7 @@ import { buyerStageForSettlement } from '../../src/sdk/buyer/engine'
 
 const HASH = `0x${'11'.repeat(32)}` as Hex
 const REFUND_TX = `0x${'22'.repeat(32)}` as Hex
+const LOCK_TX = `0x${'99'.repeat(32)}` as Hex
 const SWAP = `0x${'33'.repeat(20)}` as Hex
 const TOKEN = `0x${'44'.repeat(20)}` as Hex
 const MAKER = `0x${'55'.repeat(20)}` as Hex
@@ -19,6 +20,11 @@ const SIGNATURE = `0x${'77'.repeat(32)}${'88'.repeat(32)}1b` as Hex
 const REFUND_ABI = [{
   type: 'event', name: 'Refund', inputs: [{ indexed: true, name: 'preimageHash', type: 'bytes32' }],
 }] as const
+const LOCKUP_ABI = [{ type: 'event', name: 'Lockup', inputs: [
+  { indexed: true, name: 'preimageHash', type: 'bytes32' }, { indexed: false, name: 'amount', type: 'uint256' },
+  { indexed: false, name: 'tokenAddress', type: 'address' }, { indexed: true, name: 'claimAddress', type: 'address' },
+  { indexed: true, name: 'refundAddress', type: 'address' }, { indexed: false, name: 'timelock', type: 'uint256' },
+] }] as const
 
 const params: Erc20SwapParams = {
   preimageHash: HASH,
@@ -36,7 +42,7 @@ function record(): SettlementRecord {
     baseRefundTs: 1, bsvRefundTs: 1, claimBudgetBaseSecs: 7_200, bsvClaimPubKeyHex: `02${'1'.repeat(64)}`,
     bsvRefundPubKeyHex: `03${'2'.repeat(64)}`, baseChainId: 8453, erc20SwapAddress: SWAP,
     usdcTokenAddress: TOKEN, usdcDecimals: 6, baseClaimAddress: MAKER, baseRefundAddress: BUYER,
-    capUsdPerSwap: 100, zeroConfCapUsd: 0, baseLockTxHash: `0x${'99'.repeat(32)}`, baseLockBlock: 100,
+    capUsdPerSwap: 100, zeroConfCapUsd: 0, baseLockTxHash: LOCK_TX, baseLockBlock: 100, baseLockLogIndex: 1,
     history: [{ state: 'created', at: 1 }, { state: 'base-locked', at: 2 }],
   }
 }
@@ -50,11 +56,24 @@ function clientFor(input: Hex): Erc20SwapEvmClient {
     getLogs: async ({ event }: { event: { name: string } }) => event.name === 'Refund' ? [{
       address: SWAP,
       transactionHash: REFUND_TX,
+      transactionIndex: 2,
+      blockNumber: 120n,
       logIndex: 0,
       topics: encodeEventTopics({ abi: REFUND_ABI, eventName: 'Refund', args: { preimageHash: HASH } }),
       data: '0x',
       args: { preimageHash: HASH },
     }] : [],
+    getTransactionReceipt: async () => ({
+      status: 'success', transactionHash: LOCK_TX, blockNumber: 100n, transactionIndex: 1,
+      logs: [{
+        address: SWAP, transactionHash: LOCK_TX, blockNumber: 100n, transactionIndex: 1, logIndex: 1,
+        topics: encodeEventTopics({
+          abi: LOCKUP_ABI, eventName: 'Lockup',
+          args: { preimageHash: HASH, claimAddress: MAKER, refundAddress: BUYER },
+        }),
+        data: encodeAbiParameters(parseAbiParameters('uint256,address,uint256'), [params.amount, TOKEN, params.timelock]),
+      }],
+    }),
     getTransaction: async () => ({ to: SWAP, input }),
   }
   return client

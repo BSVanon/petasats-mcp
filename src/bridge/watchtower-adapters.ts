@@ -2,9 +2,9 @@ import { Transaction, Utils } from '@bsv/sdk'
 import type { EvmNewBroadcastAuthorizer } from './evm/inflight-sends'
 import { SettlementSession, validateSettlementRecord, type SettlementRecord, type SettlementState } from './settlement-session'
 import { readSettlementRecordFile } from './atomic-record-write'
-import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, adoptedClaimResult, swapAlreadyResolvedResult, type ResolutionFinalityClassification, type WatchtowerDeps, type WatchHeights, type WatchtowerStatus } from './watchtower'
+import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, adoptedClaimResult, InactiveBaseLockError, swapAlreadyResolvedResult, type ResolutionFinalityClassification, type WatchtowerDeps, type WatchHeights, type WatchtowerStatus } from './watchtower'
 import { testnetChainInfo, broadcastTestnet, fetchTestnetTxConfirmations } from './bsv-testnet'
-import { Erc20SwapEvmClient, type SwapResolutionOutcome } from './evm/client'
+import { Erc20SwapEvmClient, type SwapResolutionAnchor, type SwapResolutionOutcome } from './evm/client'
 import { encodeClaim, encodeRefund, type Erc20SwapParams } from './evm/erc20swap'
 import { extractBridgeCovenantSecret } from '../settlement/htlc/bridge-covenant'
 import { assertSameWatchtowerRecordIdentity } from './watchtower-record-identity'
@@ -86,7 +86,7 @@ export interface RecoveryClaimEvm {
    * reverted receipt only for the narrow already-resolved convergence path. */
   txFinalized?(hash: `0x${string}`, requireSuccess?: boolean): Promise<boolean>
   /** Canonical Claim/Refund event scan from the recorded lock block through the OP-stack finalized head. */
-  resolveSwapOutcome?(params: Erc20SwapParams, fromBlock: bigint): Promise<SwapResolutionOutcome>
+  resolveSwapOutcome?(params: Erc20SwapParams, anchor: SwapResolutionAnchor): Promise<SwapResolutionOutcome>
 }
 
 export interface EvmWriteResult {
@@ -168,20 +168,8 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
 
     refundConfirmations: async (_rec: SettlementRecord, refundTxid: string): Promise<number> => bsvConfirmations(refundTxid),
 
-    refundBelongsToSwap: async (rec: SettlementRecord, refundTxid: string): Promise<boolean> => {
-      if (!opts.resolveSpender || !rec.bsvLockOutpoint || !rec.bsvRefundTxHex) return false
-      
-      // Discovery is corroboration only; a counterparty claim spending the same outpoint can never pass this equality.
-      SettlementSession.fromRecord(rec).assertPersistedRefundValid()
-      let persistedRefund: Transaction
-      try { persistedRefund = Transaction.fromHex(rec.bsvRefundTxHex) } catch { return false }
-      if (persistedRefund.id('hex').toLowerCase() !== refundTxid.toLowerCase()) return false
-      const [lockTxid, voutText] = rec.bsvLockOutpoint.split('_')
-      const vout = Number(voutText)
-      if (!lockTxid || !Number.isSafeInteger(vout) || vout < 0) return false
-      const spender = await opts.resolveSpender(lockTxid, vout)
-      return spender?.toLowerCase() === refundTxid.toLowerCase()
-    },
+    refundBelongsToSwap: async (rec: SettlementRecord, refundTxid: string): Promise<boolean> =>
+      opts.resolveSpender ? bsvRefundBelongsToSwap(rec, refundTxid, opts.resolveSpender) : false,
 
     refundFinality: async (_rec, refundTxid, confirmations): Promise<boolean> => {
       if (confirmations < DEFAULT_BSV_FINALITY_CONFIRMATIONS) return false
@@ -196,7 +184,7 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
     // BR-H3 initiator recovery. Prefer the exact self-contained Atomic BEEF that was accepted on first broadcast;
     // retain/pass the raw subject transaction for raw-only ladder tiers. If only the BEEF survived, derive the raw
     // subject from it. In either case the artifact must decode to the persisted txid before anything is submitted.
-    rebroadcastClaim: async (rec: SettlementRecord): Promise<string> => {
+    rebroadcastClaim: async (rec: SettlementRecord, publicationOpts?: { guardedFirstPublication?: true }): Promise<string> => {
       const artifactTxid = persistedBsvClaimArtifactTxid(rec)
       let rawHex = rec.bsvClaimTxHex
       if (rec.bsvClaimBeefHex) {
@@ -215,10 +203,14 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
       }
       if (!rawHex) throw new Error('rebroadcastClaim: record has no persisted claim BEEF or raw transaction')
       if (opts.dry) return DRY_BSV_CLAIM
-      await opts.beforeSend?.()
+      // A demonstrably-public replay keeps the ordinary fence here. For first publication, the core awaited this
+      // fence before the guard and marks the call so no await can reopen the guard→send race.
+      if (!publicationOpts?.guardedFirstPublication) await opts.beforeSend?.()
       await broadcastBsv(rawHex, rec.bsvClaimBeefHex)
       return artifactTxid
     },
+
+    ...(opts.beforeSend && !opts.dry ? { beforeFirstClaimPublication: opts.beforeSend } : {}),
 
     claimConfirmations: async (_rec: SettlementRecord, claimTxid: string): Promise<number> => bsvConfirmations(claimTxid),
     claimArtifactTxid: async (rec: SettlementRecord): Promise<string> => persistedBsvClaimArtifactTxid(rec),
@@ -232,6 +224,7 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
     },
     claimMinedProof: opts.bsvClaimProof ? async (_rec, claimTxid) => opts.bsvClaimProof!(claimTxid) : undefined,
     minimumClaimConfs: DEFAULT_BSV_FINALITY_CONFIRMATIONS,
+    bsvLockRefundFinality: opts.bsvFinality,
 
     checkReveal: opts.checkReveal ?? (async (rec: SettlementRecord): Promise<string | null> => {
       // RESPONDER reveal detection: did a counterparty CLAIM spend our BSV lock, revealing `s`? Only a hashlock
@@ -275,7 +268,8 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
               // bound to this exact tuple; receiveClaimFinality re-binds it before anything terminal. A refund, a
               // missing anchor, or any doubt stays on this zero-gas retry path.
               let why = 'no finalized outcome rail or lock-block anchor'
-              if (evm.resolveSwapOutcome && Number.isSafeInteger(rec.baseLockBlock) && (rec.baseLockBlock as number) > 0) {
+              const anchor = baseResolutionAnchorFromRecord(rec)
+              if (evm.resolveSwapOutcome && anchor) {
                 // Cheap gate before the event scan: while the tuple is still escrowed at the finalized head, no
                 // finalized Claim/Refund can exist yet, so skip the lock-block→finalized log scan on those polls.
                 let finalizedLocked: boolean | undefined = false
@@ -285,7 +279,7 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
                 if (finalizedLocked === undefined) why = 'finalized exact-tuple read failed'
                 else if (finalizedLocked) why = 'still locked at the finalized head, so its resolution is not final yet'
                 else {
-                  const outcome = await evm.resolveSwapOutcome(params, BigInt(rec.baseLockBlock as number))
+                  const outcome = await evm.resolveSwapOutcome(params, anchor)
                   if (outcome.kind === 'claimed') return adoptedClaimResult(outcome.eventTxid)
                   why = outcome.kind === 'refunded'
                     ? `finalized Refund ${outcome.eventTxid}`
@@ -322,8 +316,9 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
             )
             if (!exactCall || !await evm.txFinalized(claimTxid as `0x${string}`, !alreadyResolved) ||
                 await evm.isSwapLockedFinalized(params)) {
-              if (evm.resolveSwapOutcome && Number.isSafeInteger(rec.baseLockBlock) && (rec.baseLockBlock as number) > 0) {
-                const outcome = await evm.resolveSwapOutcome(params, BigInt(rec.baseLockBlock as number))
+              const anchor = baseResolutionAnchorFromRecord(rec)
+              if (evm.resolveSwapOutcome && anchor) {
+                const outcome = await evm.resolveSwapOutcome(params, anchor)
                 if (outcome.kind === 'claimed') return { kind: 'favorable', eventTxid: outcome.eventTxid }
                 if (outcome.kind === 'refunded') return classifyFinalizedOutcome(outcome, 'claimed')
               }
@@ -332,10 +327,11 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
             // A successful exact claim transaction, finalized receipt, and finalized tuple absence already bind
             
             if (!alreadyResolved) return { kind: 'favorable' }
-            if (!evm.resolveSwapOutcome || !Number.isSafeInteger(rec.baseLockBlock) || (rec.baseLockBlock as number) <= 0) {
-              return { kind: 'unresolved', reason: 'outcome rail or bounded lock-block anchor missing for reverted-claim convergence' }
+            const anchor = baseResolutionAnchorFromRecord(rec)
+            if (!evm.resolveSwapOutcome || !anchor) {
+              return { kind: 'unresolved', reason: 'outcome rail or own-Lockup receipt anchor missing for reverted-claim convergence' }
             }
-            const outcome = await evm.resolveSwapOutcome(params, BigInt(rec.baseLockBlock as number))
+            const outcome = await evm.resolveSwapOutcome(params, anchor)
             if (outcome.kind !== 'unresolved' && outcome.eventTxid.toLowerCase() === claimTxid.toLowerCase()) {
               return { kind: 'unresolved', reason: 'the reverted claim transaction cannot also be the canonical resolution event transaction' }
             }
@@ -367,6 +363,23 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
   }
 }
 
+export async function bsvRefundBelongsToSwap(
+  rec: SettlementRecord,
+  refundTxid: string,
+  resolveSpender: (txid: string, vout: number) => Promise<string | null>,
+): Promise<boolean> {
+  if (!rec.bsvLockOutpoint || !rec.bsvRefundTxHex) return false
+  SettlementSession.fromRecord(rec).assertPersistedRefundValid()
+  let persistedRefund: Transaction
+  try { persistedRefund = Transaction.fromHex(rec.bsvRefundTxHex) } catch { return false }
+  if (persistedRefund.id('hex').toLowerCase() !== refundTxid.toLowerCase()) return false
+  const [lockTxid, voutText] = rec.bsvLockOutpoint.split('_')
+  const vout = Number(voutText)
+  if (!lockTxid || !Number.isSafeInteger(vout) || vout < 0) return false
+  const spender = await resolveSpender(lockTxid, vout)
+  return spender?.toLowerCase() === refundTxid.toLowerCase()
+}
+
 /**
  * Reconstruct the EXACT ERC20Swap tuple the machine locked, from the persisted record — the SAME
  * field mapping SettlementSession.validateObservedBaseLock enforces (preimageHash/amount/token/
@@ -382,6 +395,17 @@ export function baseRefundParamsFromRecord(rec: SettlementRecord): Erc20SwapPara
     claimAddress: rec.baseClaimAddress as `0x${string}`,
     refundAddress: rec.baseRefundAddress as `0x${string}`,
     timelock: BigInt(rec.baseTimelockBlock),
+  }
+}
+
+/** Bind outcome scans to the record's own Lockup receipt (`SettlementRecord.baseLockTxHash`). */
+export function baseResolutionAnchorFromRecord(rec: SettlementRecord): SwapResolutionAnchor | undefined {
+  if (!Number.isSafeInteger(rec.baseLockBlock) || rec.baseLockBlock! <= 0 ||
+      typeof rec.baseLockTxHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(rec.baseLockTxHash)) return undefined
+  return {
+    blockNumber: BigInt(rec.baseLockBlock!),
+    transactionHash: rec.baseLockTxHash as `0x${string}`,
+    ...(Number.isSafeInteger(rec.baseLockLogIndex) && rec.baseLockLogIndex! >= 0 ? { logIndex: rec.baseLockLogIndex } : {}),
   }
 }
 
@@ -425,7 +449,15 @@ export interface BaseWatchtowerOpts {
   /** Canonical exact-tuple mapping read at the OP-stack finalized head. */
   baseIsSwapLockedFinalized?: (params: Erc20SwapParams) => Promise<boolean>
   /** Finalized canonical Claim/Refund event outcome, bounded from the recorded lock block. */
-  baseResolveSwapOutcome?: (params: Erc20SwapParams, fromBlock: bigint) => Promise<SwapResolutionOutcome>
+  baseResolveSwapOutcome?: (params: Erc20SwapParams, anchor: SwapResolutionAnchor) => Promise<SwapResolutionOutcome>
+  /** Finalized payment evidence: Refund is valid only with the full pinned-token Transfer to refundAddress. */
+  baseFindClaimPayingTuple?: (params: Erc20SwapParams, fromBlock: bigint) => Promise<
+    { kind: 'paid'; txid: `0x${string}` } |
+    { kind: 'refunded'; txid: `0x${string}`; scannedThrough: bigint } |
+    { kind: 'none'; scannedThrough: bigint }
+  >
+  /** Receipt block for finalized full-transfer refund evidence. */
+  baseRefundBlockNumber?: (txid: `0x${string}`) => Promise<number | null>
 }
 
 /**
@@ -458,8 +490,19 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
     must(evm).txFinalized(txid as `0x${string}`, requireSuccess))
   const baseIsSwapLockedFinalized = opts.baseIsSwapLockedFinalized ?? (async (params: Erc20SwapParams) =>
     must(evm).isSwapLockedFinalized(params))
-  const baseResolveSwapOutcome = opts.baseResolveSwapOutcome ?? (async (params: Erc20SwapParams, fromBlock: bigint) =>
-    must(evm).resolveSwapOutcome(params, fromBlock))
+  const baseResolveSwapOutcome = opts.baseResolveSwapOutcome ?? (async (params: Erc20SwapParams, anchor: SwapResolutionAnchor) =>
+    must(evm).resolveSwapOutcome(params, anchor))
+  const baseFindClaimPayingTuple = opts.baseFindClaimPayingTuple ?? (evm && typeof evm.findClaimPayingTuple === 'function'
+    ? (async (params: Erc20SwapParams, fromBlock: bigint) => evm.findClaimPayingTuple(params, fromBlock))
+    : undefined)
+  const baseRefundBlockNumber = opts.baseRefundBlockNumber ?? (evm
+    ? (async (txid: `0x${string}`) => evm.blockOfTx(txid))
+    : undefined)
+  const now = opts.now ?? (() => Math.floor(Date.now() / 1000))
+  let lastExternalRefundScanAtMs = Number.NEGATIVE_INFINITY
+  let lastInactiveOutcomeScanAtMs = Number.NEGATIVE_INFINITY
+  const EXTERNAL_REFUND_RESCAN_MS = 10 * 60_000
+  const INACTIVE_OUTCOME_RESCAN_MS = 10 * 60_000
 
   return {
     // Initiator gate is the BASE height; bsvHeight is unused by evaluateWatch for this role.
@@ -511,15 +554,16 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
     assertInitiatorRefundSafe: opts.assertInitiatorRefundSafe ?? ((record) => assertInitiatorRefundSafeOnBsv(record)),
     ...(opts.onInitiatorRefundSafetyResult ? { onInitiatorRefundSafetyResult: opts.onInitiatorRefundSafetyResult } : {}),
     alreadyResolvedFinality: async (rec, result): Promise<ResolutionFinalityClassification> => {
-      if (result.operation !== 'refund' || !Number.isSafeInteger(rec.baseLockBlock) || (rec.baseLockBlock as number) <= 0) {
-        return { kind: 'unresolved', reason: 'refund operation or bounded lock-block anchor missing' }
+      const anchor = baseResolutionAnchorFromRecord(rec)
+      if (result.operation !== 'refund' || !anchor) {
+        return { kind: 'unresolved', reason: 'refund operation or own-Lockup receipt anchor missing' }
       }
       const params = baseRefundParamsFromRecord(rec)
       if (!await baseRefundTransactionMatches(result.txid, params) || !await baseTransactionFinalized(result.txid, false) ||
           await baseIsSwapLockedFinalized(params)) {
         return { kind: 'unresolved', reason: 'exact refund call, finalized reverted receipt, or finalized tuple-absence proof failed' }
       }
-      const outcome = await baseResolveSwapOutcome(params, BigInt(rec.baseLockBlock as number))
+      const outcome = await baseResolveSwapOutcome(params, anchor)
       if (outcome.kind !== 'unresolved' && outcome.eventTxid.toLowerCase() === result.txid.toLowerCase()) {
         return { kind: 'unresolved', reason: 'the reverted refund transaction cannot also be the canonical resolution event transaction' }
       }
@@ -530,7 +574,11 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
     // refund broadcast. For the INITIATOR, it is the blocking live-state safety gate rather than an event scan:
     // true => still escrowed/safe, false/error => throw so the core logs NOT-refunding + keeps polling.
     checkReveal: async (rec: SettlementRecord): Promise<null> => {
-      if (rec.state === 'revealed' || rec.bsvClaimTxid || rec.bsvClaimTxHex || rec.bsvClaimBeefHex) throw new Error('initiator refund safety: durable BSV claim/reveal evidence exists; NOT refunding')
+      const resolutionObservationException = rec.role === 'initiator' &&
+        (rec.state === 'revealed' || rec.state === 'refunding') && !!(rec.claimPublicationRefused || rec.bsvLockRefundEvidence)
+      if (!resolutionObservationException && (rec.state === 'revealed' || rec.bsvClaimTxid || rec.bsvClaimTxHex || rec.bsvClaimBeefHex)) {
+        throw new Error('initiator refund safety: durable BSV claim/reveal evidence exists; NOT refunding')
+      }
       const params = baseRefundParamsFromRecord(rec)
       let locked: boolean
       try {
@@ -540,11 +588,58 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
         throw new Error(`initiator refund safety: isSwapLocked read failed — USDC lock state unknown; NOT refunding this poll: ${reason}`)
       }
       if (!locked) {
-        throw new Error('initiator refund safety: isSwapLocked returned false — swap was claimed/already refunded or never locked; NOT refunding this poll')
+        const anchor = baseResolutionAnchorFromRecord(rec)
+        if (!anchor) throw new InactiveBaseLockError()
+        const scanAtMs = now() * 1000
+        if (scanAtMs - lastInactiveOutcomeScanAtMs < INACTIVE_OUTCOME_RESCAN_MS) throw new InactiveBaseLockError()
+        // Count failed scans too: getLogs is the expensive read, but isSwapLocked above remains on every normal poll.
+        lastInactiveOutcomeScanAtMs = scanAtMs
+        let outcome: SwapResolutionOutcome
+        try { outcome = await baseResolveSwapOutcome(params, anchor) }
+        catch { throw new InactiveBaseLockError() }
+        if (outcome.kind === 'claimed' && Number.isSafeInteger(outcome.eventBlock) && outcome.eventBlock! > 0) {
+          throw new InactiveBaseLockError({ outcome: 'claimed', eventTxid: outcome.eventTxid, eventBlock: outcome.eventBlock!, preimageHex: outcome.preimage.slice(2) })
+        }
+        if (outcome.kind === 'refunded' && Number.isSafeInteger(outcome.eventBlock) && outcome.eventBlock! > 0) {
+          throw new InactiveBaseLockError({ outcome: 'refunded', eventTxid: outcome.eventTxid, eventBlock: outcome.eventBlock! })
+        }
+        throw new InactiveBaseLockError()
       }
       return null
     },
 
+    ...(baseFindClaimPayingTuple && baseRefundBlockNumber ? { externalBaseRefund: async (rec: SettlementRecord) => {
+      if (!Number.isSafeInteger(rec.baseLockBlock) || rec.baseLockBlock! < 1 || rec.secretHex || rec.bsvClaimTxid || rec.bsvClaimTxHex || rec.bsvClaimBeefHex || rec.baseRecoveryClaimTxid || rec.competingResolution) {
+        return { kind: 'none' as const }
+      }
+      const params = baseRefundParamsFromRecord(rec)
+      // A finalized locked mapping proves no finalized Claim/Refund can exist yet. This cheap state read keeps the
+      // ordinary 15-second recovery poll from rescanning the roughly 288k-block Lockup window while escrow is live.
+      if (await baseIsSwapLockedFinalized(params)) return { kind: 'none' as const }
+      const scanAtMs = now() * 1000
+      if (scanAtMs - lastExternalRefundScanAtMs < EXTERNAL_REFUND_RESCAN_MS) return { kind: 'none' as const }
+      // Count a failed scan too: an unhealthy log provider must not consume the shared Base pool every 15 seconds.
+      lastExternalRefundScanAtMs = scanAtMs
+      const evidence = await baseFindClaimPayingTuple(params, BigInt(rec.baseLockBlock!))
+      if (evidence.kind === 'refunded') {
+        
+        // permissionless cooperative call is accepted here only because the same finalized receipt paid the exact
+        
+        if (await baseRefundTransactionMatches(evidence.txid, params)) return { kind: 'none' as const }
+        const blockNumber = await baseRefundBlockNumber(evidence.txid)
+        if (blockNumber === null || !Number.isSafeInteger(blockNumber) || blockNumber < 1) throw new Error('cooperative Refund receipt block is invalid')
+        return { kind: 'cooperative' as const, txid: evidence.txid, blockNumber }
+      }
+      if (evidence.kind === 'paid') return { kind: 'none' as const }
+      const anchor = baseResolutionAnchorFromRecord(rec)
+      if (!anchor) return { kind: 'none' as const }
+      const outcome = await baseResolveSwapOutcome(params, anchor)
+      if (outcome.kind === 'refunded') {
+        return { kind: 'attention' as const, txid: outcome.eventTxid, reason: 'external Refund lacked the exact full pinned-token Transfer to the refund address' }
+      }
+      if (outcome.kind === 'unresolved' && outcome.reason === 'read-error') throw new Error(outcome.detail ?? 'resolution read failed')
+      return { kind: 'none' as const }
+    } } : {}),
     reloadPersistedRecord: async (): Promise<SettlementRecord> => {
       const fresh = sessionFromRecordFile(readSettlementRecordFile(opts.persistPath)).toRecord()
       if (opts.strictPersistedRecordTrust) {
@@ -570,7 +665,7 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
     persist: async (rec: SettlementRecord): Promise<void> => persistWatchtowerAdapterRecord(opts.persistPath, recoveryIdentity, rec, opts.strictPersistedRecordTrust),
 
     emit: opts.emit ?? ((s): void => console.log(`  [wt] ${s.action} · ${s.note}${s.gate ? ` (base gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`)),
-    now: opts.now ?? (() => Math.floor(Date.now() / 1000)),
+    now,
     sleep: opts.sleep ?? realSleep,
     pollMs: opts.pollMs ?? 15_000,
     maxPolls: opts.maxPolls ?? 240,

@@ -1,10 +1,10 @@
 export type BsvHeightPurpose = 'risk' | 'recovery' | 'finality'
 export interface BsvHeightSource {
-  currentHeight(): Promise<number>
+  currentHeight(signal?: AbortSignal): Promise<number>
 }
 
 export interface BsvHeightReader {
-  readBsvHeight(purpose: BsvHeightPurpose): Promise<number>
+  readBsvHeight(purpose: BsvHeightPurpose, signal?: AbortSignal): Promise<number>
 }
 
 export interface BsvHeightReaderDeps {
@@ -59,8 +59,10 @@ export function makeBsvHeightReader(sources: BsvHeightSource[], deps: BsvHeightR
   }
 
   return {
-    readBsvHeight: async (purpose: BsvHeightPurpose): Promise<number> => {
-      const settled = await Promise.allSettled(sources.map((source) => source.currentHeight()))
+    readBsvHeight: async (purpose: BsvHeightPurpose, signal?: AbortSignal): Promise<number> => {
+      signal?.throwIfAborted()
+      const settled = await Promise.allSettled(sources.map((source) => source.currentHeight(signal)))
+      signal?.throwIfAborted()
       const heights = settled
         .filter((result): result is PromiseFulfilledResult<number> => result.status === 'fulfilled' && Number.isSafeInteger(result.value) && result.value > 0)
         .map((result) => result.value)

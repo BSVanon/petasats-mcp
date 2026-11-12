@@ -1,6 +1,8 @@
-import { SettlementSession, validateSettlementRecord, type CompetingResolution, type SettlementRecord, type SettlementState, type SwapRole } from './settlement-session'
-import type { BsvClaimProof } from './bsv-claim-proof'
+import { SettlementSession, validateSettlementRecord, type BaseTerminalResolution, type CompetingResolution, type SettlementRecord, type SettlementState, type SwapRole } from './settlement-session'
+import { DEFAULT_BSV_FINALITY_CONFIRMATIONS, type BsvClaimProof } from './bsv-claim-proof'
 import { BASE_BLOCK_SECS_FLOOR, baseAvailableSecsForBlocks, snapBaseSecondsNearInteger } from './base-block-time'
+import type { FirstPublicationGuardResult } from './first-publication-guard'
+import { proveBsvLockCovenantRefund } from './initiator-refund-safety'
 export type WatchAction =
   | 'idle' // nothing locked yet
   | 'wait' // locked, refund timelock not yet matured (heartbeat)
@@ -13,6 +15,7 @@ export type WatchAction =
   | 'settled' // swap settled (terminal)
   | 'needs-attention' // a finalized competing Base resolution won; durable record retained, never retried/deleted
   | 'aborted' // aborted (terminal)
+
 /** The soonest relevant refund gate, with the ETA a human reads. */
 export interface WatchGate {
   name: 'bsv-refund' | 'base-refund'
@@ -43,6 +46,16 @@ export type ResolutionFinalityClassification =
   | { kind: 'favorable'; eventTxid?: string }
   | { kind: 'competing'; resolution: CompetingResolution }
   | { kind: 'unresolved'; reason?: string }
+
+/** Exact inactive-lock classification from the Base adapter. Only the resolved variant may end a record. */
+export class InactiveBaseLockError extends Error {
+  constructor(readonly resolution?: BaseTerminalResolution & { preimageHex?: string }) {
+    super(resolution
+      ? `initiator refund safety: isSwapLocked returned false — finalized ${resolution.outcome} event ${resolution.eventTxid} at Base block ${resolution.eventBlock}`
+      : 'initiator refund safety: isSwapLocked returned false — swap resolution is not proven; NOT refunding this poll')
+    this.name = 'InactiveBaseLockError'
+  }
+}
 
 const ALREADY_RESOLVED_PREFIX = 'watchtower-already-resolved:'
 
@@ -78,9 +91,7 @@ export interface SecsPerBlock {
 }
 /** BSV ~10 min/block; Base uses the supported floor — ETA only (gates compare heights, not clocks). */
 export const DEFAULT_SECS_PER_BLOCK: SecsPerBlock = { bsv: 600, base: BASE_BLOCK_SECS_FLOOR }
-/** Six BSV blocks (~1 hour) is the minimum terminal burial used by recovery. A persisted producer target may raise
- * this floor but can never lower it back to the unsafe historical 1-confirmation behavior. */
-export const DEFAULT_BSV_FINALITY_CONFIRMATIONS = 6
+export { DEFAULT_BSV_FINALITY_CONFIRMATIONS } from './bsv-claim-proof'
 
 /** The heartbeat emitted every poll — the "read-through" a downstream human/orchestrator sees. */
 export interface WatchtowerStatus {
@@ -109,7 +120,7 @@ function mkGate(name: WatchGate['name'], chain: WatchGate['chain'], atHeight: nu
 }
 
 /** A rail answer establishes public visibility only when it identifies the exact requested transaction. */
-function isExactFetchedTx(tx: unknown, txid: string): boolean {
+export function isExactFetchedTx(tx: unknown, txid: string): boolean {
   if (!tx || typeof tx !== 'object' || !('id' in tx) || typeof tx.id !== 'function') return false
   try {
     const fetchedId = tx.id('hex')
@@ -125,8 +136,9 @@ export interface WatchDecision {
 
 /**
  * PURE decision — given the record + live heights, what should the watchtower do this tick? Refund
- * only in locked-but-not-revealed states (`base-locked` | `bsv-locked` | `refunding`); once revealed
- * the swap is completing, and terminal states are no-ops. The relevant leg + gate is chosen by role.
+ * only in locked states (`base-locked` | `bsv-locked` | `refunding`), except that a revealed initiator carrying
+ * covenant-refund evidence remains observable for its fail-closed Base-resolution route. Terminal states are
+ * no-ops. The relevant leg + gate is chosen by role.
  */
 export function evaluateWatch(rec: SettlementRecord, heights: WatchHeights, secs: SecsPerBlock = DEFAULT_SECS_PER_BLOCK): WatchDecision {
   if (rec.competingResolution) {
@@ -139,7 +151,11 @@ export function evaluateWatch(rec: SettlementRecord, heights: WatchHeights, secs
     case 'settled': return { action: 'settled', note: 'swap settled' }
     case 'refunded': return { action: 'refunded', note: 'funds already recovered' }
     case 'aborted': return { action: 'aborted', note: rec.abortReason ?? 'aborted' }
-    case 'revealed': return { action: 'reveal-seen', note: '`s` revealed — happy path completing (claim, not refund)' }
+    case 'revealed':
+      if (!(rec.role === 'initiator' && rec.bsvLockRefundEvidence)) {
+        return { action: 'reveal-seen', note: '`s` revealed — happy path completing (claim, not refund)' }
+      }
+      break // observation is allowed; fresh responder-covenant-refund proof is still required before any refund/convergence
     case 'created': return { action: 'idle', note: 'nothing locked yet' }
     default: break // base-locked | bsv-locked | refunding → refund-eligible
   }
@@ -185,6 +201,12 @@ export interface WatchtowerDeps {
   minimumRefundConfs?: number
   /** Has the counterparty revealed `s` on-chain (a competing claim racing our refund)? Secret hex, else null. */
   checkReveal: (rec: SettlementRecord) => Promise<string | null>
+  /** Initiator-only finalized external Refund classifier, polled before the timelock gate. */
+  externalBaseRefund?: (rec: SettlementRecord) => Promise<
+    { kind: 'cooperative'; txid: string; blockNumber: number } |
+    { kind: 'attention'; txid: string; reason: string } |
+    { kind: 'none' }
+  >
   /**
    * Re-read the authoritative durable record from its persistence file immediately before a first
    * refund broadcast. Optional for callers without a file-backed store. MUST throw on any read or
@@ -225,8 +247,9 @@ export interface WatchtowerDeps {
   /** Bind the persisted Base recovery claim hash to claim(exact tuple, recorded secret), then prove its successful
    * receipt (or the legacy already-resolved exact-tuple result) is below the OP-stack finalized head. */
   receiveClaimFinality?: (rec: SettlementRecord, claimTxid: string, alreadyResolved: boolean) => Promise<ResolutionFinalityClassification>
-  /** BR-H3 INITIATOR recovery: re-submit the exact persisted BSV claim artifact. Already-known/mined is success. */
-  rebroadcastClaim?: (rec: SettlementRecord) => Promise<string>
+  /** BR-H3 INITIATOR recovery: re-submit the exact persisted BSV claim artifact. `guardedFirstPublication` means the
+   * caller has just completed every awaited fence + the first-publication guard, so the adapter must send immediately. */
+  rebroadcastClaim?: (rec: SettlementRecord, opts?: { guardedFirstPublication?: true }) => Promise<string>
   /** BR-H3 recovery proof of which transaction, if any, spent the persisted BSV lock outpoint. Absence is doubt:
    * do not publish a write-ahead-only secret without this read. */
   resolveSpender?: (txid: string, vout: number) => Promise<string | null>
@@ -240,10 +263,17 @@ export interface WatchtowerDeps {
   claimArtifactTxid?: (rec: SettlementRecord) => Promise<string>
   /** Reorg-safe BSV Merkle/depth proof for the already-bound claim artifact. */
   claimFinality?: (rec: SettlementRecord, claimTxid: string, confirmations: number) => Promise<boolean>
+  /** Header-validated finality proof for a responder covenant refund before it can become Base-refund evidence. */
+  bsvLockRefundFinality?: (refundTxid: string, minimumConfirmations: number) => Promise<boolean>
   /** Evidence-only header proof collected before the existing burial target is reached. */
   claimMinedProof?: (rec: SettlementRecord, claimTxid: string) => Promise<BsvClaimProof | undefined>
   /** Non-lowerable BSV claim burial floor (default six). */
   minimumClaimConfs?: number
+  /** Ordered guard for any persisted claim which is not demonstrably public yet. Missing fails closed. */
+  firstPublicationGuard?: (rec: SettlementRecord) => Promise<FirstPublicationGuardResult>
+  /** Awaited ownership/send fence for a private claim. This runs BEFORE `firstPublicationGuard`; after the guard
+   * succeeds, `rebroadcastClaim(..., { guardedFirstPublication: true })` must reach the network send without an await. */
+  beforeFirstClaimPublication?: () => void | Promise<void>
   /** Three-way finalized event outcome for the narrow mined-revert/already-resolved convergence path. */
   alreadyResolvedFinality?: (rec: SettlementRecord, result: SwapAlreadyResolved) => Promise<ResolutionFinalityClassification>
   /** Optional supervisor cancellation fence. Checked at the start of every poll; a superseded in-memory session
@@ -319,9 +349,10 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
 
   const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
   let lastHeights: WatchHeights = { bsvHeight: 0, baseHeight: 0 }
+  let lastInactiveLockWarningAt = Number.NEGATIVE_INFINITY
   for (let i = 0; i < deps.maxPolls; i++) {
     if (deps.shouldContinue && !deps.shouldContinue()) return session.toRecord()
-    const maybeSleep = async (): Promise<void> => { if (i < deps.maxPolls - 1) await deps.sleep(deps.pollMs) }
+    const maybeSleep = async (minimumMs = 0): Promise<void> => { if (i < deps.maxPolls - 1) await deps.sleep(Math.max(deps.pollMs, minimumMs)) }
 
     // Read-side deps are wrapped: a transient RPC/indexer error → wait heartbeat + retry, never exit.
     let heights: WatchHeights
@@ -451,6 +482,32 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
       await maybeSleep(); continue
     }
 
+    if (rec.role === 'initiator' && (rec.state === 'base-locked' || rec.state === 'refunding') &&
+        !rec.secretHex && !rec.bsvClaimTxid && !rec.bsvClaimTxHex && !rec.bsvClaimBeefHex &&
+        !rec.baseRecoveryClaimTxid && !rec.competingResolution && deps.externalBaseRefund) {
+      try {
+        const external = await deps.externalBaseRefund(rec)
+        if (external.kind === 'cooperative') {
+          const candidate = SettlementSession.fromRecord(session.toRecord())
+          candidate.markCooperativeRefunded(external.txid, external.blockNumber, deps.now())
+          await deps.persist(candidate.toRecord())
+          session = candidate
+          emit('refunded', `cooperative Base Refund ${external.txid} returned the exact full pinned-token amount at block ${external.blockNumber}`)
+          return session.toRecord()
+        }
+        if (external.kind === 'attention') {
+          if (await retainCompetingResolution({ outcome: 'refunded', eventTxid: external.txid, cause: 'malformed-refund' }, external.reason)) {
+            return session.toRecord()
+          }
+          await maybeSleep(); continue
+        }
+      } catch (e) {
+        emit('wait', `external Base Refund classification failed (will retry fail-closed): ${msg(e)}`)
+        // Classification is an optional early-terminal read. Its failure must never suppress the same poll's
+        
+      }
+    }
+
     const decision = evaluateWatch(rec, heights, secs)
 
     if (decision.action === 'settled' || decision.action === 'refunded' || decision.action === 'aborted' || decision.action === 'needs-attention') {
@@ -498,9 +555,11 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
           emit('wait', `malformed claim confirmation count (${claimConfs}) — treating as a read failure, will retry`, { gate: decision.gate })
           await maybeSleep(); continue
         }
-        if (claimConfs > 0 && claimConfs < claimTarget && deps.claimMinedProof) {
+        let claimProvenPublic = false
+        if (claimConfs < claimTarget && deps.claimMinedProof) {
           try {
             const proof = await deps.claimMinedProof(rec, artifactTxid)
+            claimProvenPublic = proof !== undefined
             if (proof && typeof proof.root === 'string' &&
                 (rec.bsvClaimProvenHeight !== proof.height || rec.bsvClaimProvenRoot !== proof.root)) {
               const candidate = { ...session.toRecord(), bsvClaimProvenHeight: proof.height, bsvClaimProvenRoot: proof.root }
@@ -564,8 +623,33 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
             if (i % 10 === 0) emit('needs-attention', note, { gate: decision.gate, confirmations: claimConfs })
             else emit('wait', 'manual intervention remains active; claim not broadcast', { gate: decision.gate, confirmations: claimConfs })
           }
+          // Only exact fetched bytes or a header-validated Merkle proof demonstrate publication. A discovery-provider
+          // confirmation count alone is never authority to skip the spender/latch/Base/runway/deadline guard.
+          let claimKnown = claimProvenPublic
+          if (deps.fetchTx) {
+            try { claimKnown = claimKnown || isExactFetchedTx(await deps.fetchTx(artifactTxid), artifactTxid) }
+            catch (e) {
+              if (!claimKnown) {
+                emit('wait', `BSV claim lookup failed (will retry; claim not broadcast): ${msg(e)}`, { gate: decision.gate, confirmations: claimConfs })
+                await maybeSleep(); continue
+              }
+            }
+          }
+          if (claimKnown) {
+            try {
+              const again = await deps.rebroadcastClaim(rec)
+              emit('claim-broadcast', `BSV claim ${rec.bsvClaimTxid} unconfirmed (${claimConfs}/${claimTarget}) — ${i === 0 ? 'broadcast' : 'RE-broadcast'} for mempool-eviction recovery (${isRealRefundTxid(again) ? again : 'revalidated'})`, { gate: decision.gate, confirmations: claimConfs })
+            } catch (e) {
+              emit('wait', `claim re-broadcast failed (will retry): ${msg(e)}`, { gate: decision.gate })
+            }
+            await maybeSleep(); continue
+          }
           if (!deps.resolveSpender) {
-            emit('wait', 'BSV lock-spender rail is not wired — refusing to re-broadcast claim blind (fail-closed)', { gate: decision.gate, confirmations: claimConfs })
+            if (rec.claimPublicationRefused) {
+              manualAttention(`MANUAL ATTENTION: first publication was durably refused at ${rec.claimPublicationRefused.atMs}: ${rec.claimPublicationRefused.reason}; claim not broadcast`)
+              await maybeSleep(); continue
+            }
+            emit('wait', 'BSV lock-spender rail is not wired — refusing first publication blind (fail-closed)', { gate: decision.gate, confirmations: claimConfs })
             await maybeSleep(); continue
           }
           const [lockTxid, voutText] = (rec.bsvLockOutpoint ?? '').split('_')
@@ -606,48 +690,76 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
               }
             }
             if (competingSpend === 'verified') {
-              manualAttention(`MANUAL ATTENTION: BSV lock spent by ${spenderTxid.slice(0, 8)} (not our claim); claim not broadcast; check Base`)
-              await maybeSleep(); continue
+              try {
+                const evidence = await proveBsvLockCovenantRefund(rec, {
+                  resolveSpender: deps.resolveSpender,
+                  fetchTx: async (txid) => await deps.fetchTx!(txid) as import('@bsv/sdk').Transaction | null,
+                  proveFinality: deps.bsvLockRefundFinality,
+                }, () => deps.now() * 1_000)
+                const candidate = SettlementSession.fromRecord(session.toRecord())
+                candidate.recordBsvLockRefundEvidence(evidence.spenderTxid, evidence.observedAtMs)
+                await deps.persist(candidate.toRecord())
+                session = candidate
+                emit('wait', `BSV responder covenant refund ${evidence.spenderTxid} proven and persisted — claim can never land; re-arm the initiator Base-refund route`, { gate: decision.gate, confirmations: claimConfs })
+                return session.toRecord()
+              } catch (e) {
+                manualAttention(`MANUAL ATTENTION: BSV lock spent by ${spenderTxid.slice(0, 8)} (not our claim); covenant refund not proven (${msg(e)}); claim not broadcast; check Base`)
+                await maybeSleep(); continue
+              }
             }
             if (competingSpend === 'disproven') {
               emit('wait', `BSV spender discovery reported non-spender ${spenderTxid.slice(0, 8)}; continuing claim recovery`, { gate: decision.gate, confirmations: claimConfs })
               spenderTxid = null
             } else {
-              let claimKnown = false
-              if (deps.fetchTx) {
-                try { claimKnown = isExactFetchedTx(await deps.fetchTx(artifactTxid), artifactTxid) } catch { /* remains unverifiable */ }
-              }
-              if (!claimKnown) {
-                manualAttention(`MANUAL ATTENTION: BSV spender ${spenderTxid.slice(0, 8)} is unverifiable; claim not broadcast; check Base`)
-                await maybeSleep(); continue
-              }
-              // A fetched copy proves our persisted claim is already public, so replaying it cannot reveal the secret.
-              spenderTxid = artifactTxid
+              manualAttention(`MANUAL ATTENTION: BSV spender ${spenderTxid.slice(0, 8)} is unverifiable; claim not broadcast; check Base`)
+              await maybeSleep(); continue
             }
           }
-          // A discovery answer naming our artifact is still only an unverified assertion. Treat it exactly as an
-          // unspent result so the exact-id public-claim check and reveal runway below decide whether replay is safe.
-          if (spenderTxid?.toLowerCase() === artifactTxid.toLowerCase()) spenderTxid = null
-          if (!spenderTxid) {
-            let claimKnown = false
-            if (deps.fetchTx) {
+          // A terminal publication latch forbids only our first claim publication. Keep observing the already-locked
+          // outpoint above: a later responder covenant refund can safely re-arm the Base-refund route without ever
+          // publishing the losing claim.
+          if (rec.claimPublicationRefused) {
+            manualAttention(`MANUAL ATTENTION: first publication was durably refused at ${rec.claimPublicationRefused.atMs}: ${rec.claimPublicationRefused.reason}; claim not broadcast`)
+            await maybeSleep(); continue
+          }
+          // A discovery answer naming our artifact is still only an unverified assertion. The exact fetch above did
+          // not prove publication, so this remains a guarded first publication.
+          if (!deps.firstPublicationGuard) {
+            emit('wait', 'first-publication guard rails are not wired — claim not broadcast (fail-closed)', { gate: decision.gate, confirmations: claimConfs })
+            await maybeSleep(); continue
+          }
+          if (deps.beforeFirstClaimPublication) {
+            try { await deps.beforeFirstClaimPublication() }
+            catch (e) {
+              emit('wait', `first-publication send fence failed (will retry; claim not broadcast): ${msg(e)}`, { gate: decision.gate, confirmations: claimConfs })
+              await maybeSleep(); continue
+            }
+          }
+          let publication: FirstPublicationGuardResult
+          try { publication = await deps.firstPublicationGuard(rec) }
+          catch (e) {
+            emit('wait', `first-publication guard failed (will retry; claim not broadcast): ${msg(e)}`, { gate: decision.gate, confirmations: claimConfs })
+            await maybeSleep(); continue
+          }
+          if (!publication.ok) {
+            if (publication.terminal) {
               try {
-                claimKnown = isExactFetchedTx(await deps.fetchTx(artifactTxid), artifactTxid)
+                const candidate = SettlementSession.fromRecord(session.toRecord())
+                candidate.recordClaimPublicationRefused(deps.now() * 1_000, publication.reason)
+                await deps.persist(candidate.toRecord())
+                session = candidate
+                manualAttention(`MANUAL ATTENTION: first publication permanently refused and latched: ${publication.reason}`)
               } catch (e) {
-                emit('wait', `BSV claim lookup failed (will retry; claim not broadcast): ${msg(e)}`, { gate: decision.gate, confirmations: claimConfs })
-                await maybeSleep(); continue
+                emit('wait', `terminal first-publication refusal could not be persisted — claim not broadcast (will retry fail-closed): ${msg(e)}`, { gate: decision.gate, confirmations: claimConfs })
               }
+            } else {
+              emit('wait', `${publication.reason}; claim not broadcast this attempt`, { gate: decision.gate, confirmations: claimConfs })
             }
-            if (!claimKnown) {
-              const runway = session.guardInitiatorCanReveal(heights.bsvHeight, { recovery: true })
-              if (!runway.ok) {
-                manualAttention('MANUAL ATTENTION: reveal runway expired before the claim was seen; claim not broadcast; USDC is refundable after the Base timelock once the BSV is refunded')
-                await maybeSleep(); continue
-              }
-            }
+            await maybeSleep(); continue
           }
           try {
-            const again = await deps.rebroadcastClaim(rec)
+            // No await may be introduced between the successful guard above and the adapter's network-send call.
+            const again = await deps.rebroadcastClaim(rec, { guardedFirstPublication: true })
             emit('claim-broadcast', `BSV claim ${rec.bsvClaimTxid} unconfirmed (${claimConfs}/${claimTarget}) — ${i === 0 ? 'broadcast' : 'RE-broadcast'} for mempool-eviction recovery (${isRealRefundTxid(again) ? again : 'revalidated'})`, { gate: decision.gate, confirmations: claimConfs })
           } catch (e) {
             emit('wait', `claim re-broadcast failed (will retry): ${msg(e)}`, { gate: decision.gate })
@@ -709,20 +821,22 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
       }
       // A Base refund after the BSV claim published `s` would take both legs. Every initiator recovery must inspect
       // durable claim evidence plus the exact BSV lock outpoint; a missing rail is itself doubt and fails closed.
-      if (decision.action === 'refund-base') {
+      const proveInitiatorRefundSafety = async (): Promise<boolean> => {
+        if (decision.action !== 'refund-base') return true
         if (!deps.assertInitiatorRefundSafe) {
           deps.onInitiatorRefundSafetyResult?.('initiator refund safety rail is missing')
           emit('wait', 'initiator refund safety rail is missing — NOT refunding because BSV claim/preimage status is unknown', { gate: decision.gate })
-          await maybeSleep(); continue
+          return false
         }
         try {
           await deps.assertInitiatorRefundSafe(rec)
           deps.onInitiatorRefundSafetyResult?.()
+          return true
         } catch (e) {
           const error = msg(e)
           deps.onInitiatorRefundSafetyResult?.(error)
           emit('wait', `initiator BSV claim/preimage check failed — NOT refunding this poll (fail-closed): ${error}`, { gate: decision.gate })
-          await maybeSleep(); continue
+          return false
         }
       }
       // Not yet broadcast (or a dry-sentinel-poisoned record, or retrying a failed broadcast). Check for a
@@ -732,7 +846,40 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
       try {
         revealed = await deps.checkReveal(rec)
       } catch (e) {
-        emit('wait', `reveal check failed — NOT refunding this poll (fail-closed): ${msg(e)}`, { gate: decision.gate })
+        if (e instanceof InactiveBaseLockError && e.resolution) {
+          if (e.resolution.outcome === 'claimed' && (rec.claimPublicationRefused || rec.bsvLockRefundEvidence)) {
+            const retained = await retainCompetingResolution({
+              outcome: 'claimed', eventTxid: e.resolution.eventTxid, preimageHex: e.resolution.preimageHex,
+            }, 'inactive Base-lock convergence', { gate: decision.gate })
+            if (retained) return session.toRecord()
+            await maybeSleep(); continue
+          }
+          if (e.resolution.outcome === 'refunded' && !await proveInitiatorRefundSafety()) {
+            await maybeSleep(); continue
+          }
+          try {
+            const candidate = SettlementSession.fromRecord(session.toRecord())
+            candidate.markBaseResolutionTerminal(e.resolution, e.resolution.preimageHex, deps.now())
+            await deps.persist(candidate.toRecord())
+            session = candidate
+            emit(e.resolution.outcome === 'claimed' ? 'settled' : 'refunded',
+              `terminal-${e.resolution.outcome}: finalized Base event ${e.resolution.eventTxid} at block ${e.resolution.eventBlock}; polling stopped`,
+              { gate: decision.gate })
+            return session.toRecord()
+          } catch (persistError) {
+            emit('wait', `Base resolution proof could not be durably recorded — record left unchanged (fail-closed): ${msg(persistError)}`, { gate: decision.gate })
+            await maybeSleep(); continue
+          }
+        }
+        if (!(e instanceof InactiveBaseLockError) || deps.now() - lastInactiveLockWarningAt >= 60 * 60) {
+          emit('wait', `reveal check failed — NOT refunding this poll (fail-closed): ${msg(e)}`, { gate: decision.gate })
+          if (e instanceof InactiveBaseLockError) lastInactiveLockWarningAt = deps.now()
+        }
+        // Inactive-lock warnings are hourly and the adapter's expensive getLogs scan is ten-minute throttled, but
+        // the recovery loop itself keeps its normal cadence so the next true live-state read can refund immediately.
+        await maybeSleep(); continue
+      }
+      if (!await proveInitiatorRefundSafety()) {
         await maybeSleep(); continue
       }
       if (revealed) {
