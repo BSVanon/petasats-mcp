@@ -67,12 +67,13 @@ describe('safeMkdir — the owner-only directory helper shared by local-state an
     return { calls, fileSystem: fileSystem as unknown as Parameters<typeof safeMkdir>[1] }
   }
 
-  it('with the real constants on Linux: lstat, mkdir, lstat, open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW), fstat, fchmod 0700, close', () => {
+  it('with the real constants on Linux: lstat, mkdir, lstat, open(O_RDONLY|O_DIRECTORY|O_NOFOLLOW), fstat, fchmod 0700, close', function () {
+    if (process.platform === 'win32') { this.skip(); return } // Windows lacks O_DIRECTORY; the injected-constants test below covers that branch
     const path = join(parent, 'd')
     const { calls, fileSystem } = spy()
     safeMkdir(path, fileSystem)
     expect(calls).to.deep.equal(['lstat', 'mkdir', 'lstat', 'open', 'fstat', 'fchmod', 'close'])
-    expect(statSync(path).mode & 0o777).to.equal(0o700)
+    if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).to.equal(0o700) // Windows reports synthesized 0o666 mode bits
   })
 
   it('with injected constants lacking O_DIRECTORY (the win32 gap), safeMkdir chmods the path and never opens or fchmods a directory handle', () => {
@@ -81,6 +82,6 @@ describe('safeMkdir — the owner-only directory helper shared by local-state an
     const fsConstants = { ...constants, O_DIRECTORY: undefined } as unknown as Parameters<typeof safeMkdir>[2]
     safeMkdir(path, fileSystem, fsConstants)
     expect(calls).to.deep.equal(['lstat', 'mkdir', 'lstat', 'chmod'])
-    expect(statSync(path).mode & 0o777).to.equal(0o700)
+    if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).to.equal(0o700) // Windows reports synthesized 0o666 mode bits
   })
 })
