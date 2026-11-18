@@ -73,7 +73,7 @@ describe('safeMkdir — the owner-only directory helper shared by local-state an
     const { calls, fileSystem } = spy()
     safeMkdir(path, fileSystem)
     expect(calls).to.deep.equal(['lstat', 'mkdir', 'lstat', 'open', 'fstat', 'fchmod', 'close'])
-    if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).to.equal(0o700) // Windows reports synthesized 0o666 mode bits
+    expect(statSync(path).mode & 0o777).to.equal(0o700)
   })
 
   it('with injected constants lacking O_DIRECTORY (the win32 gap), safeMkdir chmods the path and never opens or fchmods a directory handle', () => {
