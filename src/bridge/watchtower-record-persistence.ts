@@ -3,7 +3,6 @@ import {
   closeSync,
   constants,
   fstatSync,
-  fsyncSync,
   linkSync,
   lstatSync,
   mkdtempSync,
@@ -14,7 +13,7 @@ import {
   unlinkSync,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { MAX_SETTLEMENT_RECORD_BYTES, writeSettlementRecordAtomically } from './atomic-record-write'
+import { MAX_SETTLEMENT_RECORD_BYTES, syncNewEntry, writeSettlementRecordAtomically } from './atomic-record-write'
 import { validateSettlementRecord, type SettlementRecord } from './settlement-session'
 import { assertSameWatchtowerRecordIdentity } from './watchtower-record-identity'
 
@@ -100,8 +99,7 @@ export function persistWatchtowerRecordForIdentity(
     claimDir = undefined
     claimed = undefined
 
-    const directoryFd = openSync(parent, constants.O_RDONLY | constants.O_DIRECTORY)
-    try { fsyncSync(directoryFd) } finally { closeSync(directoryFd) }
+    syncNewEntry(path, { directoryFlags: constants.O_RDONLY | constants.O_DIRECTORY })
   } catch (error) {
     if (claimed) {
       try {

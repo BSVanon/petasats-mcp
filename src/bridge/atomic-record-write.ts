@@ -73,6 +73,55 @@ function openUniqueTemporaryFile(path: string, mode?: number): { path: string; f
   }
 }
 
+/** Every filesystem call syncNewEntry/syncRemovedEntry make. Tests substitute a subset to observe ordering or inject failures. */
+interface SyncEntryFsOps {
+  openSync: typeof openSync
+  fsyncSync: typeof fsyncSync
+  closeSync: typeof closeSync
+}
+
+interface SyncEntryOptions {
+  fs?: SyncEntryFsOps
+  platform?: NodeJS.Platform
+  /** Flags for the POSIX directory open. Defaults to plain 'r'; callers that already open with O_DIRECTORY pass that. */
+  directoryFlags?: string | number
+}
+
+function syncParentDirectory(path: string, fs: SyncEntryFsOps, directoryFlags: string | number): void {
+  const directoryFd = fs.openSync(dirname(path), directoryFlags)
+  try { fs.fsyncSync(directoryFd) } finally { fs.closeSync(directoryFd) }
+}
+
+/**
+ * Make a just-created, renamed, or linked directory entry power-loss durable.
+ * POSIX fsyncs the parent directory — the sequence every durable writer in this codebase already used. Windows
+ * cannot fsync a directory handle, so there it instead reopens and fsyncs the entry's own file; on NTFS that
+ * flushes the file's metadata, including its new name — the same rule PostgreSQL's durable_rename follows.
+ */
+export function syncNewEntry(path: string, opts: SyncEntryOptions = {}): void {
+  // Built fresh per call (never hoisted to a module-level constant): openSync/fsyncSync/closeSync are named imports,
+  // and a test that monkeypatches the real fs module must still reach this default, unprotected by a stale snapshot.
+  const fs = opts.fs ?? { openSync, fsyncSync, closeSync }
+  const platform = opts.platform ?? process.platform
+  if (platform === 'win32') {
+    const fd = fs.openSync(path, 'r+')
+    try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+    return
+  }
+  syncParentDirectory(path, fs, opts.directoryFlags ?? 'r')
+}
+
+/**
+ * Make a removal durable: the same parent-directory fsync as syncNewEntry on POSIX. Windows has no handle left to
+ * flush once the name is gone, so this is a no-op there.
+ */
+export function syncRemovedEntry(path: string, opts: SyncEntryOptions = {}): void {
+  const fs = opts.fs ?? { openSync, fsyncSync, closeSync }
+  const platform = opts.platform ?? process.platform
+  if (platform === 'win32') return
+  syncParentDirectory(path, fs, opts.directoryFlags ?? 'r')
+}
+
 /**
  * Persist serialized settlement-record data without ever truncating the live record in place.
  * The temporary file is deliberately beside the target, so rename is an atomic replacement.
@@ -109,10 +158,8 @@ export function writeSettlementRecordAtomically(path: string, contents: string, 
     renameSync(tmp, path)
     tmp = undefined
 
-    // A file fsync makes the new contents durable; syncing the parent directory makes the rename durable too.
-    const directoryFd = openSync(dirname(path), 'r')
-    try { fsyncSync(directoryFd) }
-    finally { closeSync(directoryFd) }
+    // The file fsync above made the new contents durable; syncNewEntry makes the rename itself durable too.
+    syncNewEntry(path)
   } finally {
     if (fd !== undefined) {
       try { closeSync(fd) } catch { /* preserve the original write failure */ }
