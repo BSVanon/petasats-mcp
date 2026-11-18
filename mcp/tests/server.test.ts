@@ -10,7 +10,7 @@ import { createBuyerKit } from '../../src/sdk/buyer/buyer-kit.js'
 import { readSpendingStop, stopSpending } from '../../src/sdk/buyer/stop.js'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 /** A fake buyer kit: quote doubles the input and startSwap records the request. */
@@ -228,7 +228,7 @@ test('init prints absolute MCP launch paths', () => {
   const mcp = initResult(home).mcp as { command: string; args: string[] }
   assert.equal(mcp.command, process.execPath)
   assert.equal(mcp.args.length, 1)
-  assert.match(mcp.args[0], /^\//)
+  assert.ok(isAbsolute(mcp.args[0]), mcp.args[0]) // absolute on every platform: /… on POSIX, D:\… on Windows
 })
 
 test('a 0.2.2 home without withdrawals works with status, limits, and resume CLI handlers', async () => {
