@@ -66,7 +66,7 @@ test('fast speed is an explicit optional buyer choice, preserves v2 offer metada
   assert.equal(sink.last?.speed, 'fast'); assert.equal((sink.last?.quote as any)?.fastOffered, true); assert.equal(started.requested_speed, 'fast'); assert.equal(started.settlement_mode_used, 'pending')
   const tool = TOOLS.find((item) => item.name === 'swap_asset_to_bsv')!
   assert.equal((tool.inputSchema.required as readonly string[]).includes('speed'), false)
-  assert.match(tool.description, /Fast mode makes the kit reveal its secret against an unconfirmed BSV lock\. If the market maker double-spends that lock, you can lose the swap amount\./)
+  assert.match(tool.description, /Fast mode makes the kit reveal its secret against an unconfirmed BSV lock\. If the counterparty double-spends that lock, you can lose the swap amount\./)
   assert.match(tool.description, /both sides agree.*at most \$25.*one BSV confirmation/i)
 })
 

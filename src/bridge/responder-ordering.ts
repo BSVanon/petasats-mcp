@@ -113,7 +113,7 @@ export function checkResponderRunwayAndOrdering(
   if (safeClaimWcSecs < bsvRefundBoundSecs + CROSS_CHAIN_MARGIN_SECS) {
     return {
       ok: false,
-      reason: `cross-chain timelock mis-ordered: BSV refund 99.9999% bound ~${Math.round(bsvRefundBoundSecs / 60)}min vs the market maker's USDC-claim cutoff ~${Math.round(safeClaimWcSecs / 60)}min (need cutoff ≥ BSV-refund bound + ${CROSS_CHAIN_MARGIN_SECS / 60}min) — refusing (a taker could reveal past the market maker's claim window and keep both legs)`,
+      reason: `cross-chain timelock mis-ordered: BSV refund 99.9999% bound ~${Math.round(bsvRefundBoundSecs / 60)}min vs the counterparty's USDC-claim cutoff ~${Math.round(safeClaimWcSecs / 60)}min (need cutoff ≥ BSV-refund bound + ${CROSS_CHAIN_MARGIN_SECS / 60}min) — refusing (a taker could reveal past the counterparty's claim window and keep both legs)`,
     }
   }
   return { ok: true }

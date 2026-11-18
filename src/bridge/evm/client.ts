@@ -44,6 +44,15 @@ import {
   type LockupEvent,
 } from './erc20swap'
 import {
+  invalidSwapResolutionAnchor,
+  proveSwapLockAnchor,
+  resolveSwapOutcomeFromEventTx,
+  strictlyAfterLock,
+  type ResolutionReceipt,
+  type SwapResolutionAnchor,
+  type SwapResolutionOutcome,
+} from './resolution-event'
+import {
   assertCooperativeRefundConstants,
   cooperativeRefundCalldataMatches,
   cooperativeRefundTypedData,
@@ -177,18 +186,7 @@ export interface PinnedNativeTransferFees {
 /** Canonical finalized resolution of one ERC20Swap hashlock. Event transaction identity is retained so a competing
  * resolution can be persisted and surfaced to an operator. `unresolved` is deliberately broad: absence, malformed
  * provider data, contradictory Claim+Refund events, and every read failure all refuse terminal classification. */
-export type SwapResolutionOutcome =
-  | { kind: 'claimed'; preimage: Hex; eventTxid: Hex; eventBlock?: number }
-  | { kind: 'refunded'; eventTxid: Hex; eventBlock?: number }
-  | { kind: 'unresolved'; reason: 'not-found' | 'invalid-anchor' | 'malformed-log' | 'contradictory' | 'read-error'; detail?: string }
-
-/** The record's own Lockup coordinates. Resolution evidence is valid only when it is strictly later in chain order. */
-export interface SwapResolutionAnchor {
-  blockNumber: bigint
-  transactionHash: Hex
-  /** Responders retain the observed Lockup index; initiator-owned locks use -1 and are re-derived from the receipt. */
-  logIndex?: number
-}
+export type { SwapResolutionAnchor, SwapResolutionOutcome } from './resolution-event'
 
 /** Finalized receipt evidence for how a responder's exact ERC-20 tuple left escrow. */
 export type ClaimPaymentOutcome =
@@ -1088,46 +1086,14 @@ export class Erc20SwapEvmClient {
    */
   async resolveSwapOutcome(p: Erc20SwapParams, anchor: SwapResolutionAnchor): Promise<SwapResolutionOutcome> {
     try {
-      if (anchor.blockNumber <= 0n || !/^0x[0-9a-fA-F]{64}$/.test(anchor.transactionHash)) {
+      if (invalidSwapResolutionAnchor(anchor)) {
         return { kind: 'unresolved', reason: 'invalid-anchor', detail: 'recorded lock block and transaction hash must be valid' }
       }
       await this.assertContractIdentity()
       const lockReceipt = await this.pub.getTransactionReceipt({ hash: anchor.transactionHash })
-      const lockBlock = lockReceipt.blockNumber
-      const lockTransactionIndex = lockReceipt.transactionIndex
-      if (lockReceipt.status !== 'success' || lockReceipt.transactionHash.toLowerCase() !== anchor.transactionHash.toLowerCase() ||
-          lockBlock !== anchor.blockNumber ||
-          !Number.isSafeInteger(lockTransactionIndex) || lockTransactionIndex < 0) {
-        return { kind: 'unresolved', reason: 'invalid-anchor', detail: 'recorded Lockup receipt position could not be proven' }
-      }
-      const matchingLocks = lockReceipt.logs.flatMap((log) => {
-        if (log.address.toLowerCase() !== this.swapAddress.toLowerCase()) return []
-        const lockup = decodeLockupLog({ topics: [...log.topics], data: log.data })
-        if (!lockup || log.transactionHash?.toLowerCase() !== anchor.transactionHash.toLowerCase() ||
-            log.blockNumber !== lockBlock || log.transactionIndex !== lockTransactionIndex ||
-            lockup.preimageHash.toLowerCase() !== p.preimageHash.toLowerCase() ||
-            lockup.amount !== p.amount || lockup.tokenAddress.toLowerCase() !== p.tokenAddress.toLowerCase() ||
-            lockup.claimAddress.toLowerCase() !== p.claimAddress.toLowerCase() ||
-            lockup.refundAddress.toLowerCase() !== p.refundAddress.toLowerCase() || lockup.timelock !== p.timelock ||
-            !Number.isSafeInteger(log.logIndex) || log.logIndex < 0) return []
-        return [log.logIndex]
-      })
-      if (matchingLocks.length !== 1 ||
-          (anchor.logIndex !== undefined && anchor.logIndex >= 0 && matchingLocks[0] !== anchor.logIndex)) {
-        return { kind: 'unresolved', reason: 'invalid-anchor', detail: 'recorded receipt does not contain one exact Lockup at the recorded index' }
-      }
-      const lockLogIndex = matchingLocks[0]
-      const strictlyAfterLock = (log: { blockNumber?: bigint | null; transactionIndex?: number | null; transactionHash?: Hex | null; logIndex?: number | null }): boolean | undefined => {
-        if (typeof log.blockNumber !== 'bigint') return undefined
-        if (log.blockNumber > lockBlock) return true
-        if (log.blockNumber < lockBlock) return false
-        if (!Number.isSafeInteger(log.transactionIndex) || (log.transactionIndex as number) < 0) return undefined
-        if ((log.transactionIndex as number) > lockTransactionIndex) return true
-        if ((log.transactionIndex as number) < lockTransactionIndex) return false
-        if (!log.transactionHash || log.transactionHash.toLowerCase() !== anchor.transactionHash.toLowerCase() ||
-            !Number.isSafeInteger(log.logIndex) || (log.logIndex as number) < 0) return undefined
-        return (log.logIndex as number) > lockLogIndex
-      }
+      const lock = proveSwapLockAnchor(lockReceipt as unknown as ResolutionReceipt, p, anchor, this.swapAddress)
+      if ('kind' in lock) return lock
+      const lockBlock = lock.blockNumber
       const tip = await this.finalizedBlockNumber()
       let claimed: Extract<SwapResolutionOutcome, { kind: 'claimed' }> | undefined
       let refunded: Extract<SwapResolutionOutcome, { kind: 'refunded' }> | undefined
@@ -1143,7 +1109,7 @@ export class Erc20SwapEvmClient {
           fromBlock: w.from, toBlock: w.to,
         })
         for (const log of claimLogs) {
-          const afterLock = strictlyAfterLock(log)
+          const afterLock = strictlyAfterLock(log, lock)
           if (afterLock === false) continue
           if (afterLock === undefined) { malformed = true; continue }
           const preimage = log.args.preimage
@@ -1169,7 +1135,7 @@ export class Erc20SwapEvmClient {
           claimed = { kind: 'claimed', preimage, eventTxid, eventBlock }
         }
         for (const log of refundLogs) {
-          const afterLock = strictlyAfterLock(log)
+          const afterLock = strictlyAfterLock(log, lock)
           if (afterLock === false) continue
           if (afterLock === undefined) { malformed = true; continue }
           const eventTxid = log.transactionHash
@@ -1194,6 +1160,22 @@ export class Erc20SwapEvmClient {
     } catch (error) {
       return { kind: 'unresolved', reason: 'read-error', detail: error instanceof Error ? error.message : String(error) }
     }
+  }
+
+  /** Verify one known Claim/Refund transaction without any historical log-range search. */
+  async resolveSwapOutcomeFromEventTx(
+    p: Erc20SwapParams,
+    anchor: SwapResolutionAnchor,
+    eventTxid: Hex,
+  ): Promise<SwapResolutionOutcome> {
+    return resolveSwapOutcomeFromEventTx(p, anchor, eventTxid, this.swapAddress, {
+      assertContractIdentity: () => this.assertContractIdentity(),
+      getTransactionReceipt: async (hash) =>
+        await this.pub.getTransactionReceipt({ hash }) as unknown as ResolutionReceipt,
+      finalizedBlockNumber: () => this.finalizedBlockNumber(),
+      transactionCalls: (hash, to, data) => this.transactionCalls(hash, to, data),
+      isSwapLocked: (params, opts) => this.isSwapLocked(params, opts),
+    })
   }
 
   /**

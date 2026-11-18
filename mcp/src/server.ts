@@ -13,7 +13,7 @@ import { VERSION } from './version.js'
 
 const ASSET_HELP = 'USDC or BSV (phase 1 supports USDC → BSV only)'
 const MAX_BSV_SATS = 2_100_000_000_000_000n
-export const INSTRUCTIONS = `PetaSats buyer kit. It buys BSV with USDC on Base through a cross-chain atomic swap with the PetaSats market maker. It runs on this computer and keeps its keys here; no service ever holds the user's funds.
+export const INSTRUCTIONS = `PetaSats buyer kit. It buys BSV with USDC on Base through a cross-chain atomic swap with the counterparty. It runs on this computer and keeps its keys here; no service ever holds the user's funds.
 
 SCOPE: USDC on Base -> BSV only. About $5 to $100 per swap. Each buyer: at most 3 swaps and $200 per day. A shared daily total can make the service busy; a declined request can be retried later.
 
@@ -24,7 +24,7 @@ STEPS
 2. get_quote. It shows the exact BSV for an exact USDC amount, the rate and the costs. A quote lasts about 60 seconds.
 3. If a person is directing you, show them the quote and get a clear yes. This is the only time to ask. If they already gave you an amount and a limit, that is the yes.
 4. swap_asset_to_bsv with quote_id (or min_bsv_out). If the quote has expired, the kit gets a new one and goes ahead only if it pays at least min_bsv_out, or 99% of the old quote.
-5. wait_for_swap until done is true (each call waits up to about 50 seconds). A swap usually finishes within about an hour: the market maker's BSV lock and the kit's claim each wait for a BSV block, and a delivery to another address goes out together with the claim.
+5. wait_for_swap until done is true (each call waits up to about 50 seconds). A swap usually finishes within about an hour: the counterparty's BSV lock and the kit's claim each wait for a BSV block, and a delivery to another address goes out together with the claim.
 6. Results: delivered or settled = BSV received; refunded = the USDC came back to the kit; failed = nothing was locked.
 
 REPORTING
@@ -33,7 +33,7 @@ REPORTING
 - Never pause, slow down or ask anything once a swap has started. Reporting never holds up the swap.
 
 SAFETY
-- Standard speed is the default. Fast mode is the buyer's explicit choice and both sides must agree; otherwise the swap waits for one BSV confirmation. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.
+- Standard speed is the default. Fast mode is the buyer's explicit choice and both sides must agree; otherwise the swap waits for one BSV confirmation. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the counterparty double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.
 - Keep this MCP server running until the swap is done. If it stops, the swap resumes safely when it starts again. If it stays stopped for more than about ${BUYER_BASE_CLAIM_BUDGET_HOURS} hours after the USDC lock, the swap cannot finish; the kit then refunds the USDC the next time it runs after the Base timelock ends (about ${BUYER_BASE_REFUND_HOURS} hours after the lock).
 - The kit refuses a new swap or a withdrawal while a swap is in progress.
 - stop_spending stops new swaps and withdrawals until the user runs \`npx petasats-mcp resume\` in a terminal. Limits in limits.json can also refuse destinations and daily spending.
@@ -56,7 +56,7 @@ const TOOLS = [
   },
   {
     name: 'swap_asset_to_bsv',
-    title: 'Start USDC to BSV swap', description: 'Starts a funds-moving USDC on Base to BSV swap. speed is the buyer’s explicit choice; standard is the default. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the market maker double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    title: 'Start USDC to BSV swap', description: 'Starts a funds-moving USDC on Base to BSV swap. speed is the buyer’s explicit choice; standard is the default. Fast mode makes the kit reveal its secret against an unconfirmed BSV lock. If the counterparty double-spends that lock, you can lose the swap amount. It is available only when both sides agree and the amount is at most $25; otherwise the swap waits for one BSV confirmation.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -103,7 +103,7 @@ const TOOLS = [
 
 const ABOUT = `# PetaSats buyer kit
 
-The local buyer kit buys BSV with the operator’s own USDC on Base through the market maker:
+The local buyer kit buys BSV with the operator’s own USDC on Base through the counterparty:
 
 - **USDC → BSV only** — a cross-chain covenant atomic swap. One secret settles both legs; neither side can take one leg without the other.
 
@@ -126,7 +126,7 @@ function toQuoteWire(q: Quote): Record<string, unknown> {
   return {
     quote_id: q.quoteId, expires_at: new Date(q.expiry * 1000).toISOString(), expires_in_seconds: Math.max(0, q.expiry - Math.floor(Date.now() / 1000)),
     usdc_in: { atomic: q.amountIn.toString(), display: usdcDisplay }, bsv_out: { sats: bsv.toString(), display: bsvDisplay }, est_bsv_claim_fee_sats: claimFee.toString(), est_bsv_received_sats: (bsv - claimFee).toString(), rate_usd_per_bsv: rate, market_mid_usd_per_bsv: mid ?? null, price_vs_mid_percent: mid ? Number((((rate - mid) / mid) * 100).toFixed(2)) : null,
-    costs: { base_gas: 'approve and lock on Base, paid in ETH by this kit', bsv_claim_fee_sats: claimFee.toString(), bsv_delivery_fee_note: 'with deliver_to, one more small BSV fee (about 400 sats)' }, fee_note: "PetaSats adds no separate fee; the market maker's price is the rate above", limits: { min_usd_note: 'about $5; smaller swaps are declined', max_usd_per_swap: 100, per_buyer_per_day: '3 swaps and $200', shared_daily_total_note: 'shared daily total may make the service busy' }, next: 'swap_asset_to_bsv with this quote_id; quotes last about 60 seconds',
+    costs: { base_gas: 'approve and lock on Base, paid in ETH by this kit', bsv_claim_fee_sats: claimFee.toString(), bsv_delivery_fee_note: 'with deliver_to, one more small BSV fee (about 400 sats)' }, fee_note: "PetaSats adds no separate fee; the counterparty's price is the rate above", limits: { min_usd_note: 'about $5; smaller swaps are declined', max_usd_per_swap: 100, per_buyer_per_day: '3 swaps and $200', shared_daily_total_note: 'shared daily total may make the service busy' }, next: 'swap_asset_to_bsv with this quote_id; quotes last about 60 seconds',
     from: formatAsset(q.from), to: formatAsset(q.to), route: q.route, amount_in: q.amountIn.toString(), amount_out: q.amountOut.toString(), expiry: q.expiry,
     ...(buyerQuote.doorQuoteId ? { door_quote_id: buyerQuote.doorQuoteId, usdc_base_units: buyerQuote.usdcBaseUnits?.toString(), bsv_sats: buyerQuote.bsvSats?.toString(), door_protocol_version: buyerQuote.doorProtocolVersion ?? 1, fast_offered: buyerQuote.fastOffered ?? false, fast_cap_usdc_base_units: (buyerQuote.fastCapUsdcBaseUnits ?? 0n).toString() } : {}),
   }
@@ -180,7 +180,7 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
       case 'get_quote': {
         const from = parseAsset(requireString(a, 'from_asset'))
         const to = parseAsset(requireString(a, 'to_asset'))
-        if (from !== 'USDC' || to !== 'BSV') throw new ToolInputError('not available: only USDC → BSV through the market maker door')
+        if (from !== 'USDC' || to !== 'BSV') throw new ToolInputError('not available: only USDC → BSV through the counterparty door')
         const amountIn = requireAmount(a, 'amount_in')
         const q = await petasats.quote({ from, to, amountIn, deliverTo: '' })
         return success(toQuoteWire(q))
@@ -188,7 +188,7 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
 
       case 'swap_asset_to_bsv': {
         const from = parseAsset(requireString(a, 'from_asset'))
-        if (from !== 'USDC') throw new ToolInputError('not available: only USDC → BSV through the market maker door')
+        if (from !== 'USDC') throw new ToolInputError('not available: only USDC → BSV through the counterparty door')
         const amountIn = requireAmount(a, 'amount_in')
         const deliverTo = optionalString(a, 'deliver_to')
         const quoteObj = optionalObject(a, 'quote')

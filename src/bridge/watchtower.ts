@@ -389,7 +389,7 @@ export async function runWatchtower(session: SettlementSession, deps: Watchtower
         session = candidate
         emit(
           'needs-attention',
-          `COMPETING Base ${resolution.outcome} resolution ${resolution.eventTxid} won during ${context}; market-maker recovery did not succeed — record retained, retries stopped, operator attention required`,
+          `COMPETING Base ${resolution.outcome} resolution ${resolution.eventTxid} won during ${context}; counterparty recovery did not succeed — record retained, retries stopped, operator attention required`,
           extra,
         )
         return true

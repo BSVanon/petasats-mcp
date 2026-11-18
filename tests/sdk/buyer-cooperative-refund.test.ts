@@ -49,7 +49,7 @@ function rails(over: { locked?: boolean; outcome?: 'refunded' | 'claimed' | 'unr
 }
 
 describe('buyer cooperative refund recovery', () => {
-  it("K-I1: finalizes the market maker’s Refund and a later BSV-lock observation cannot create a reveal", async () => {
+  it("K-I1: finalizes the counterparty’s Refund and a later BSV-lock observation cannot create a reveal", async () => {
     let current = record()
     const result = await resolveCooperativeRefund(current, {
       evm: rails(), now: () => 9_000, reread: () => current, persist: (next) => { current = next }, assertPoolSafe: () => {},
@@ -106,7 +106,7 @@ describe('buyer cooperative refund recovery', () => {
     expect(current.state).eq('base-locked')
   })
 
-  it("maps the finalized Refund through buyer recovery, unblocks the kit, and names the market maker’s decline", async () => {
+  it("maps the finalized Refund through buyer recovery, unblocks the kit, and names the counterparty’s decline", async () => {
     const settlementDir = mkdtempSync(join(tmpdir(), 'petasats-buyer-coop-refund-'))
     const settlements = makeFileSwapRecordStore(settlementDir, { censusGroupRead: false })
     settlements.write(record())
@@ -124,6 +124,6 @@ describe('buyer cooperative refund recovery', () => {
     expect(outcome).to.include({ stage: 'refunded', settlementState: 'refunded', baseRefundTxid: REFUND_TXID })
     expect(settlements.list().records[0]).to.include({ state: 'refunded', refundTxid: REFUND_TXID })
     const view = buyerStatusView({ ...buyer, ...outcome, stage: 'refunded', settlementState: 'refunded', reason: COOPERATIVE_REFUND_REASON })
-    expect(view).to.include({ done: true, stage_label: "The market maker declined; USDC came back" })
+    expect(view).to.include({ done: true, stage_label: "The counterparty declined; USDC came back" })
   })
 })

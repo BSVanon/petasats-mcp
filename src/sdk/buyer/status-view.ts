@@ -23,7 +23,7 @@ const etaMinutes = (stage: string): number => {
 
 export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown> {
   const info = record.stage === 'refunded' && record.reason === COOPERATIVE_REFUND_REASON
-    ? { label: "The market maker declined; USDC came back", step: null }
+    ? { label: "The counterparty declined; USDC came back", step: null }
     : stages[record.stage] ?? { label: 'Older or unknown record', step: null }
   const delivery = !!record.deliverTo
   const terminal = ['settled', 'delivered', 'refunded', 'failed'].includes(record.stage)

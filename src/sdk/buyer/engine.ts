@@ -50,6 +50,9 @@ export function buyerStageForSettlement(state: SettlementState): BuyerSwapStage 
 }
 
 const terminalSettlement = (state: SettlementState): boolean => state === 'settled' || state === 'refunded' || state === 'aborted'
+const WALLET_DECLINED_REASON = 'You declined in your wallet; nothing was sent.'
+const WALLET_DECLINED_LATER_LOCK_REASON = 'You declined a repeated lock request. The first request may still go through; if it does, your USDC comes back after the time limit.'
+const isNeverSentWalletRefusal = (error: unknown): boolean => !!error && typeof error === 'object' && (error as { neverSent?: unknown }).neverSent === true
 /** The covenant claim pays the buyer from output 0.  Prefer the persisted bytes over a derived estimate. */
 function claimPayoutSats(record: SettlementRecord): number | undefined {
   if (record.bsvClaimTxHex) {
@@ -89,7 +92,9 @@ export interface BuyerEngineDeps {
   }>
   chainTracker: ChainTracker
   bsvReservePub: PublicKey
-  settlementDir: string
+  settlementDir?: string
+  /** Browser/alternate recovery store. Omit to retain the Node file store. */
+  settlementStore?: BuyerSettlementStore
   usdcTokenAddress: `0x${string}`
   capUsdPerSwap: number
   now: () => number
@@ -101,6 +106,19 @@ export interface BuyerEngineDeps {
   assertEvmPoolSafe: () => void | Promise<void>
   /** Operator opt-in: resolve stuck records written before the attempt marker (one kit process used this home). */
   resolveUnmarkedStuckLocks?: boolean
+  /** Browser EIP-1193 sends cannot expose signed bytes before broadcast; false keeps conservative refund recovery. */
+  recordLockAttempts?: boolean
+  /** Awaited after the secret enters the recovery record and before approve/lock wallet prompts. */
+  onRecoveryReady?: (record: SettlementRecord) => Promise<void>
+}
+
+export interface BuyerSettlementStore {
+  read(hashHex: string): SettlementRecord | undefined
+  write(record: SettlementRecord): void
+  clear(hashHex: string, expected?: SettlementRecord): void
+  list(): { records: SettlementRecord[]; errors: Array<{ path: string; hashHex?: string; error: Error }> }
+  pathFor(hashHex: string): string
+  flush?(): Promise<void>
 }
 
 /**
@@ -109,7 +127,8 @@ export interface BuyerEngineDeps {
  */
 export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recoverAll(records: BuyerSwapRecord[]): Promise<Map<string, BuyerRecoveryOutcome>> } {
   const lifecycle = new AbortController()
-  const records = makeFileSwapRecordStore(deps.settlementDir, { censusGroupRead: false, recordMode: 0o600 })
+  if (!deps.settlementStore && !deps.settlementDir) throw new Error('buyer engine needs settlementStore or settlementDir')
+  const records = (deps.settlementStore ?? makeFileSwapRecordStore(deps.settlementDir!, { censusGroupRead: false, recordMode: 0o600 })) as BuyerSettlementStore
   // The executor must retain the legacy lenient reads: an indexer outage while
   // its funded lock is confirming cannot abort the live swap. Recovery needs
   // the opposite distinction so an unknown read cannot authorize a transition
@@ -146,6 +165,14 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       if (!state || !terminalSettlement(state)) records.clear(hashHex, expected)
     },
     recordPathFor: (hashHex) => records.pathFor(hashHex),
+    ...(deps.settlementStore ? { recordIoFor: (hashHex: string) => ({
+      read: () => {
+        const record = records.read(hashHex)
+        if (!record) throw new Error(`buyer recovery record ${hashHex} is missing`)
+        return record
+      },
+      write: async (record: SettlementRecord) => { records.write(record); await records.flush?.() },
+    }) } : {}),
     pollMs: BUYER_RECOVERY_POLL_MS,
     refundConfs: 1,
     now: () => Math.floor(deps.now() / 1000),
@@ -290,10 +317,10 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
               try {
                 const height = await deps.bsv.chainHeight()
                 if (checked.record.bsvRefundLocktime - height < MIN_RESPONDER_WINDOW_BLOCKS) throw error
-                deps.log(`buyer: still waiting for the market maker's BSV lock; ${checked.record.bsvRefundLocktime - height} BSV blocks remain in the market maker's safe lock window`)
+                deps.log(`buyer: still waiting for the counterparty's BSV lock; ${checked.record.bsvRefundLocktime - height} BSV blocks remain in the counterparty's safe lock window`)
               } catch (heightError) {
                 if (heightError === error) throw error
-                deps.log(`buyer: BSV height unavailable while waiting for the market maker's lock; continuing without changing the recovery path (${heightError instanceof Error ? heightError.message : String(heightError)})`)
+                deps.log(`buyer: BSV height unavailable while waiting for the counterparty's lock; continuing without changing the recovery path (${heightError instanceof Error ? heightError.message : String(heightError)})`)
               }
               continue
             }
@@ -329,7 +356,9 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           executingHashes.add(record.hashHex)
           records.write(record)
           remember(input.swapId, record, input.onSettlement)
+          if (deps.settlementStore) return records.flush?.()
         },
+        ...(deps.onRecoveryReady ? { onRecoveryReady: deps.onRecoveryReady } : {}),
         readPersistedRecord: records.read,
         onHashlockCreated: async (hashHex) => {
           executingHash = hashHex
@@ -347,7 +376,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
           zeroConfMinArcProviders: 2,
           lockTxFetchUntilRevealRunway: true,
           ...(input.quote.doorProtocolVersion === 2 ? { doorProtocolVersion: 2 as const, doorQuoteId: input.quote.doorQuoteId, agreedSettlementMode: agreedMode, fastCapUsdcBaseUnits: fastCap } : {}),
-          approveOnlyBelowAllowance: true, recordLockAttempts: true, assertTimelocksAgainstConfiguredBsvWindow: true,
+          approveOnlyBelowAllowance: true, recordLockAttempts: deps.recordLockAttempts ?? true, assertTimelocksAgainstConfiguredBsvWindow: true,
         },
       })
       try {
@@ -371,6 +400,23 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
         }
         return { ...result, bsvClaimPayoutSats: settlement ? claimPayoutSats(settlement) : undefined, revealed: seen?.state === 'revealed' || !!result.bsvClaimTxid, settlementModeUsed: result.settlementModeUsed ?? settlement?.settlementModeUsed, settlementModeDowngradeReason: result.settlementModeDowngradeReason ?? settlement?.settlementModeDowngradeReason }
       } catch (error) {
+        if (executingHash && isNeverSentWalletRefusal(error)) {
+          // Nothing was locked only when the refusal came before any lock could exist: the executor cleared the lock
+          // placeholder of a refused first lock, or it never persisted that placeholder (it always does before a lock
+          // request). A refusal at any later point keeps the conservative path below.
+          const refusedClear = executorClears.get(input.swapId)
+          const seen = known.get(input.swapId)
+          const preLock = refusedClear
+            ? refusedClear.state === 'created' || refusedClear.state === 'base-locked'
+            : seen === undefined || seen.state === 'created'
+          if (preLock) {
+            if (!refusedClear) clearExecutorRecord(executingHash, WALLET_DECLINED_REASON)
+            executorClears.delete(input.swapId)
+            return { ok: false, reason: WALLET_DECLINED_REASON, nothingLocked: true, settlementModeUsed: 'not_revealed' }
+          }
+          executorClears.delete(input.swapId)
+          throw Object.assign(new Error(WALLET_DECLINED_LATER_LOCK_REASON), { cause: error })
+        }
         const cleared = executorClears.get(input.swapId)
         executorClears.delete(input.swapId)
         if (cleared?.state === 'created' || cleared?.state === 'base-locked') {

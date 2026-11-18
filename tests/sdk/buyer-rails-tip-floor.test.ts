@@ -9,7 +9,10 @@ const ACCOUNT = privateKeyToAccount(KEY)
 const SWAP = '0x1111111111111111111111111111111111111111' as const
 const USDC = '0x2222222222222222222222222222222222222222' as const
 const TO = '0x3333333333333333333333333333333333333333' as const
-const DEPOSIT_HASH = `0x${'ab'.repeat(32)}` as Hex
+// Base blocks start with two deposit transactions (receipt type 0x7e), then ordinary ones (measured 2026-11-13).
+// A deposit hash encodes its block and position, so its receipt binds back to the block that holds it.
+const depositHash = (number: bigint, position: 0 | 1): Hex => `0xde${position}${number.toString(16).padStart(61, '0')}` as Hex
+const depositBlock = (hash: Hex): bigint | undefined => /^0xde[01][0-9a-f]{61}$/.test(hash) ? BigInt(`0x${hash.slice(5)}`) : undefined
 const BASE_FEE = 5_000_000n
 const SUGGESTION = 1_000_000n
 const INCLUDED = 50_000_000n
@@ -37,7 +40,7 @@ function fakeNode(opts: { history: boolean }) {
       if (typeof tag === 'string' && tag.startsWith('0x')) {
         const number = BigInt(tag); const transactionHash = `0x${number.toString(16).padStart(64, '0')}` as Hex
         probeTransactions.set(transactionHash, number)
-        return reply(id, { ...block(number), transactions: [DEPOSIT_HASH, transactionHash] })
+        return reply(id, { ...block(number), transactions: [depositHash(number, 0), depositHash(number, 1), transactionHash] })
       }
       return reply(id, block(tag === 'finalized' || tag === 'safe' ? finalized : finalized + 2n))
     }
@@ -58,10 +61,11 @@ function fakeNode(opts: { history: boolean }) {
     if (method === 'eth_sendRawTransaction') { const signed = params[0] as Hex; sent.push(signed); return reply(id, keccak256(signed)) }
     if (method === 'eth_getTransactionReceipt') {
       const hash = params[0] as Hex
-      if (hash === DEPOSIT_HASH) return reply(id, receipt(DEPOSIT_HASH, 0n))
+      const depositNumber = depositBlock(hash)
+      if (depositNumber !== undefined) return reply(id, { ...receipt(hash, depositNumber), blockHash: `0x${'cd'.repeat(32)}`, type: '0x7e', logs: [] })
       const probeBlock = probeTransactions.get(hash)
       if (probeBlock !== undefined) return reply(id, {
-        ...receipt(hash, probeBlock), blockHash: `0x${'cd'.repeat(32)}`, logs: [logForBlock(probeBlock)],
+        ...receipt(hash, probeBlock), blockHash: `0x${'cd'.repeat(32)}`, type: '0x2', logs: [logForBlock(probeBlock)],
       })
       return sent.some((signed) => keccak256(signed) === hash) ? reply(id, receipt(hash, finalized)) : reply(id, null)
     }

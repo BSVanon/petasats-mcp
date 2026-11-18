@@ -17,7 +17,10 @@ const BALANCE = 194790595100339n
 const COST = 194891395100339n
 const SWAP = '0x1111111111111111111111111111111111111111' as const
 const USDC = '0x2222222222222222222222222222222222222222' as const
-const DEPOSIT_HASH = `0x${'ab'.repeat(32)}` as Hex
+// Base blocks start with two deposit transactions (receipt type 0x7e), then ordinary ones (measured 2026-11-13).
+// A deposit hash encodes its block and position, so its receipt binds back to the block that holds it.
+const depositHash = (number: bigint, position: 0 | 1): Hex => `0xde${position}${number.toString(16).padStart(61, '0')}` as Hex
+const depositBlock = (hash: Hex): bigint | undefined => /^0xde[01][0-9a-f]{61}$/.test(hash) ? BigInt(`0x${hash.slice(5)}`) : undefined
 
 const reply = (id: unknown, result: unknown, status = 200) => new Response(JSON.stringify({ jsonrpc: '2.0', result, id }), { status, headers: { 'content-type': 'application/json' } })
 const refusal = (id: unknown) => new Response(JSON.stringify({ jsonrpc: '2.0', error: { code: -32602, message: 'Archive requests require a personal token. Get one at: https://www.allnodes.com/publicnode' }, id }), { status: 403, headers: { 'content-type': 'application/json' } })
@@ -56,7 +59,7 @@ class FakeBaseNode {
       if (typeof tag === 'string' && tag.startsWith('0x')) {
         const number = BigInt(tag); const transactionHash = `0x${number.toString(16).padStart(64, '0')}` as Hex
         this.probeTransactions.set(transactionHash, number)
-        return reply(id, { ...block(number), transactions: [DEPOSIT_HASH, transactionHash] })
+        return reply(id, { ...block(number), transactions: [depositHash(number, 0), depositHash(number, 1), transactionHash] })
       }
       return reply(id, block(tag === 'finalized' || tag === 'safe' ? this.finalized : this.finalized + 2n))
     }
@@ -72,10 +75,11 @@ class FakeBaseNode {
     if (method === 'eth_estimateGas') return reply(id, '0x5208')
     if (method === 'eth_getTransactionReceipt') {
       const hash = params[0] as Hex
-      if (hash === DEPOSIT_HASH) return reply(id, receipt(DEPOSIT_HASH, 0n))
+      const depositNumber = depositBlock(hash)
+      if (depositNumber !== undefined) return reply(id, { ...receipt(hash, depositNumber), blockHash: `0x${'cd'.repeat(32)}`, type: '0x7e', logs: [] })
       const probeBlock = this.probeTransactions.get(hash)
       if (probeBlock !== undefined) return reply(id, {
-        ...receipt(hash, probeBlock), blockHash: `0x${'cd'.repeat(32)}`,
+        ...receipt(hash, probeBlock), blockHash: `0x${'cd'.repeat(32)}`, type: '0x2',
         logs: [{ address: SWAP, topics: [`0x${'12'.repeat(32)}`], transactionHash: hash, logIndex: '0x0', blockNumber: `0x${probeBlock.toString(16)}`, blockHash: `0x${'cd'.repeat(32)}` }],
       })
       if (this.failReceipts) return new Response('synthetic receipt failure', { status: 500 })

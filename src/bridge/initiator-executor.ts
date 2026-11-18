@@ -8,7 +8,7 @@ import { assertTokenAllowedAndDecimals } from './evm/token-allowlist'
 import { preimageHashOf, type Erc20SwapParams } from './evm/erc20swap'
 import type { BridgeIntent, BridgeIntentV2, BridgeQuote, BridgeQuoteV2 } from './settlement-types'
 import { assertLockSafeForZeroConf, assertLockSafeForZeroConfMultiArc, watchRevealThroughClaim, watchRevealThroughClaimMultiArc, coverageLabel, type FetchTxStatus, type FetchArcStatuses } from './mainnet-zeroconf'
-import { ARC_PROVIDERS, CLAIM_WATCH_RESEND_MS, classifyArcStatus, classifyMultiArc, DEFAULT_CLAIM_WATCH_MAX_BLOCKS, watchLockThroughClaim } from './zeroconf-monitor'
+import { ARC_PROVIDERS, CLAIM_WATCH_RESEND_MS, classifyArcStatus, classifyMultiArc, DEFAULT_CLAIM_WATCH_MAX_BLOCKS, watchLockThroughClaim, type ClaimConfirmationStatus } from './zeroconf-monitor'
 import { assertInitiatorTimelocks, DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS } from './initiator-timelocks'
 import { baseAvailableSecsForBlocks, baseRequiredSecsForBlocks } from './base-block-time'
 import { makePreRevealHeightRead } from './pre-reveal-height'
@@ -29,6 +29,8 @@ import {
 } from './first-publication-guard'
 
 export { FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS, PRE_REVEAL_WAIT_BACKSTOP_MS, baseSafeRevealCutoff, computePreRevealWaitDeadlineMs } from './first-publication-guard'
+
+const isNeverSentWalletRefusal = (error: unknown): boolean => !!error && typeof error === 'object' && (error as { neverSent?: unknown }).neverSent === true
 
 /** The concrete swap the initiator runs: deliver an allowlisted ERC-20, receive BSV. */
 export interface BridgeDeliverErc20Spec {
@@ -461,7 +463,9 @@ export interface BridgeInitiatorDeps {
    *  DISTINCT ARC providers to ACCEPT, not just Anvil (which the single `zeroConfStatus` rail can never corroborate). */
   zeroConfArcStatuses?: FetchArcStatuses
   /** Persist the at-risk USDC session so the Base watchtower can refund at the timelock. */
-  persist?(rec: SettlementRecord): void
+  persist?(rec: SettlementRecord): void | Promise<void>
+  /** Browser durability seam: awaited after the secret is held and before the first wallet signature request. */
+  onRecoveryReady?(rec: SettlementRecord): Promise<void>
   /** Synchronous authoritative read at the write-ahead boundary. A missing wiring fails closed before publication. */
   readPersistedRecord?(swapId: string): SettlementRecord | undefined
   /**
@@ -472,7 +476,6 @@ export interface BridgeInitiatorDeps {
   /** M-4 (red-team): clear the at-risk record on a CLEAN settle. Without it the initiator re-persists on settle, so
    *  every completed swap leaves a stale 'at-risk' record that masks a genuinely stranded one on the next startup. */
   clearRecord?(swapId: string): void
-  
   clearNeverSentLock?(hashHex: string, reason: string): void
   now?(): number
   /** Millisecond wall clock for the Base lock landing deadline (separate from SettlementSession's seconds clock). */
@@ -498,9 +501,9 @@ function validateResponderQuote(quote: BridgeQuote): void {
     if (PublicKey.fromString(quote.responderBsvPubKeyHex).toAddress().toString() !== quote.responderBsvAddress) fail()
   } catch { fail() }
 }
-
 // The BSV claim reveals the secret — the money-critical broadcast. Anvil is an SPV node with no UTXO set: it verifies
 // the spend from the lock's merkle proof carried in a BEEF, and REJECTS a bare tx (HTTP 422, BEEF parse-fail at byte 0;
+
 // block. The reveal-safety gate is re-read from a FRESH BSV height before every attempt, so the retry/backoff window
 // cannot carry a once-safe claim past its margin. `revealed` + the exact raw claim are persisted write-ahead before
 // broadcast; an all-fail/ambiguous attempt therefore remains claim-recoverable and never becomes Base-refundable.
@@ -576,7 +579,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
   // A proof discovery source can index a newly-mined block a few seconds before the independent header source does.
   // Keep this state per executor so a prolonged header lag emits one useful line per proof height, not one per poll.
   const headerLagLoggedAt = new Set<number>()
-  const verifyMerkleProof = async (txid: string, mp: MerklePath, label: string): Promise<'valid' | 'header-behind' | 'invalid'> => {
+  const verifyMerkleProof = async (txid: string, mp: MerklePath, label: string): Promise<'valid' | 'header-behind' | 'unverified' | 'invalid'> => {
     let verifyError: unknown
     try {
       if (await mp.verify(txid, deps.chainTracker!)) return 'valid'
@@ -595,7 +598,9 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         headerLagLoggedAt.add(mp.blockHeight)
         log('bsv', `${label}: header source is behind proof block ${mp.blockHeight}${tip === undefined ? ' (tip unavailable)' : ` (tip ${tip})`} — waiting to verify`)
       }
-      return 'header-behind'
+      // A failed tip read cannot prove the header is behind. Preserve the existing ordinary non-burial budget for that
+      // ambiguous state; only a known tip below the proof block pauses the budget in the post-claim watch.
+      return tip === undefined ? 'unverified' : 'header-behind'
     }
     if (verifyError !== undefined) throw verifyError
     return 'invalid'
@@ -773,6 +778,7 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         const session = SettlementSession.create(paramsFrom(intent, quote, token.decimals, cfg, now()), 'initiator', now())
         liveSession = session
         session.holdSecret(Utils.toHex(secret))
+        if (deps.onRecoveryReady) await deps.onRecoveryReady(session.toRecord())
         const revealHeight = makePreRevealHeightRead({ read: (signal) => bsv.chainHeight(signal), revealed: () => session.state === 'revealed', sleep, signal: deps.signal, log: (m) => log('bsv', m) })
 
         // 5. Lock USDC on Base (approve → wait allowance → lock).
@@ -855,24 +861,32 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // Presence, even while empty, is a capability marker: this kit records every locally signed lock before it
         // broadcasts. Older records omit the field and need the conservative nonce-burn recovery path.
         if (cfg.recordLockAttempts) session.beginBaseLockAttempts()
-        deps.persist?.(session.toRecord()) // ACTIONABLE at-risk record BEFORE the lock lands → the watchtower refunds at the timelock
+        const preLockPending = deps.persist?.(session.toRecord()) // ACTIONABLE at-risk record BEFORE the lock lands → the watchtower refunds at the timelock
+        if (preLockPending) await preLockPending
         const lockDeadlineAt = nowMs() + lockLandDeadlineMs
         let lockAttemptRecorded = false
         const recordLockAttempt = cfg.recordLockAttempts ? async (attempt: LockAttempt): Promise<void> => {
           lockAttemptRecorded = true // first: a failed persist below must never read as "never sent"
           session.noteBaseLockAttempt({ txHash: attempt.hash, nonce: attempt.nonce })
-          deps.persist?.(session.toRecord())
+          const pending = deps.persist?.(session.toRecord())
+          if (pending) await pending
         } : undefined
         // The buyer's rails record every signed lock before broadcasting it, so a lock call that failed before any
         // attempt was recorded sent nothing and nothing can land (e.g. a write-boundary safety refusal once a covered
         // allowance skips the approve). Clear the placeholder rather than block the kit until the timelock.
+        let lockCalls = 0
         const lockOnce = async (): Promise<SentTx> => {
+          const firstLockCall = lockCalls++ === 0
           try {
             return await evm.lock(evmParams, undefined, recordLockAttempt)
           } catch (error) {
-            if (!recordLockAttempt || lockAttemptRecorded || !deps.clearNeverSentLock) throw error
+            // A wallet refusal proves nothing was sent only on the first lock request: a later one may follow a lock
+            // that is still in flight.
+            const walletRefused = firstLockCall && isNeverSentWalletRefusal(error)
+            if ((!recordLockAttempt && !walletRefused) || lockAttemptRecorded || !deps.clearNeverSentLock) throw error
             const cause = error instanceof Error ? error.message : String(error)
-            deps.clearNeverSentLock(hashHex, `the USDC lock was never sent (${cause}); nothing was locked`)
+            deps.clearNeverSentLock(hashHex, walletRefused ? cause : `the USDC lock was never sent (${cause}); nothing was locked`)
+            if (walletRefused) throw error
             throw new Error(`USDC lock not sent (${cause}) — cleared the pre-lock record (nothing locked)`)
           }
         }
@@ -887,20 +901,33 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         // pre-lock record ONLY on a confirmed false for the exact tuple AT the reverted receipt's block (a lagging
         // node's latest could still say absent). No block, a true, or any read error keeps the record.
         if (lk.status === 'reverted') {
-          const kept = (why: string): Error => {
-            deps.persist?.(session.toRecord())
-            return new Error(`USDC lock reverted (${lk.hash}) ${why}; record kept, the watchtower refunds at the timelock`)
+          const kept = (why: string): { error: Error; pending: void | Promise<void> } => {
+            const pending = deps.persist?.(session.toRecord())
+            return { pending, error: new Error(`USDC lock reverted (${lk.hash}) ${why}; record kept, the watchtower refunds at the timelock`) }
           }
-          if (!lk.blockNumber || lk.blockNumber <= 0n) throw kept('without a receipt block to check the tuple at')
+          if (!lk.blockNumber || lk.blockNumber <= 0n) {
+            const retained = kept('without a receipt block to check the tuple at')
+            if (retained.pending) await retained.pending
+            throw retained.error
+          }
           let locked: boolean
           try { locked = await boundedPreRevealCall(() => evm.isSwapLocked(evmParams, { blockNumber: lk.blockNumber })) }
-          catch (error) { throw kept(`and the tuple check at block ${lk.blockNumber} failed (${error instanceof Error ? error.message : String(error)})`) }
-          if (locked) throw kept('but the exact tuple is locked on-chain — an earlier broadcast landed')
+          catch (error) {
+            const retained = kept(`and the tuple check at block ${lk.blockNumber} failed (${error instanceof Error ? error.message : String(error)})`)
+            if (retained.pending) await retained.pending
+            throw retained.error
+          }
+          if (locked) {
+            const retained = kept('but the exact tuple is locked on-chain — an earlier broadcast landed')
+            if (retained.pending) await retained.pending
+            throw retained.error
+          }
           deps.clearRecord?.(hashHex)
           throw new Error(`USDC lock reverted (${lk.hash}) — cleared the pre-lock record (nothing locked)`)
         }
         if (lk.status === 'pending') {
-          deps.persist?.(session.toRecord())
+          const pending = deps.persist?.(session.toRecord())
+          if (pending) await pending
           throw new Error(`USDC lock outcome unknown (${lk.hash}) — record kept; the watchtower refunds at the timelock if it landed`)
         }
         baseLockTxid = lk.hash
@@ -915,7 +942,8 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           baseTimelockBlock: intent.baseTimelockBlock,
           claimBudgetBaseBlocks: cfg.claimBudgetBaseBlocks ?? DEFAULT_INITIATOR_CLAIM_BUDGET_BASE_BLOCKS,
         }))
-        deps.persist?.(session.toRecord()) // re-persist post-lock with the real txid/block (state unchanged; refund is params-keyed)
+        const landedPending = deps.persist?.(session.toRecord()) // re-persist post-lock with the real txid/block (state unchanged; refund is params-keyed)
+        if (landedPending) await landedPending
         const baseLockedMessage = {
           txHash: lk.hash as `0x${string}`,
           blockNumber: Number(lk.blockNumber ?? 0),
@@ -1285,7 +1313,8 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
               if (terminalPreRevealFailure && durableClaimTxid !== undefined && session.state === 'revealed' && !session.toRecord().claimPublicationRefused) {
                 const reason = error instanceof Error ? error.message : String(error)
                 session.recordClaimPublicationRefused(nowMs(), reason)
-                deps.persist?.(session.toRecord())
+                const pending = deps.persist?.(session.toRecord())
+                if (pending) await pending
               }
               throw error
             }
@@ -1299,7 +1328,8 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
               session.observeReveal(Utils.toHex(secret), now())
             }
             session.recordClaimBroadcast(claimTxid, claimRawHex, claimAtomicBeefHex, claimConfs)
-            deps.persist?.(session.toRecord())
+            const pending = deps.persist?.(session.toRecord())
+            if (pending) await pending
             durableClaimTxid = claimTxid
             const submittedTxid = await bsv.broadcast(claimRawHex, claimAtomicBeefHex) // ladder: raw + BEEF → Anvil→ARC→WoC→Bitails
             if (submittedTxid.toLowerCase() !== claimTxid.toLowerCase()) {
@@ -1339,7 +1369,6 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
             const watchOpts = {
               // Block cadence: give up only after the chain advances `maxBlocks` REAL blocks; the
               // maxPolls cap is the absolute failsafe (stalled chain), NOT the give-up — so a slow BSV block extends
-              
               maxPolls: cfg.zeroConfClaimMaxPolls ?? 4320, sleepMs: cfg.zeroConfSleepMs ?? 5_000, sleep,
               chainHeight: recoveryHeight, maxBlocks: claimMaxBlocks,
               onPoll: ({ blocksElapsed }: { poll: number; blocksElapsed: number }) => { if (blocksElapsed > 0) log('bsv', `0-conf claim-watch: ${blocksElapsed}/${claimMaxBlocks} new block(s) elapsed, claim ${bsvClaimTxid.slice(0, 12)}… not yet buried…`) },
@@ -1379,13 +1408,14 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
           // verification THROWS (fail-closed, record kept); `zeroConfClaimMaxPolls` is only the absolute failsafe cap.
           const claimMaxBlocks = cfg.zeroConfClaimMaxBlocks ?? DEFAULT_CLAIM_WATCH_MAX_BLOCKS
           const proveClaimByMerkle = !!deps.chainTracker && typeof bsv.fetchBeef === 'function'
-          const claimBuriedCheck = async (): Promise<boolean> => {
+          const claimBuriedCheck = async (): Promise<ClaimConfirmationStatus> => {
             if (proveClaimByMerkle) {
               const beefTx = await bsv.fetchBeef!(bsvClaimTxid).catch(() => null)
               const mp = beefTx?.merklePath
               if (!mp) return false
               const proof = await verifyMerkleProof(bsvClaimTxid, mp, `confirmed-path: claim ${bsvClaimTxid.slice(0, 12)}…`)
               if (proof === 'invalid') throw new Error(`confirmed-path: claim ${bsvClaimTxid.slice(0, 12)}… merkle proof FAILED ChainTracker verification — refusing to declare it settled (s public, record kept)`)
+              if (proof === 'header-behind') return proof
               return proof === 'valid'
             }
             const confs = await bsv.txConfirmations(bsvClaimTxid).catch(() => 0)
@@ -1418,9 +1448,13 @@ export function makeBridgeInitiatorExecutor(deps: BridgeInitiatorDeps): {
         return { ok: true, baseLockTxid, bsvClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: useZeroConfFastPath ? 'fast' as const : 'confirmed' as const, settlementModeDowngradeReason } : {}) }
       } catch (e) {
         lockObservation?.finish()
+        // Browser EIP-1193 code 4001 proves the prompt was refused before signing/sending. Let the buyer engine
+        // terminalize its already-durable pre-lock record; every unmarked error retains the conservative result path.
+        if (isNeverSentWalletRefusal(e) && !baseLockTxid && durableClaimTxid === undefined) throw e
         // Before write-ahead, failure remains Base-refund eligible. At/after write-ahead the exact claim may have
         // escaped even when every broadcaster response was an error, so return its id and keep claim recovery alive.
-        return { ok: false, baseLockTxid, bsvClaimTxid: durableClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: durableClaimTxid ? undefined : 'not_revealed' as const } : {}), reason: e instanceof Error ? e.message : String(e) }
+        const reason = isNeverSentWalletRefusal(e) ? 'A wallet request was declined after the USDC lock was sent; the swap is kept for recovery.' : e instanceof Error ? e.message : String(e)
+        return { ok: false, baseLockTxid, bsvClaimTxid: durableClaimTxid, hashHex: evmPreimageHash, ...(cfg.doorProtocolVersion === 2 ? { settlementModeUsed: durableClaimTxid ? undefined : 'not_revealed' as const } : {}), reason }
       }
     },
   }

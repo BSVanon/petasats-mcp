@@ -43,8 +43,10 @@ function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?
     const request = JSON.parse(String(init?.body)) as { id: unknown; method: string; params: unknown[] }
     const s = state[url] ?? {}
     const blockHash = s.hash ?? `0x${'a'.repeat(64)}`
-    const depositTx = `0x${'d'.repeat(64)}`
-    const txForBlock = (block: string): string => `0x${BigInt(block).toString(16).padStart(64, '0')}`
+    const txForBlock = (block: string, position = 2): string => `0x${(BigInt(block) * 3n + BigInt(position)).toString(16).padStart(64, '0')}`
+    const depositForBlock = (block: string, depositIndex: 0 | 1): string => txForBlock(block, depositIndex)
+    const blockForTx = (transactionHash: string): string => `0x${(BigInt(transactionHash) / 3n).toString(16)}`
+    const isDepositTx = (transactionHash: string): boolean => BigInt(transactionHash) % 3n !== 2n
     const logForBlock = (block: string) => ({
       address: `0x${'9'.repeat(40)}`, topics: [`0x${'1'.repeat(64)}`], transactionHash: txForBlock(block),
       logIndex: '0x1', blockNumber: `0x${BigInt(block).toString(16)}`, blockHash,
@@ -54,7 +56,8 @@ function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?
     if (request.method === 'eth_blockNumber') return response(request.id, s.latest ?? '0x202')
     if (request.method === 'eth_getBlockByNumber') {
       if (request.params[0] === 'safe' || request.params[0] === 'finalized') return response(request.id, { number: '0x200', hash: blockHash })
-      return response(request.id, { number: request.params[0], hash: blockHash, transactions: [depositTx, txForBlock(String(request.params[0]))] })
+      const block = String(request.params[0])
+      return response(request.id, { number: block, hash: blockHash, transactions: [depositForBlock(block, 0), depositForBlock(block, 1), txForBlock(block)] })
     }
     if (request.method === 'eth_getLogs') {
       const filter = request.params[0] as { fromBlock?: string; toBlock?: string; topics?: unknown }
@@ -64,10 +67,10 @@ function rpcFetch(state: Record<string, { chain?: string; hash?: string; latest?
     }
     if (request.method === 'eth_getTransactionReceipt') {
       const transactionHash = String(request.params[0])
-      const blockNumber = `0x${BigInt(transactionHash).toString(16)}`
+      const blockNumber = blockForTx(transactionHash)
       return response(request.id, {
-        transactionHash, blockNumber, blockHash,
-        logs: transactionHash === depositTx ? [] : [logForBlock(blockNumber)],
+        transactionHash, blockNumber, blockHash, type: isDepositTx(transactionHash) ? '0x7e' : '0x2',
+        logs: isDepositTx(transactionHash) ? [] : [logForBlock(blockNumber)],
       })
     }
     return response(request.id, null)

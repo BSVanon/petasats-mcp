@@ -86,7 +86,7 @@ export function makeValidatedBsvFinality(rails: RecoveryBsvRails): ((txid: strin
 }
 
 /** Reuse the same header-validated proof rail for covenant-refund evidence and every Base-refund send proof. */
-function makeInitiatorRefundSafetyRails(rails: RecoveryBsvRails | undefined): InitiatorRefundSafetyBsvRails | undefined {
+export function makeInitiatorRefundSafetyRails(rails: RecoveryBsvRails | undefined): InitiatorRefundSafetyBsvRails | undefined {
   if (!rails) return undefined
   const proveFinality = makeValidatedBsvFinality(rails)
   return {
@@ -101,6 +101,7 @@ function makeInitiatorRefundSafetyRails(rails: RecoveryBsvRails | undefined): In
  * until a header-validated burial; this route deliberately has no EVM/refund capability. */
 export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts: {
   persistPath: string
+  recordIo?: { read(): SettlementRecord; write(record: SettlementRecord): void | Promise<void> }
   dry: boolean
   pollMs?: number
   maxPolls?: number
@@ -117,6 +118,7 @@ export function makeInitiatorClaimRecoveryDeps(session: SettlementSession, opts:
   const { bsvRails } = opts
   const deps = makeBsvWatchtowerDeps(session, {
     persistPath: opts.persistPath,
+    recordIo: opts.recordIo,
     dry: opts.dry,
     pollMs: opts.pollMs,
     maxPolls: opts.maxPolls,
@@ -417,6 +419,8 @@ export interface SuperviseInitiatorRecoveryOpts {
   firstClaimPublication?: 'disabled'
   /** The record's persistence file (the restock-store path) — the watchtower writes the refund txid + terminal state here. */
   recordPath: string
+  /** Alternate durable-store seam used by the browser buyer. */
+  recordIo?: { read(): SettlementRecord; write(record: SettlementRecord): void | Promise<void> }
   /** Keyless-safe EVM reads (current block / tx confirmations / canonical isSwapLocked state) driving the height-gated
    *  watch. The SAME `Erc20SwapEvmClient` instance works whether it holds a key (in-process) or not (doc 25 E4 signer
    *  path, keyless-constructed) — every read method works identically either way; only a SEND needs a key, and the
@@ -509,6 +513,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
     }
     const deps = makeInitiatorClaimRecoveryDeps(session, {
       persistPath: recordPath,
+      recordIo: opts.recordIo,
       dry: false,
       pollMs: opts.pollMs,
       maxPolls: opts.maxPolls ?? 100_000,
@@ -559,6 +564,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
 
   const deps = makeBaseWatchtowerDeps(session, {
     persistPath: recordPath,
+    recordIo: opts.recordIo,
     dry: false,
     evm: evmReads, // reads: baseHeight / baseConfirmations / isSwapLocked — keyless-safe (works whether evmReads holds a key or not)
     // Signing: the keyed client OR the keyless brain adapter. Preserve outcome-unknown as an explicit pending
@@ -600,6 +606,7 @@ export function superviseBaseInitiatorRecovery(opts: SuperviseInitiatorRecoveryO
 export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRecoveryOpts, 'session' | 'recordPath' | 'onTerminal' | 'onNonTerminal' | 'shouldContinue'> & {
   clearRecord: (swapId: string, expected?: SettlementRecord) => void
   recordPathFor: (swapId: string, record?: SettlementRecord) => string
+  recordIoFor?: (swapId: string, record?: SettlementRecord) => { read(): SettlementRecord; write(record: SettlementRecord): void | Promise<void> }
   /** Resolve late-installed read/signing capabilities only when a fresh run is armed. */
   evmProvider?: () => Erc20SwapEvmClient | undefined
   evmRefundProvider?: () => Pick<RecoveryClaimEvm, 'address' | 'swapAddress' | 'chainId' | 'refund'> | undefined
@@ -672,6 +679,7 @@ export function makeInitiatorRecoverySupervisor(base: Omit<SuperviseInitiatorRec
         evmRefund: base.evmRefundProvider?.() ?? base.evmRefund,
         session: SettlementSession.fromRecord(recoveryRecord),
         recordPath: base.recordPathFor(rec.hashHex, rec),
+        recordIo: base.recordIoFor?.(rec.hashHex, rec),
         shouldContinue: () => run.active,
         beforeSend: () => runSupersedeSafeSendFence(() => run.active, base.beforeSend),
         onRefundSafetyResult: (error) => {

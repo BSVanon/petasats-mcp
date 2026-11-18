@@ -25,6 +25,8 @@ const LABEL_CLAIMS_NO_LIVE_LOCK: ReadonlySet<SettlementState> = new Set(['create
 export interface BsvWatchtowerOpts {
   /** Where to durably persist the record after every state-affecting mutation (JSON sidecar). */
   persistPath: string
+  /** Browser/alternate durable-store seam. Omit to retain the file-backed runtime. */
+  recordIo?: { read(): SettlementRecord; write(record: SettlementRecord): void | Promise<void> }
   /** Optional exact mode retained across atomic replacements (the isolated signer journal uses 0640). */
   persistMode?: number
   /** DRY: revalidate + log but never broadcast (returns the pre-derived refund txid so the loop proceeds). */
@@ -341,7 +343,7 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
       : {}),
 
     reloadPersistedRecord: async (): Promise<SettlementRecord> => {
-      const fresh = sessionFromRecordFile(readSettlementRecordFile(opts.persistPath)).toRecord()
+      const fresh = opts.recordIo ? opts.recordIo.read() : sessionFromRecordFile(readSettlementRecordFile(opts.persistPath)).toRecord()
       if (opts.strictPersistedRecordTrust) {
         validateSettlementRecord(fresh)
         assertSameWatchtowerRecordIdentity(recoveryIdentity, fresh, 'BSV recovery strict reload')
@@ -352,7 +354,10 @@ export function makeBsvWatchtowerDeps(session: SettlementSession, opts: BsvWatch
       return fresh
     },
 
-    persist: async (rec: SettlementRecord): Promise<void> => persistWatchtowerAdapterRecord(opts.persistPath, recoveryIdentity, rec, opts.strictPersistedRecordTrust, opts.persistMode),
+    persist: async (rec: SettlementRecord): Promise<void> => {
+      if (opts.recordIo) await opts.recordIo.write(rec)
+      else persistWatchtowerAdapterRecord(opts.persistPath, recoveryIdentity, rec, opts.strictPersistedRecordTrust, opts.persistMode)
+    },
 
     emit: opts.emit ?? ((s): void => console.log(`  [wt] ${s.action} · ${s.note}${s.gate ? ` (bsv gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`)),
     now: opts.now ?? (() => Math.floor(Date.now() / 1000)),
@@ -419,6 +424,8 @@ export interface BaseWatchtowerOpts {
   evm?: Erc20SwapEvmClient
   /** Where to durably persist the record after every state-affecting mutation (JSON sidecar). */
   persistPath: string
+  /** Browser/alternate durable-store seam. Omit to retain the file-backed runtime. */
+  recordIo?: { read(): SettlementRecord; write(record: SettlementRecord): void | Promise<void> }
   /** DRY: validate the refund tuple encodes + heartbeat, but NEVER send (returns a non-broadcast sentinel). */
   dry?: boolean
   emit?: (s: WatchtowerStatus) => void
@@ -641,7 +648,7 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
       return { kind: 'none' as const }
     } } : {}),
     reloadPersistedRecord: async (): Promise<SettlementRecord> => {
-      const fresh = sessionFromRecordFile(readSettlementRecordFile(opts.persistPath)).toRecord()
+      const fresh = opts.recordIo ? opts.recordIo.read() : sessionFromRecordFile(readSettlementRecordFile(opts.persistPath)).toRecord()
       if (opts.strictPersistedRecordTrust) {
         validateSettlementRecord(fresh)
         assertSameWatchtowerRecordIdentity(recoveryIdentity, fresh, 'Base recovery strict reload')
@@ -662,7 +669,10 @@ export function makeBaseWatchtowerDeps(session: SettlementSession, opts: BaseWat
       return fresh
     },
 
-    persist: async (rec: SettlementRecord): Promise<void> => persistWatchtowerAdapterRecord(opts.persistPath, recoveryIdentity, rec, opts.strictPersistedRecordTrust),
+    persist: async (rec: SettlementRecord): Promise<void> => {
+      if (opts.recordIo) await opts.recordIo.write(rec)
+      else persistWatchtowerAdapterRecord(opts.persistPath, recoveryIdentity, rec, opts.strictPersistedRecordTrust)
+    },
 
     emit: opts.emit ?? ((s): void => console.log(`  [wt] ${s.action} · ${s.note}${s.gate ? ` (base gate ${s.gate.atHeight}, ~${Math.round(s.gate.etaSeconds / 60)}m)` : ''}`)),
     now,

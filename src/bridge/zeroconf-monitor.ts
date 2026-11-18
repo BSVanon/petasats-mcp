@@ -114,8 +114,9 @@ export async function monitorZeroConf(getStatus: () => Promise<ZeroConfVerdict>,
 }
 
 export interface WatchThroughClaimOpts {
-  /** ABSOLUTE failsafe cap on status rounds (≥ 1). In block-cadence mode (below) this only fires if the chain is
-   *  fully STALLED / the height source is broken; otherwise `maxBlocks` decides. In legacy (no `chainHeight`) mode it
+  /** ABSOLUTE failsafe cap on status rounds (≥ 1). In block-cadence mode (below) it fires if the chain is fully
+   *  STALLED, the height source is broken, or a claim proof's header never arrives (a 'header-behind' poll spends no
+   *  `maxBlocks` budget); otherwise `maxBlocks` decides. In legacy (no `chainHeight`) mode it
    *  is the wall-clock give-up (`maxPolls × sleepMs`). Fail-closed if the claim never buries within it. */
   maxPolls: number
   /** Gap between checks (ms). */
@@ -149,6 +150,9 @@ export interface WatchThroughClaimOpts {
   now?: () => number
 }
 
+/** `header-behind` means a claim proof exists but its block header is not in the ChainTracker yet. */
+export type ClaimConfirmationStatus = boolean | 'header-behind'
+
 /**
  * §12.12 PATH-A DETECTION (NOT prevention) — after the initiator REVEALS `s` against a 0-conf lock,
  * watch the LOCK for a funding double-spend until the initiator's own CLAIM buries (≥1 conf). This
@@ -166,7 +170,7 @@ export interface WatchThroughClaimOpts {
  */
 export async function watchLockThroughClaim(
   lockStatus: () => Promise<ZeroConfVerdict>,
-  claimConfirmed: () => Promise<boolean>,
+  claimConfirmed: () => Promise<ClaimConfirmationStatus>,
   opts: WatchThroughClaimOpts,
 ): Promise<void> {
   if (!Number.isInteger(opts.maxPolls) || opts.maxPolls < 1) throw new Error('watchLockThroughClaim: maxPolls must be an integer ≥ 1')
@@ -181,17 +185,15 @@ export async function watchLockThroughClaim(
   if (opts.resendEveryMs !== undefined && (!Number.isFinite(opts.resendEveryMs) || opts.resendEveryMs <= 0)) throw new Error('watchLockThroughClaim: resendEveryMs must be a finite number > 0')
   const now = opts.now ?? Date.now
   // BLOCK-CADENCE (BSVanon's fix): anchor the give-up budget to CHAIN PROGRESS, not wall-clock — the budget is measured
-  // in NEW blocks since the FIRST unburied poll, so a slow-but-normal block extends the wait instead of false-failing an
-  // honest claim. review 099868d1: (MEDIUM) the height rail is consulted ONLY AFTER an unburied claim result — never
+  // in NEW blocks seen across unburied polls (a 'header-behind' poll, whose proof waits only for its header, spends none),
+  // so a slow-but-normal block extends the wait instead of false-failing an honest claim. review 099868d1: (MEDIUM) the height rail is consulted ONLY AFTER an unburied claim result — never
   // before — so a height outage can NEVER override the buried-first WIN (a mined/merkle-proven claim is definitive
   // regardless of the tip). (LOW) every height is validated: a malformed (NaN/negative/fractional) or REGRESSING tip
   // fails closed rather than silently degrading the maxBlocks bound to the absolute-failsafe cap. D2 found that a
   // single Anvil height-read blip can otherwise falsely abandon a claim after `s` is public, so a bounded run of bad
-  // reads is tolerated as no progress; it never moves the anchor/high-water or extends the budget indefinitely.
-  let startHeight: number | undefined
+  // reads is tolerated as no progress; it never moves the high-water or extends the budget indefinitely.
   let lastHeight = -1
   let blocksElapsed = 0
-  let lastHookBlocksElapsed = 0
   let lastResendAt = now() // the caller broadcast the claim just before the watch started
   const resend = async (poll: number, newBlock: boolean): Promise<void> => {
     const at = now()
@@ -215,13 +217,14 @@ export async function watchLockThroughClaim(
     return { height: h }
   }
   for (let i = 0; i < opts.maxPolls; i++) {
-    let buried: boolean
+    let confirmation: ClaimConfirmationStatus
     try {
-      buried = await claimConfirmed()
+      confirmation = await claimConfirmed()
     } catch (e) {
       throw new Error(`0-conf claim-watch: claim-confirm check failed (fail-closed) — ${msg(e)}`)
     }
-    if (buried) return // buried-first WIN — a definitive claim burial, INDEPENDENT of the height rail (review 099868d1 MEDIUM)
+    if (confirmation === true) return // buried-first WIN — a definitive claim burial, INDEPENDENT of the height rail (review 099868d1 MEDIUM)
+    const headerBehind = confirmation === 'header-behind'
     let verdict: ZeroConfVerdict
     try {
       verdict = await lockStatus()
@@ -232,6 +235,7 @@ export async function watchLockThroughClaim(
       throw new Error('0-conf claim-watch: DOUBLE-SPEND of the BSV lock after reveal — swap under attack, do NOT declare complete')
     }
     if (useBlocks) {
+      const heightBeforeRead = lastHeight
       const heightRead = await readValidHeight() // consulted ONLY after an unburied result (never before the buried-first check)
       if (heightRead.failure) {
         consecutiveHeightFailures += 1
@@ -245,12 +249,12 @@ export async function watchLockThroughClaim(
       }
       consecutiveHeightFailures = 0
       const h = heightRead.height!
-      if (startHeight === undefined) startHeight = h // anchor the budget on the FIRST unburied poll
-      blocksElapsed = h - startHeight // ≥ 0: readValidHeight rejects any regression below the anchor
+      const newBlocks = heightBeforeRead < 0 ? 0 : h - heightBeforeRead
+      // A discovered proof waiting only for its independently tracked header is not a non-burial. Keep validating the
+      // height rail and re-sending on its new blocks, but do not spend the claim's non-burial block budget while it lags.
+      if (!headerBehind) blocksElapsed += newBlocks
       opts.onPoll?.({ poll: i, blocksElapsed })
-      const newBlock = blocksElapsed > lastHookBlocksElapsed
-      if (newBlock) lastHookBlocksElapsed = blocksElapsed
-      await resend(i, newBlock)
+      await resend(i, newBlocks > 0)
       if (blocksElapsed >= maxBlocks) {
         throw new Error(`0-conf claim-watch: initiator BSV claim did not bury within ${maxBlocks} new block(s) (fail-closed) — do NOT declare complete`)
       }
@@ -261,6 +265,6 @@ export async function watchLockThroughClaim(
     if (i < opts.maxPolls - 1) await sleep(opts.sleepMs)
   }
   throw new Error(useBlocks
-    ? `0-conf claim-watch: initiator BSV claim did not bury within the absolute failsafe window (${opts.maxPolls} polls; chain may be stalled) — do NOT declare complete`
+    ? `0-conf claim-watch: initiator BSV claim did not bury within the absolute failsafe window (${opts.maxPolls} polls; chain may be stalled, or the claim proof's header never arrived) — do NOT declare complete`
     : '0-conf claim-watch: initiator BSV claim did not bury within the risk window (fail-closed) — do NOT declare complete')
 }

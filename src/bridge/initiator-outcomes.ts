@@ -1,1 +1,1 @@
-export const COOPERATIVE_REFUND_REASON = "The market maker declined; USDC came back through the cooperative refund."
+export const COOPERATIVE_REFUND_REASON = "The counterparty declined; USDC came back through the cooperative refund."
