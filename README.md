@@ -2,6 +2,8 @@
 
 # PetaSats MCP
 
+[![PetaSats MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/BSVanon/petasats-mcp/badges/score.svg)](https://glama.ai/mcp/servers/BSVanon/petasats-mcp)
+
 Buy BSV with USDC on Base from your AI app through a local, non-custodial MCP server.
 
 ## What it does
