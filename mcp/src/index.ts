@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url'
 import { type BuyerHome, type BuyerKit, buyerAddresses, buyerHome, DOOR_IDENTITY_PLACEHOLDER, createBuyerRuntime, initialiseBuyerHome, listBuyerWithdrawalIntents, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, readBuyerLimits, resolveBuyerWithdrawalIntent, resumeSpending } from 'petasats/sdk'
 import { createPetaSatsMcpServer, handleToolCall, TOOLS } from './server.js'
 import { supportedPairs, parseAsset } from './assets.js'
+import { isHostedCopy } from './hosted.js'
 
 const terminal = new Set(['delivered', 'refunded', 'failed'])
 
@@ -171,10 +172,11 @@ async function main(): Promise<void> {
     return
   }
   const kit = runtime?.kit ?? unavailableKit(unavailable ?? 'buyer runtime is unavailable')
-  const server = createPetaSatsMcpServer({ petasats: kit, doorIdentity: runtime?.config.doorIdentity })
-  startBackgroundRecovery(kit)
+  const hosted = isHostedCopy()
+  const server = createPetaSatsMcpServer({ petasats: kit, doorIdentity: runtime?.config.doorIdentity, hosted })
+  if (!hosted) startBackgroundRecovery(kit)
   await server.connect(new StdioServerTransport())
-  console.error(runtime ? '[petasats-mcp] running on stdio' : `[petasats-mcp] running on stdio; money tools unavailable: ${unavailable}`)
+  console.error(hosted ? '[petasats-mcp] running on stdio in quote-only mode (shared server); key and money tools are refused' : runtime ? '[petasats-mcp] running on stdio' : `[petasats-mcp] running on stdio; money tools unavailable: ${unavailable}`)
 }
 
 /** npm installs the bin as a symlink (POSIX) while import.meta.url is the real path; compare real paths. */
