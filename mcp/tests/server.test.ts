@@ -118,13 +118,22 @@ test('wallet_info includes the pinned door identity and never serializes private
 
 test('stop_spending is registered, idempotent, and fund_wallet asks the core planning guard with amount_in', async () => {
   const tool = TOOLS.find((item) => item.name === 'stop_spending')
-  assert.deepEqual(tool?.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true })
+  assert.deepEqual(tool?.annotations, { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false })
   let planned = ''; let plannedAmount: bigint | undefined; let stopped = ''
   const kit = { ...fakePetasats(), assertCanPlanSwap: async (address: string, amount: bigint) => { planned = address; plannedAmount = amount }, stopSpending: async (reason?: string) => { stopped = reason ?? ''; return { alreadyStopped: false, at: 1, reason } } }
   payload(await handleToolCall(kit, 'fund_wallet', { bsv_address: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', amount_in: '1' }))
   assert.equal(planned, '1BoatSLRHtKNngkdXEeobR76b53LETtpyT')
   assert.equal(plannedAmount, 1n)
   assert.equal(payload(await handleToolCall(kit, 'stop_spending', { reason: 'pause' })).stopped, true); assert.equal(stopped, 'pause')
+})
+
+test('every tool describes each parameter and declares its read-only and open-world hints', () => {
+  for (const tool of TOOLS) {
+    assert.ok(tool.description.length > 0, tool.name)
+    assert.equal(typeof tool.annotations.readOnlyHint, 'boolean', tool.name)
+    assert.equal(typeof tool.annotations.openWorldHint, 'boolean', tool.name)
+    for (const [key, property] of Object.entries(tool.inputSchema.properties) as Array<[string, { description?: string }]>) assert.ok(property.description, `${tool.name}.${key}`)
+  }
 })
 
 test('background recovery starts immediately without blocking and serializes overlapping ticks', async () => {

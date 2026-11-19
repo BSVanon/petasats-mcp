@@ -1796,12 +1796,12 @@
       "format": "esm"
     },
     "src/bridge/initiator-outcomes.ts": {
-      "bytes": 116,
+      "bytes": 406,
       "imports": [],
       "format": "esm"
     },
     "src/sdk/buyer/types.ts": {
-      "bytes": 11749,
+      "bytes": 11810,
       "imports": [
         {
           "path": "src/bridge/initiator-outcomes.ts",
@@ -39620,7 +39620,7 @@
       "format": "esm"
     },
     "src/bridge/initiator-executor.ts": {
-      "bytes": 105387,
+      "bytes": 105497,
       "imports": [
         {
           "path": "node_modules/@bsv/sdk/dist/esm/mod.js",
@@ -40264,8 +40264,13 @@
       "imports": [],
       "format": "esm"
     },
+    "src/sdk/buyer/counterparty-wording.ts": {
+      "bytes": 689,
+      "imports": [],
+      "format": "esm"
+    },
     "src/sdk/buyer/door-client.ts": {
-      "bytes": 9732,
+      "bytes": 9850,
       "imports": [
         {
           "path": "crypto",
@@ -40291,6 +40296,11 @@
           "path": "src/transport/door-retry-after.ts",
           "kind": "import-statement",
           "original": "../../transport/door-retry-after"
+        },
+        {
+          "path": "src/sdk/buyer/counterparty-wording.ts",
+          "kind": "import-statement",
+          "original": "./counterparty-wording"
         }
       ],
       "format": "esm"
@@ -40312,7 +40322,7 @@
       "format": "esm"
     },
     "src/sdk/buyer/settlement-mode.ts": {
-      "bytes": 8142,
+      "bytes": 8154,
       "imports": [
         {
           "path": "src/sdk/buyer/door-retry.ts",
@@ -40323,7 +40333,7 @@
       "format": "esm"
     },
     "src/sdk/buyer/buyer-kit.ts": {
-      "bytes": 34398,
+      "bytes": 34419,
       "imports": [
         {
           "path": "crypto",
@@ -40768,7 +40778,7 @@
       "format": "esm"
     },
     "src/sdk/buyer/status-view.ts": {
-      "bytes": 4901,
+      "bytes": 5237,
       "imports": [
         {
           "path": "src/sdk/buyer/types.ts",
@@ -40784,6 +40794,11 @@
           "path": "src/bridge/base-block-time.ts",
           "kind": "import-statement",
           "original": "../../bridge/base-block-time"
+        },
+        {
+          "path": "src/sdk/buyer/counterparty-wording.ts",
+          "kind": "import-statement",
+          "original": "./counterparty-wording"
         }
       ],
       "format": "esm"
@@ -43528,7 +43543,7 @@
       "format": "esm"
     },
     "mcp/src/server.ts": {
-      "bytes": 24665,
+      "bytes": 31546,
       "imports": [
         {
           "path": "node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js",
@@ -45420,13 +45435,13 @@
           "bytesInOutput": 0
         },
         "src/bridge/initiator-outcomes.ts": {
-          "bytesInOutput": 109
+          "bytesInOutput": 366
         },
         "src/sdk/buyer/types.ts": {
           "bytesInOutput": 0
         },
         "src/sdk/buyer/buyer-kit.ts": {
-          "bytesInOutput": 28270
+          "bytesInOutput": 28264
         },
         "node_modules/viem/_esm/index.js": {
           "bytesInOutput": 200
@@ -46530,7 +46545,7 @@
           "bytesInOutput": 10924
         },
         "src/bridge/initiator-executor.ts": {
-          "bytesInOutput": 60185
+          "bytesInOutput": 60255
         },
         "src/bridge/bsv-claim-proof.ts": {
           "bytesInOutput": 856
@@ -46602,7 +46617,7 @@
           "bytesInOutput": 210
         },
         "src/sdk/buyer/door-client.ts": {
-          "bytesInOutput": 8101
+          "bytesInOutput": 8151
         },
         "src/transport/door-protocol-v2.ts": {
           "bytesInOutput": 5831
@@ -46610,11 +46625,14 @@
         "src/transport/messagebox-request-reply.ts": {
           "bytesInOutput": 2098
         },
+        "src/sdk/buyer/counterparty-wording.ts": {
+          "bytesInOutput": 292
+        },
         "src/sdk/buyer/door-retry.ts": {
           "bytesInOutput": 1874
         },
         "src/sdk/buyer/settlement-mode.ts": {
-          "bytesInOutput": 5772
+          "bytesInOutput": 5784
         },
         "src/sdk/buyer/runtime/runtime.ts": {
           "bytesInOutput": 9265
@@ -46668,7 +46686,7 @@
           "bytesInOutput": 1266
         },
         "src/sdk/buyer/status-view.ts": {
-          "bytesInOutput": 4575
+          "bytesInOutput": 4810
         },
         "node_modules/zod/v4/mini/parse.js": {
           "bytesInOutput": 0
@@ -46713,10 +46731,10 @@
           "bytesInOutput": 24
         },
         "mcp/src/server.ts": {
-          "bytesInOutput": 22691
+          "bytesInOutput": 29512
         }
       },
-      "bytes": 5540147
+      "bytes": 5547920
     }
   }
 }

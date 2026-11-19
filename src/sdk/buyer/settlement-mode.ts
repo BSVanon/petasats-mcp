@@ -17,7 +17,7 @@ export function requestedSettlementMode(record: BuyerSwapRecord): SettlementMode
 
 export function initialSettlementMode(record: { requestedSpeed: 'standard' | 'fast'; fastSettlementAllowedSnapshot: boolean; quote: BuyerQuote; amountIn: bigint }): { eligible: boolean; downgradeReason?: string } {
   const eligible = record.requestedSpeed === 'fast' && record.fastSettlementAllowedSnapshot && record.quote.doorProtocolVersion === 2 && record.quote.fastOffered === true && (record.quote.fastCapUsdcBaseUnits ?? 0n) >= record.amountIn
-  const downgradeReason = record.requestedSpeed !== 'fast' ? undefined : !record.fastSettlementAllowedSnapshot ? 'fast settlement is disabled by limits.json' : record.quote.doorProtocolVersion !== 2 ? 'market maker supports the confirmed v1 protocol only' : !record.quote.fastOffered || (record.quote.fastCapUsdcBaseUnits ?? 0n) < record.amountIn ? 'market maker did not offer fast settlement for this amount' : undefined
+  const downgradeReason = record.requestedSpeed !== 'fast' ? undefined : !record.fastSettlementAllowedSnapshot ? 'fast settlement is disabled by limits.json' : record.quote.doorProtocolVersion !== 2 ? 'the counterparty supports the confirmed v1 protocol only' : !record.quote.fastOffered || (record.quote.fastCapUsdcBaseUnits ?? 0n) < record.amountIn ? 'the counterparty did not offer fast settlement for this amount' : undefined
   return { eligible, downgradeReason }
 }
 
@@ -35,10 +35,10 @@ export async function negotiateSettlementMode(record: BuyerSwapRecord, deps: { d
   const admission = deps.retry
     ? await callDoorWithRetry(admit, { ...deps.retry, stage: 'admission', canWait: (waitMs) => record.quote.expiry * 1_000 > deps.now() + waitMs + 5_000 })
     : await admit()
-  if (admission.handshakeDeadlineMs <= deps.now()) throw new Error('market maker admission expired before the handshake began')
+  if (admission.handshakeDeadlineMs <= deps.now()) throw new Error('counterparty admission expired before the handshake began')
   const admittedMode = admission.settlementMode ?? 'confirmed'
   const admittedCap = admission.fastCapUsdcBaseUnits ?? '0'
-  const downgradeReason = admittedMode === 'confirmed' && requestedMode === 'fast' ? 'market maker did not agree to fast settlement' : record.settlementModeDowngradeReason
+  const downgradeReason = admittedMode === 'confirmed' && requestedMode === 'fast' ? 'the counterparty did not agree to fast settlement' : record.settlementModeDowngradeReason
   record = await deps.write(record, 'admitted', { swapNamespace: admission.swapNamespace, handshakeDeadlineMs: admission.handshakeDeadlineMs, agreedSettlementMode: admittedMode, agreedFastCapUsdcBaseUnits: admittedCap, settlementModeDowngradeReason: downgradeReason })
   return { record, admission, admittedMode, admittedCap, downgradeReason }
 }

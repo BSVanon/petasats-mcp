@@ -15,7 +15,7 @@ export interface DoorRetryOptions {
 }
 
 function baseReason(error: DoorDeclineError): string {
-  const match = /^The market maker declined this request: (.*)\. Nothing was locked\.$/.exec(error.decline.message)
+  const match = /^The counterparty declined this request: (.*)\. Nothing was locked\.$/.exec(error.decline.message)
   return parseRetryAfter(match?.[1] ?? error.decline.message).base
 }
 

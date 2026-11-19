@@ -2,7 +2,7 @@ import type { ConvertRequest, PetaSats, Quote, SwapResult } from '../convert'
 import type { SettlementState } from '../../bridge/settlement-session'
 import type { Transaction } from '@bsv/sdk'
 
-export { COOPERATIVE_REFUND_REASON } from '../../bridge/initiator-outcomes'
+export { COOPERATIVE_REFUND_REASON, LEGACY_COOPERATIVE_REFUND_REASON, isCooperativeRefundReason } from '../../bridge/initiator-outcomes'
 
 export type SettlementSpeed = 'standard' | 'fast'
 export type SettlementMode = 'confirmed' | 'fast'
