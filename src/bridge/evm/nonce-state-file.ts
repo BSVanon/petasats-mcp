@@ -14,6 +14,7 @@ import {
 } from 'node:fs'
 import { dirname } from 'node:path'
 import { isAddress, type Address } from 'viem'
+import { syncNewEntry } from '../atomic-record-write'
 import { parseEvmNonceState, type EvmNonceState } from './inflight-state'
 
 export const NONCE_STATE_MODE = 0o660
@@ -67,7 +68,7 @@ export function assertIdentity(chainId: number, address: Address): void {
 }
 
 /** Read and strictly parse the state. Absence is benign only when the file and its temp are both absent. */
-export function readNonceStateFile(path: string, tmpPath: string, fs: NonceStateFsOps): EvmNonceState | undefined {
+export function readNonceStateFile(path: string, tmpPath: string, fs: NonceStateFsOps, platform: NodeJS.Platform = process.platform): EvmNonceState | undefined {
   // A leftover temp can mean the prior process died after a successful broadcast but before atomic rename. The old
   // counter is then unsafe to reuse, so halt before preparing another transaction and require operator resolution.
   try {
@@ -90,7 +91,8 @@ export function readNonceStateFile(path: string, tmpPath: string, fs: NonceState
     throw new Error(`EVM nonce counter ${path} must be a regular non-symlink file (fail-closed)`)
   }
   const mode = before.mode & 0o777
-  if (mode !== NONCE_STATE_MODE) {
+  // POSIX: enforce 0660 owner/group-only (skip on win32 where these bits are meaningless).
+  if (platform !== 'win32' && mode !== NONCE_STATE_MODE) {
     throw new Error(`EVM nonce counter ${path} must be 0660 owner/group-only; got 0${mode.toString(8)} (fail-closed)`)
   }
 
@@ -101,7 +103,7 @@ export function readNonceStateFile(path: string, tmpPath: string, fs: NonceState
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
       throw new Error(`EVM nonce counter ${path} changed while opening (fail-closed)`)
     }
-    if ((opened.mode & 0o777) !== NONCE_STATE_MODE) {
+    if (platform !== 'win32' && (opened.mode & 0o777) !== NONCE_STATE_MODE) {
       throw new Error(`EVM nonce counter ${path} permissions changed while opening (fail-closed)`)
     }
     return parseEvmNonceState(fs.readFileSync(fd, 'utf8'), path)
@@ -114,7 +116,7 @@ export function readNonceStateFile(path: string, tmpPath: string, fs: NonceState
 }
 
 /** Replace the state durably: temp write -> fchmod -> fsync -> rename -> parent directory fsync. */
-export function writeNonceStateFile(path: string, tmpPath: string, state: EvmNonceState, fs: NonceStateFsOps): void {
+export function writeNonceStateFile(path: string, tmpPath: string, state: EvmNonceState, fs: NonceStateFsOps, platform: NodeJS.Platform = process.platform): void {
   assertIdentity(state.chainId, state.address)
   assertNonce(state.nextNonce, 'nextNonce')
   if (!Number.isSafeInteger(state.lastBroadcastAtMs) || state.lastBroadcastAtMs < 0) {
@@ -146,17 +148,13 @@ export function writeNonceStateFile(path: string, tmpPath: string, state: EvmNon
   }
   fs.renameSync(tmpPath, path)
 
-  // The file fsync made the contents durable; only the parent directory fsync makes the rename itself durable.
-  let directoryFd: number | undefined
+  // The file fsync made the contents durable; syncNewEntry makes the rename itself durable too (parent directory
+  // fsync on POSIX; a file reopen+fsync on win32, which has no directory handle to fsync). A close failure is now
+  // also fail-closed here: unlike the old inline sequence, nothing swallows it after a successful fsync.
   try {
-    directoryFd = fs.openSync(parent, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY)
-    fs.fsyncSync(directoryFd)
+    syncNewEntry(path, { fs, directoryFlags: fsConstants.O_RDONLY | fsConstants.O_DIRECTORY, platform })
   } catch (error) {
     throw new NonceStateDurabilityError(path, error instanceof Error ? error.message : String(error))
-  } finally {
-    if (directoryFd !== undefined) {
-      try { fs.closeSync(directoryFd) } catch { /* the durability verdict above is what matters */ }
-    }
   }
 }
 

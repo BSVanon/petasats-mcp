@@ -1,4 +1,5 @@
 import Mocha from 'mocha'
+import { fileURLToPath } from 'node:url'
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -8,6 +9,6 @@ async function findTests(dir) {
 }
 
 const mocha = new Mocha()
-for (const file of await findTests(new URL('../tests/', import.meta.url).pathname)) mocha.addFile(file)
+for (const file of await findTests(fileURLToPath(new URL('../tests/', import.meta.url)))) mocha.addFile(file)
 await mocha.loadFilesAsync()
 process.exitCode = await new Promise((resolve) => mocha.run(resolve))

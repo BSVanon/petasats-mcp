@@ -140,7 +140,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## @modelcontextprotocol/sdk@1.30.0
+## @modelcontextprotocol/sdk@1.32.2
 
 Package license field: MIT
 License file: LICENSE
@@ -430,7 +430,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## fast-uri@3.1.5
+## fast-uri@3.1.9
 
 Package license field: BSD-3-Clause
 License file: LICENSE
@@ -672,7 +672,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## zod@4.4.3
+## zod@4.6.7
 
 Package license field: MIT
 License file: LICENSE

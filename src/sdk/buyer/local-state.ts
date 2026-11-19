@@ -1,8 +1,9 @@
 import * as fs from 'fs'
+import { homedir } from 'os'
 import { join } from 'path'
 import { PrivateKey } from '@bsv/sdk'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
-import { writeSettlementRecordAtomically } from '../../bridge/atomic-record-write'
+import { syncNewEntry, writeSettlementRecordAtomically } from '../../bridge/atomic-record-write'
 import type { BuyerStore, BuyerSwapRecord } from './types'
 import { DEFAULT_BUYER_BASE_RPC_URLS } from './runtime/evm-rails'
 
@@ -16,12 +17,19 @@ export interface BuyerDiskConfig { doorIdentity?: string; baseRpcUrls: string[];
 export interface BuyerKeys { identityWif: string; evmPrivateKey: `0x${string}`; bsvWif: string }
 export interface BuyerHome { home: string; keysPath: string; configPath: string; limitsPath: string; stopPath: string; swapsDir: string; settlementDir: string; withdrawalsDir: string }
 
-export function buyerHome(home = process.env.PETASATS_HOME || join(process.env.HOME || '.', '.petasats')): BuyerHome {
+export function buyerHome(home = process.env.PETASATS_HOME || join(process.env.HOME || homedir(), '.petasats')): BuyerHome {
   return { home, keysPath: join(home, 'keys.json'), configPath: join(home, 'config.json'), limitsPath: join(home, 'limits.json'), stopPath: join(home, 'STOP'), swapsDir: join(home, 'swaps'), settlementDir: join(home, 'settlement'), withdrawalsDir: join(home, 'withdrawals') }
 }
 type BuyerHomeFs = Pick<typeof fs, 'chmodSync' | 'existsSync' | 'mkdirSync' | 'openSync' | 'readFileSync' | 'writeFileSync' | 'closeSync' | 'readdirSync' | 'renameSync' | 'fsyncSync' | 'lstatSync' | 'fstatSync' | 'fchmodSync'>
+type BuyerHomeFsConstants = typeof fs.constants & { O_DIRECTORY?: number; O_NOFOLLOW?: number }
 
-function safeMkdir(path: string, fileSystem: BuyerHomeFs = fs): void {
+/**
+ * Create path as an owner-only (0700) directory, refusing a symlink at that name. The fd-open+fchmod step (rather
+ * than a plain chmod) is skipped whenever O_DIRECTORY or O_NOFOLLOW is unavailable — e.g. on win32, where opening a
+ * directory with those POSIX-only flags and then fchmod-ing the handle most likely fails (libuv's fchmod reopens the
+ * handle without backup semantics). The fsConstants parameter exists only so tests can simulate that platform gap.
+ */
+export function safeMkdir(path: string, fileSystem: BuyerHomeFs = fs, fsConstants: BuyerHomeFsConstants = fs.constants as BuyerHomeFsConstants): void {
   const assertDirectory = (): void => {
     const stat = fileSystem.lstatSync(path)
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe local directory ${path}; replace it with a directory and chmod 700 ${path}`)
@@ -31,7 +39,6 @@ function safeMkdir(path: string, fileSystem: BuyerHomeFs = fs): void {
   }
   fileSystem.mkdirSync(path, { recursive: true, mode: 0o700 })
   assertDirectory()
-  const fsConstants = fs.constants as typeof fs.constants & { O_DIRECTORY?: number; O_NOFOLLOW?: number }
   if (fsConstants.O_DIRECTORY !== undefined && fsConstants.O_NOFOLLOW !== undefined) {
     const fd = fileSystem.openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW)
     try {
@@ -48,8 +55,7 @@ function writeNew(path: string, value: unknown, mode: number, fileSystem: BuyerH
     fileSystem.chmodSync(path, mode)
     fileSystem.fsyncSync(fd)
   } finally { fileSystem.closeSync(fd) }
-  const directoryFd = fileSystem.openSync(join(path, '..'), 'r')
-  try { fileSystem.fsyncSync(directoryFd) } finally { fileSystem.closeSync(directoryFd) }
+  syncNewEntry(path, { fs: fileSystem })
 }
 
 function assertReadableBuyerKeys(keys: unknown): asserts keys is BuyerKeys {
@@ -83,16 +89,17 @@ export function initialiseBuyerHome(homePath?: string, fileSystem: BuyerHomeFs =
   } satisfies BuyerDiskConfig, 0o600, fileSystem)
   return paths
 }
-export function secureFileText(path: string): string {
+export function secureFileText(path: string, platform: NodeJS.Platform = process.platform): string {
   const before = fs.lstatSync(path)
   const owner = typeof process.getuid === 'function' ? process.getuid() : undefined
   if (!before.isFile() || before.isSymbolicLink()) throw new Error(`unsafe local file ${path}; replace it with a regular file and chmod 600 ${path}`)
-  if ((before.mode & 0o077) !== 0 || (owner !== undefined && before.uid !== owner)) throw new Error(`unsafe permissions on ${path}; run chmod 600 ${path}`)
+  // POSIX: refuse group/world-accessible key material (skip on win32 where these bits are meaningless).
+  if ((platform !== 'win32' && (before.mode & 0o077) !== 0) || (owner !== undefined && before.uid !== owner)) throw new Error(`unsafe permissions on ${path}; run chmod 600 ${path}`)
   const nofollow = (fs.constants as typeof fs.constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0
   const fd = fs.openSync(path, fs.constants.O_RDONLY | nofollow)
   try {
     const after = fs.fstatSync(fd)
-    if (before.dev !== after.dev || before.ino !== after.ino || !after.isFile() || (after.mode & 0o077) !== 0 || (owner !== undefined && after.uid !== owner)) {
+    if (before.dev !== after.dev || before.ino !== after.ino || !after.isFile() || (platform !== 'win32' && (after.mode & 0o077) !== 0) || (owner !== undefined && after.uid !== owner)) {
       throw new Error(`unsafe local file ${path}; replace it with a regular file and chmod 600 ${path}`)
     }
     return fs.readFileSync(fd, 'utf8')
@@ -100,11 +107,12 @@ export function secureFileText(path: string): string {
 }
 
 /** Validate runtime directories before a sensitive file inside them is opened. */
-export function assertSecureBuyerHome(paths: BuyerHome): void {
+export function assertSecureBuyerHome(paths: BuyerHome, platform: NodeJS.Platform = process.platform): void {
   const owner = typeof process.getuid === 'function' ? process.getuid() : undefined
   for (const path of [paths.home, paths.swapsDir, paths.settlementDir, paths.withdrawalsDir]) {
     const stat = fs.lstatSync(path)
-    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || (owner !== undefined && stat.uid !== owner)) {
+    // POSIX: refuse a group/world-writable runtime directory (skip on win32 where these bits are meaningless).
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (platform !== 'win32' && (stat.mode & 0o077) !== 0) || (owner !== undefined && stat.uid !== owner)) {
       throw new Error(`unsafe local directory ${path}; run chmod 700 ${path}`)
     }
   }

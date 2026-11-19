@@ -1,13 +1,14 @@
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import esbuild from 'esbuild'
 const identity = JSON.parse(await readFile(new URL('./door-identity.json', import.meta.url))).doorIdentity
 const version = JSON.parse(await readFile(new URL('../package.json', import.meta.url))).version
 let commit = process.env.GITHUB_SHA || 'unknown'; if (commit === 'unknown') try { commit = execFileSync('git', ['rev-parse', 'HEAD']).toString().trim() } catch {}
 await mkdir(new URL('../dist/', import.meta.url), { recursive: true })
-const output = new URL('../dist/petasats-mcp.mjs', import.meta.url).pathname
-const meta = new URL('../build/meta.json', import.meta.url).pathname
+const output = fileURLToPath(new URL('../dist/petasats-mcp.mjs', import.meta.url))
+const meta = fileURLToPath(new URL('../build/meta.json', import.meta.url))
 const result = await esbuild.build({ entryPoints: ['mcp/src/index.ts'], bundle: true, platform: 'node', target: 'node22', format: 'esm', alias: { 'petasats/sdk': './src/sdk/buyer-sdk.ts' }, define: { __PETASATS_DOOR_IDENTITY__: JSON.stringify(identity) }, banner: { js: '#!/usr/bin/env node\n/* petasats-mcp ' + version + '; commit ' + commit + '; Open BSV License v4 */' }, outfile: output, metafile: true })
 await writeFile(meta, JSON.stringify(result.metafile, null, 2) + '\n')
 const packageRoot = (input) => { const parts = input.replaceAll('\\', '/').split('/'); const at = parts.lastIndexOf('node_modules'); return at < 0 ? undefined : parts.slice(0, at + (parts[at + 1]?.startsWith('@') ? 3 : 2)).join('/') }

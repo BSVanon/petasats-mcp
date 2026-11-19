@@ -1,6 +1,7 @@
-import { COOPERATIVE_REFUND_REASON, type BuyerSwapRecord } from './types'
+import { COOPERATIVE_REFUND_REASON, isCooperativeRefundReason, type BuyerSwapRecord } from './types'
 import { MIN_REVEAL_CONFIRM_BUDGET_BLOCKS } from '../../bridge/responder-ordering'
 import { BASE_BLOCK_SECS_FLOOR } from '../../bridge/base-block-time'
+import { sanitizeCounterpartyReason } from './counterparty-wording'
 
 const stages: Record<string, { label: string; step: number | null }> = {
   quoted: { label: 'Quote saved', step: 1 }, admitted: { label: 'Admitted', step: 2 },
@@ -22,8 +23,9 @@ const etaMinutes = (stage: string): number => {
 }
 
 export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown> {
-  const info = record.stage === 'refunded' && record.reason === COOPERATIVE_REFUND_REASON
-    ? { label: "The counterparty declined; USDC came back", step: null }
+  const cooperativeRefund = record.stage === 'refunded' && isCooperativeRefundReason(record.reason)
+  const info = cooperativeRefund
+    ? { label: 'The counterparty declined; USDC came back', step: null }
     : stages[record.stage] ?? { label: 'Older or unknown record', step: null }
   const delivery = !!record.deliverTo
   const terminal = ['settled', 'delivered', 'refunded', 'failed'].includes(record.stage)
@@ -31,7 +33,7 @@ export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown
   const lockTxid = record.bsvLockOutpoint?.split('_')[0] ?? record.bsvLockTxid
   return {
     swap_id: record.swapId, stage: unknown ? 'needs_attention' : record.stage, stage_label: info.label,
-    requested_speed: record.requestedSpeed ?? 'standard', agreed_settlement_mode: record.agreedSettlementMode ?? 'confirmed', settlement_mode_used: record.settlementModeUsed ?? 'pending', settlement_mode_downgrade_reason: record.settlementModeDowngradeReason ?? null,
+    requested_speed: record.requestedSpeed ?? 'standard', agreed_settlement_mode: record.agreedSettlementMode ?? 'confirmed', settlement_mode_used: record.settlementModeUsed ?? 'pending', settlement_mode_downgrade_reason: record.settlementModeDowngradeReason === undefined ? null : sanitizeCounterpartyReason(record.settlementModeDowngradeReason),
     step: info.step, steps_total: delivery ? 8 : 7, done: terminal,
     outcome: record.stage === 'delivered' ? 'delivered' : record.stage === 'settled' ? 'settled' : record.stage === 'refunded' ? 'refunded' : record.stage === 'failed' ? 'failed' : null,
     needs_attention: unknown || record.stage === 'needs_attention',
@@ -48,6 +50,6 @@ export function buyerStatusView(record: BuyerSwapRecord): Record<string, unknown
       note: `block heights; a BSV block takes about 10 minutes, a Base block about ${BASE_BLOCK_SECS_FLOOR} seconds`,
     },
     txids: { base_lock: record.baseLockTxid ? { txid: record.baseLockTxid, url: base(record.baseLockTxid) } : undefined, base_refund: record.baseRefundTxid ? { txid: record.baseRefundTxid, url: base(record.baseRefundTxid) } : undefined, bsv_lock: lockTxid ? { txid: lockTxid, url: bsv(lockTxid) } : undefined, bsv_claim: record.bsvClaimTxid ? { txid: record.bsvClaimTxid, url: bsv(record.bsvClaimTxid) } : undefined, bsv_delivery: record.sweepOutbox ? { txid: record.sweepOutbox.txid, url: bsv(record.sweepOutbox.txid) } : undefined },
-    reason: record.reason, created_at: new Date(record.createdAtMs).toISOString(), updated_at: new Date(record.updatedAtMs).toISOString(),
+    reason: cooperativeRefund ? COOPERATIVE_REFUND_REASON : record.reason === undefined ? undefined : sanitizeCounterpartyReason(record.reason), created_at: new Date(record.createdAtMs).toISOString(), updated_at: new Date(record.updatedAtMs).toISOString(),
   }
 }

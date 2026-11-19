@@ -17,3 +17,14 @@ test('every README command runs the release it ships with', () => {
   assert.ok(versions.length > 0)
   assert.deepEqual([...new Set(versions)], [VERSION])
 })
+
+test('the agent skill runs the release it ships with', () => {
+  // The skill sits beside the README: under the template here, at the repository root once published.
+  const path = [join(MCP_ROOT, 'public', 'template', 'skills', 'petasats-buy-bsv', 'SKILL.md'), join(MCP_ROOT, '..', 'skills', 'petasats-buy-bsv', 'SKILL.md')].find((p) => existsSync(p))
+  assert.ok(path)
+  const skill = readFileSync(path, 'utf8')
+  assert.deepEqual(skill.match(/(?:npx|-y) petasats-mcp(?!@)|"petasats-mcp"/g) ?? [], [], 'a command names the package without a version')
+  const versions = [...skill.matchAll(/petasats-mcp[@ ](\d+\.\d+\.\d+)/g)].map((m) => m[1])
+  assert.ok(versions.length > 0)
+  assert.deepEqual([...new Set(versions)], [VERSION])
+})

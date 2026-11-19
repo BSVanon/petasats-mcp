@@ -16,7 +16,7 @@ import { waitForLockTx } from './lock-tx-wait'
 import { retryOnSchedule } from '../wallet/bounded-retry'
 import { AmbiguousBsvLockError } from './bsv-lock-discovery'
 import { abortableSleep, withRequestTimeout } from '../wallet/abortable-request'
-import { COOPERATIVE_REFUND_REASON } from './initiator-outcomes'
+import { COOPERATIVE_REFUND_REASON, LEGACY_COOPERATIVE_REFUND_REASON } from './initiator-outcomes'
 import {
   FIRST_PUBLICATION_BASE_HEIGHT_MARGIN_BLOCKS,
   FIRST_PUBLICATION_READ_TIMEOUT_MS,
@@ -168,7 +168,9 @@ function combinedSignal(parent: AbortSignal | undefined, local: AbortSignal): Ab
 }
 
 // Built from the one reason constant so a renamed public-kit literal still matches exactly.
-const COOPERATIVE_REFUND_PATTERN = COOPERATIVE_REFUND_REASON.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const COOPERATIVE_REFUND_PATTERN = [COOPERATIVE_REFUND_REASON, LEGACY_COOPERATIVE_REFUND_REASON]
+  .map((reason) => reason.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|')
 const FINALIZED_BASE_OUTCOME = new RegExp(
   `^(?:${COOPERATIVE_REFUND_PATTERN}|RECOVERY NEEDS ATTENTION: finalized Base (?:Claim|Refund)\\b)`,
 )
@@ -494,7 +496,7 @@ const MAX_SAFE_SATS = BigInt(Number.MAX_SAFE_INTEGER)
 
 /** Reject an untrusted settlement reply before it can cause an EVM or BSV action. */
 function validateResponderQuote(quote: BridgeQuote): void {
-  const fail = (): never => { throw new Error('market maker settlement reply has missing or invalid fields; nothing was locked') }
+  const fail = (): never => { throw new Error('counterparty settlement reply has missing or invalid fields; nothing was locked') }
   if (typeof quote.responderEvmAddr !== 'string' || !isAddress(quote.responderEvmAddr) || /^0x0{40}$/i.test(quote.responderEvmAddr)) fail()
   if (typeof quote.responderBsvPubKeyHex !== 'string' || !/^(?:02|03)[0-9a-fA-F]{64}$/.test(quote.responderBsvPubKeyHex) || typeof quote.responderBsvAddress !== 'string') fail()
   try {

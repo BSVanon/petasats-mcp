@@ -298,7 +298,7 @@ export function makeBuyerEngine(deps: BuyerEngineDeps): BuyerExecutor & { recove
       const coordinator = {
         ...messageBox,
         sendIntent: async (...args: Parameters<typeof messageBox.sendIntent>) => {
-          if (deps.now() >= input.handshakeDeadlineMs) throw new Error('market maker admission expired before the swap intent was sent')
+          if (deps.now() >= input.handshakeDeadlineMs) throw new Error('counterparty admission expired before the swap intent was sent')
           return messageBox.sendIntent(...args)
         },
         recvBsvLocked: async (signal?: AbortSignal) => {

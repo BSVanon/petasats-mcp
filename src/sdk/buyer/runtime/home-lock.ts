@@ -1,4 +1,4 @@
-import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, unlinkSync } from 'fs'
+import { chmodSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, unlinkSync } from 'fs'
 import { randomBytes } from 'crypto'
 import { join } from 'path'
 
@@ -20,6 +20,15 @@ function pidIsAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Creates and secures the lock directory with exactly local-state.ts's safeMkdir guard (lstat, mkdir 0700, lstat,
+ * then an fd-open+fchmod to 0700 — skipped in favor of a plain chmod when O_DIRECTORY or O_NOFOLLOW is unavailable,
+ * e.g. on win32, where fchmod-ing a directory handle most likely fails; libuv's fchmod reopens the handle without
+ * backup semantics). The guard is duplicated here rather than imported from local-state.ts: there is no import
+ * cycle, but local-state.ts pulls in @bsv/sdk and viem, and a bare ts-node cold start of that whole graph measured
+ * over 2.5s from this file alone — past the 2000ms timeout the child-kill lock test below relies on. Keep both
+ * copies identical if either one changes.
+ */
 function lockDirectory(home: string): string {
   const path = join(home, 'kit.lock.d')
   const assertDirectory = (): void => {
@@ -31,12 +40,14 @@ function lockDirectory(home: string): string {
   }
   mkdirSync(path, { recursive: true, mode: 0o700 })
   assertDirectory()
-  const flags = constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0)
-  const fd = openSync(path, flags)
-  try {
-    if (!fstatSync(fd).isDirectory()) throw new Error(`unsafe local directory ${path}; replace it with a directory and chmod 700 ${path}`)
-    fchmodSync(fd, 0o700)
-  } finally { closeSync(fd) }
+  const fsConstants = constants as typeof constants & { O_DIRECTORY?: number; O_NOFOLLOW?: number }
+  if (fsConstants.O_DIRECTORY !== undefined && fsConstants.O_NOFOLLOW !== undefined) {
+    const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW)
+    try {
+      if (!fstatSync(fd).isDirectory()) throw new Error(`unsafe local directory ${path}; replace it with a directory and chmod 700 ${path}`)
+      fchmodSync(fd, 0o700)
+    } finally { closeSync(fd) }
+  } else chmodSync(path, 0o700)
   return path
 }
 

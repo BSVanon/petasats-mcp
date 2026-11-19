@@ -1,5 +1,5 @@
 import * as fs from 'fs'
-import { dirname } from 'path'
+import { syncNewEntry, syncRemovedEntry } from '../../bridge/atomic-record-write'
 import { secureFileText, type BuyerHome } from './local-state'
 
 export interface SpendingStop { at: number; reason?: string }
@@ -35,7 +35,7 @@ export function stopSpending(paths: BuyerHome, reason: string | undefined, at = 
   try {
     const fd = fs.openSync(paths.stopPath, 'wx', 0o600)
     try { fs.writeFileSync(fd, JSON.stringify({ at, ...(reason ? { reason } : {}) }) + '\n'); fs.fchmodSync(fd, 0o600); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
-    const dir = fs.openSync(dirname(paths.stopPath), 'r'); try { fs.fsyncSync(dir) } finally { fs.closeSync(dir) }
+    syncNewEntry(paths.stopPath)
     return { alreadyStopped: false, at, ...(reason ? { reason } : {}) }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
@@ -54,6 +54,6 @@ export function resumeSpending(paths: BuyerHome): ResumedSpending | DiscardedInv
   let invalid = false
   try { current = readSpendingStop(paths) } catch { invalid = true }
   fs.unlinkSync(paths.stopPath)
-  const dir = fs.openSync(dirname(paths.stopPath), 'r'); try { fs.fsyncSync(dir) } finally { fs.closeSync(dir) }
+  syncRemovedEntry(paths.stopPath)
   return invalid ? { invalid: true } : current!
 }

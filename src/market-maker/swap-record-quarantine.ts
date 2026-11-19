@@ -8,9 +8,9 @@
  * quarantine directory is removed. Record bytes are never deleted here.
  */
 
-import { closeSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
+import { linkSync, lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { readSettlementRecordFile } from '../bridge/atomic-record-write'
+import { readSettlementRecordFile, syncNewEntry } from '../bridge/atomic-record-write'
 
 export const SWAP_CLEAR_QUARANTINE_PREFIX = '.swap-clear-'
 export const QUARANTINED_RECORD_NAME = 'verified-record'
@@ -34,12 +34,6 @@ function rootExists(path: string): boolean {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
     throw error
   }
-}
-
-function fsyncDirectory(dir: string): void {
-  const fd = openSync(dir, 'r')
-  try { fsyncSync(fd) }
-  finally { closeSync(fd) }
 }
 
 /** Read the quarantined record's swap id with the bounded, no-follow record reader. */
@@ -93,7 +87,7 @@ export function adoptQuarantinedSwapRecords(dir: string, log: (message: string) 
       }
       linkSync(held, root) // EEXIST if a writer recreated the root meanwhile: kept below, both generations retained
       unlinkSync(held)
-      fsyncDirectory(dir)
+      syncNewEntry(root)
       rmdirSync(quarantine)
       scan.adopted.push(root)
       log(`⚠️ swap-record quarantine ADOPTED: restored ${root} from ${quarantine}`)

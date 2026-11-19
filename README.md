@@ -17,31 +17,31 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.20`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
+Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.21`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
 
 ```sh
-claude mcp add petasats -- npx -y petasats-mcp@0.2.20
+claude mcp add petasats -- npx -y petasats-mcp@0.2.21
 ```
 
 Claude Desktop (`claude_desktop_config.json`), Cursor (`~/.cursor/mcp.json`):
 
 ```json
-{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.20"]}}}
+{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.21"]}}}
 ```
 
 VS Code (`.vscode/mcp.json`):
 
 ```json
-{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.20"]}}}
+{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.21"]}}}
 ```
 
 Codex (CLI, IDE extension, or app):
 
 ```sh
-codex mcp add petasats -- npx -y petasats-mcp@0.2.20
+codex mcp add petasats -- npx -y petasats-mcp@0.2.21
 ```
 
-Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.20`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
+Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.21`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
 
 ## Fund the kit
 
@@ -78,9 +78,9 @@ You can create `~/.petasats/limits.json` to restrict where an AI may send funds 
 }
 ```
 
-Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.20 limits` to inspect it.
+Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.21 limits` to inspect it.
 
-`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.20 resume`; recovery for swaps already started keeps working.
+`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.21 resume`; recovery for swaps already started keeps working.
 
 `allowFastSettlement: false` forbids fast settlement for new swaps. If the field is missing, an explicitly requested fast swap is permitted to negotiate it; standard remains the default.
 
@@ -110,9 +110,9 @@ The npm package is built by GitHub Actions from a tagged commit and published wi
 
 ## Files, status, and recovery
 
-The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.20 status` for status and `npx petasats-mcp@0.2.20 recover` after interruption.
+The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.21 status` for status and `npx petasats-mcp@0.2.21 recover` after interruption.
 
-A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.20 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.20 withdrawal <hash> sent` or `npx petasats-mcp@0.2.20 withdrawal <hash> not-sent`.
+A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.21 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.21 withdrawal <hash> sent` or `npx petasats-mcp@0.2.21 withdrawal <hash> not-sent`.
 
 Repeating the same Base withdrawal (same asset, amount, and address) within an hour is refused as a likely retry. Do not run two AI apps using the kit on the same folder at the same time.
 
@@ -124,7 +124,7 @@ A swap started with version 0.2.0 or 0.2.1 whose USDC lock never landed can stay
 
 ## Release notes
 
-0.2.20:
+0.2.21:
 
 - The kit no longer shows "claiming" after your BSV has arrived when BSV block headers lag behind.
 - Before delivering to your address, the kit checks every payout it relays: the transaction and its proof agree, it spends only the claim, and the amount, address and fee are right.

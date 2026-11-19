@@ -6,8 +6,9 @@ import { join } from 'node:path'
 import type { SettlementRecord } from '../../src/bridge/settlement-session'
 import { resolveCooperativeRefund } from '../../src/sdk/buyer/cooperative-refund'
 import { buyerStageForSettlement, makeBuyerEngine } from '../../src/sdk/buyer/engine'
+import { createBuyerKit } from '../../src/sdk/buyer/buyer-kit'
 import { buyerStatusView } from '../../src/sdk/buyer/status-view'
-import { COOPERATIVE_REFUND_REASON, type BuyerSwapRecord } from '../../src/sdk/buyer/types'
+import { COOPERATIVE_REFUND_REASON, LEGACY_COOPERATIVE_REFUND_REASON, isCooperativeRefundReason, type BuyerSwapRecord } from '../../src/sdk/buyer/types'
 import { makeFileSwapRecordStore } from '../../src/market-maker/swap-record-store'
 
 const HASH = 'a'.repeat(64)
@@ -106,7 +107,7 @@ describe('buyer cooperative refund recovery', () => {
     expect(current.state).eq('base-locked')
   })
 
-  it("maps the finalized Refund through buyer recovery, unblocks the kit, and names the counterparty’s decline", async () => {
+  it('maps the finalized Refund through buyer recovery, unblocks the kit, and names the counterparty’s decline', async () => {
     const settlementDir = mkdtempSync(join(tmpdir(), 'petasats-buyer-coop-refund-'))
     const settlements = makeFileSwapRecordStore(settlementDir, { censusGroupRead: false })
     settlements.write(record())
@@ -123,7 +124,30 @@ describe('buyer cooperative refund recovery', () => {
     const outcome = (await engine.recoverAll([buyer])).get(buyer.swapId)
     expect(outcome).to.include({ stage: 'refunded', settlementState: 'refunded', baseRefundTxid: REFUND_TXID })
     expect(settlements.list().records[0]).to.include({ state: 'refunded', refundTxid: REFUND_TXID })
-    const view = buyerStatusView({ ...buyer, ...outcome, stage: 'refunded', settlementState: 'refunded', reason: COOPERATIVE_REFUND_REASON })
-    expect(view).to.include({ done: true, stage_label: "The counterparty declined; USDC came back" })
+    for (const reason of [COOPERATIVE_REFUND_REASON, LEGACY_COOPERATIVE_REFUND_REASON]) {
+      const view = buyerStatusView({ ...buyer, ...outcome, stage: 'refunded', settlementState: 'refunded', reason })
+      expect(view).to.include({ done: true, stage: 'refunded', stage_label: 'The counterparty declined; USDC came back', reason: COOPERATIVE_REFUND_REASON })
+    }
+  })
+
+  it('accepts both persisted cooperative-refund texts without rewriting the record', () => {
+    expect(isCooperativeRefundReason(COOPERATIVE_REFUND_REASON)).eq(true)
+    expect(isCooperativeRefundReason(LEGACY_COOPERATIVE_REFUND_REASON)).eq(true)
+    expect(isCooperativeRefundReason('other refund reason')).eq(false)
+  })
+
+  it('classifies both cooperative-refund texts as refunded when the buyer lifecycle catches them', async () => {
+    for (const reason of [COOPERATIVE_REFUND_REASON, LEGACY_COOPERATIVE_REFUND_REASON]) {
+      const rows = new Map<string, BuyerSwapRecord>()
+      const kit = createBuyerKit({ now: () => 1_000 }, {
+        store: { list: async () => [...rows.values()], get: async (id) => rows.get(id), put: async (row) => { rows.set(row.swapId, structuredClone(row)) } },
+        door: { quote: async (amount) => ({ quoteId: 'q'.repeat(16), bsvSats: 10_000, usdcBaseUnits: amount.toString(), expiresAtMs: 10_000 }), admit: async () => ({ swapNamespace: 'n'.repeat(32), handshakeDeadlineMs: 10_000 }) },
+        executor: { execute: async () => { throw new Error(reason) } },
+        wallet: { baseAddress: `0x${'1'.repeat(40)}`, bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', balances: async () => ({ usdc: 1_000_000n, eth: 1n, claimedBsvSats: 0n }) },
+      })
+      const started = await kit.startSwap({ amountIn: 1_000_000n, minBsvOut: 1n })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect((await kit.status(started.swapId))[0]).to.include({ stage: 'refunded', settlementState: 'refunded', reason })
+    }
   })
 })

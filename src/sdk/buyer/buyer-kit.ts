@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto'
 import { isAddress } from 'viem'
 import { isBsv, isErc20, type ConvertRequest, type Quote, type SwapResult } from '../convert'
-import { COOPERATIVE_REFUND_REASON, type BuyerBaseWallet, type BuyerKit, type BuyerKitConfig, type BuyerQuote, type BuyerSwapRecord, type BuyerSwapStage, type BuyerStore, type BuyerWallet, type DoorClient, type BuyerExecutor, type StartSwapRequest, type BuyerWithdrawalCancelResult, type BuyerWithdrawalIntents, type BuyerWithdrawalReconcileOutcome } from './types'
+import { COOPERATIVE_REFUND_REASON, isCooperativeRefundReason, type BuyerBaseWallet, type BuyerKit, type BuyerKitConfig, type BuyerQuote, type BuyerSwapRecord, type BuyerSwapStage, type BuyerStore, type BuyerWallet, type DoorClient, type BuyerExecutor, type StartSwapRequest, type BuyerWithdrawalCancelResult, type BuyerWithdrawalIntents, type BuyerWithdrawalReconcileOutcome } from './types'
 import { isBaseInsufficientFunds } from './withdrawal-intent'
 import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
@@ -31,7 +31,7 @@ function asUsd(amount: bigint): number {
 function nextEvent(stage: BuyerSwapStage | string): string {
   if (!knownStage(stage)) return 'An older or unknown record needs recovery before funds can move.'
   const words: Record<BuyerSwapStage, string> = {
-    quoted: 'Waiting for the market maker to admit the bound quote.', admitted: 'Sending the atomic-swap intent.', usdc_locked: 'Waiting for the BSV lock.',
+    quoted: 'Waiting for the counterparty to admit the bound quote.', admitted: 'Sending the atomic-swap intent.', usdc_locked: 'Waiting for the BSV lock.',
     waiting_bsv_lock: 'Waiting for the BSV lock.', bsv_lock_confirming: 'Waiting for an independently verified BSV confirmation.',
     claiming: 'Claiming BSV; recovery will keep this claim alive.', claimed: 'Waiting for the BSV claim to bury.', settled: 'BSV is in the local kit wallet.',
     sweeping: 'Sweeping confirmed BSV to the requested address.', delivered: 'BSV was delivered.', refund_waiting: 'Waiting for the Base timelock before refunding USDC.', refunded: 'USDC was refunded.', failed: 'No money-moving step was accepted.', needs_attention: 'Recovery needs attention; settlement evidence could not be read.',
@@ -152,8 +152,8 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     if (amountIn > BigInt(Math.floor(capUsdPerSwap * 1e6))) throw new Error(`amount exceeds this kit’s $${capUsdPerSwap} per-swap cap`)
     const reply = await callDoorWithRetry(() => deps.door.quote(amountIn, requestId(), forceLegacy), { ...retry, stage: 'quote' })
     const units = BigInt(reply.usdcBaseUnits)
-    if (units !== amountIn) throw new Error('market maker quote does not bind the exact USDC atomic amount requested')
-    if (!Number.isSafeInteger(reply.bsvSats) || reply.bsvSats < 1 || reply.expiresAtMs <= now()) throw new Error('market maker returned an invalid or expired quote')
+    if (units !== amountIn) throw new Error('counterparty quote does not bind the exact USDC atomic amount requested')
+    if (!Number.isSafeInteger(reply.bsvSats) || reply.bsvSats < 1 || reply.expiresAtMs <= now()) throw new Error('counterparty returned an invalid or expired quote')
     const fastCap = BigInt(reply.fastCapUsdcBaseUnits ?? '0')
     const value = { from: 'USDC' as const, to: 'BSV' as const, route: 'bridge' as const, amountIn, amountOut: BigInt(reply.bsvSats), expiry: Math.floor(reply.expiresAtMs / 1000), quoteId: reply.quoteId, doorQuoteId: reply.quoteId, usdcBaseUnits: units, bsvSats: BigInt(reply.bsvSats), midUsdPerBsv: reply.midUsdPerBsv, claimFeeBudgetSats: buyerClaimFeeBudgetSats(), doorProtocolVersion: reply.doorProtocolVersion ?? 1, fastOffered: reply.fastOffered ?? false, fastCapUsdcBaseUnits: fastCap }
     issuedQuotes.set(value.quoteId, value)
@@ -209,7 +209,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         if (!settlementAttached && !record.settlementHashHex) reason = fastNegotiationFailureReason(record, reason)
         // The engine only emits this after the reverted receipt's exact tuple has been proven absent and its pre-lock
         // checkpoint cleared.  It is the one exception to the normal "a checkpoint means refund" rule.
-        await write(record, reason === COOPERATIVE_REFUND_REASON ? 'refunded' : reason.startsWith('RECOVERY NEEDS ATTENTION:') ? 'needs_attention' : reason === 'the USDC lock reverted; nothing was locked' ? 'failed' : record.settlementState === 'revealed' ? 'claiming' : settlementAttached || record.settlementHashHex ? 'refund_waiting' : 'failed', { ...(reason === COOPERATIVE_REFUND_REASON ? { settlementState: 'refunded' as const } : {}), reason, settlementModeUsed: record.settlementState === 'revealed' ? record.settlementModeUsed ?? (record.agreedSettlementMode === 'fast' ? 'fast' : 'confirmed') : record.settlementModeUsed === 'fast' || record.settlementModeUsed === 'confirmed' ? record.settlementModeUsed : 'not_revealed' })
+        await write(record, isCooperativeRefundReason(reason) ? 'refunded' : reason.startsWith('RECOVERY NEEDS ATTENTION:') ? 'needs_attention' : reason === 'the USDC lock reverted; nothing was locked' ? 'failed' : record.settlementState === 'revealed' ? 'claiming' : settlementAttached || record.settlementHashHex ? 'refund_waiting' : 'failed', { ...(isCooperativeRefundReason(reason) ? { settlementState: 'refunded' as const } : {}), reason, settlementModeUsed: record.settlementState === 'revealed' ? record.settlementModeUsed ?? (record.agreedSettlementMode === 'fast' ? 'fast' : 'confirmed') : record.settlementModeUsed === 'fast' || record.settlementModeUsed === 'confirmed' ? record.settlementModeUsed : 'not_revealed' })
       } catch (writeError) {
         log(`could not persist swap failure for ${record.swapId}; settlement recovery remains armed: ${writeError instanceof Error ? writeError.message : String(writeError)}`)
       }
@@ -254,11 +254,11 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
 
   return {
     quote: async (request): Promise<Quote> => {
-      if (!isErc20(request.from) || request.from !== 'USDC' || !isBsv(request.to)) throw new Error('not available: only USDC → BSV through the market maker door')
+      if (!isErc20(request.from) || request.from !== 'USDC' || !isBsv(request.to)) throw new Error('not available: only USDC → BSV through the counterparty door')
       return quote(request.amountIn)
     },
     convert: async (request: ConvertRequest): Promise<SwapResult> => {
-      if (request.from !== 'USDC' || request.to !== 'BSV') throw new Error('not available: only USDC → BSV through the market maker door')
+      if (request.from !== 'USDC' || request.to !== 'BSV') throw new Error('not available: only USDC → BSV through the counterparty door')
       if (!request.quote) throw new Error('convert needs a quote from quote(); nothing was locked')
       const started = await startSwap({ amountIn: request.amountIn, deliverTo: request.deliverTo || undefined, quote: request.quote as BuyerQuote | undefined })
       return { ok: true, route: 'bridge', status: 'pending', txids: { swapId: started.swapId } }
