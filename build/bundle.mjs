@@ -9,7 +9,7 @@ let commit = process.env.GITHUB_SHA || 'unknown'; if (commit === 'unknown') try 
 await mkdir(new URL('../dist/', import.meta.url), { recursive: true })
 const output = fileURLToPath(new URL('../dist/petasats-mcp.mjs', import.meta.url))
 const meta = fileURLToPath(new URL('../build/meta.json', import.meta.url))
-const result = await esbuild.build({ entryPoints: ['mcp/src/index.ts'], bundle: true, platform: 'node', target: 'node22', format: 'esm', alias: { 'petasats/sdk': './src/sdk/buyer-sdk.ts' }, define: { __PETASATS_DOOR_IDENTITY__: JSON.stringify(identity) }, banner: { js: '#!/usr/bin/env node\n/* petasats-mcp ' + version + '; commit ' + commit + '; Open BSV License v4 */' }, outfile: output, metafile: true })
+const result = await esbuild.build({ entryPoints: ['mcp/src/index.ts'], bundle: true, platform: 'node', target: 'node22', format: 'esm', alias: { 'petasats/sdk': './src/sdk/buyer-sdk.ts' }, define: { __PETASATS_DOOR_IDENTITY__: JSON.stringify(identity) }, banner: { js: '#!/usr/bin/env node\n/* petasats-mcp ' + version + '; commit ' + commit + '; MIT License */' }, outfile: output, metafile: true })
 await writeFile(meta, JSON.stringify(result.metafile, null, 2) + '\n')
 const packageRoot = (input) => { const parts = input.replaceAll('\\', '/').split('/'); const at = parts.lastIndexOf('node_modules'); return at < 0 ? undefined : parts.slice(0, at + (parts[at + 1]?.startsWith('@') ? 3 : 2)).join('/') }
 const versions = []; for (const root of new Set(Object.keys(result.metafile.inputs).map(packageRoot).filter(Boolean))) { const manifest = JSON.parse(await readFile(join(process.cwd(), root, 'package.json'), 'utf8')); versions.push(manifest.name + '@' + manifest.version) }

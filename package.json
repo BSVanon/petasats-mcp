@@ -1,12 +1,12 @@
 {
   "name": "petasats-mcp",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "overrides": {
     "@bsv/sdk": "2.1.0",
     "@bsv/wallet-toolbox-client": "2.1.21"
   },
   "description": "Buy BSV with USDC on Base from your AI app. A local MCP server: keys stay on your machine; settlement is a cross-chain atomic swap.",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "petasats-mcp": "dist/petasats-mcp.mjs"

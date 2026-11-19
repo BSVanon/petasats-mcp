@@ -1,7 +1,7 @@
 /** Local, non-custodial USDC on Base to BSV buyer-kit adapter. */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
   assertBuyerMainnetP2pkhAddress, buyerStatusView,
   BUYER_BASE_CLAIM_BUDGET_HOURS, BUYER_BASE_REFUND_HOURS,
@@ -9,6 +9,7 @@ import {
 } from 'petasats/sdk'
 import { requireString, optionalString, optionalObject, requireAmount, success, toolError, toolErrorData, ToolInputError } from './validate.js'
 import { parseAsset, formatAsset, supportedPairs } from './assets.js'
+import { addHostedQuoteOnlyNote, HOSTED_ALLOWED_TOOLS, hostedToolRefusal, isHostedCopy } from './hosted.js'
 import { VERSION } from './version.js'
 
 const MAX_BSV_SATS = 2_100_000_000_000_000n
@@ -358,6 +359,7 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
 
 export interface PetaSatsMcpDeps {
   petasats: BuyerKit
+  hosted?: boolean
   doorIdentity?: string
   name?: string
   version?: string
@@ -365,7 +367,7 @@ export interface PetaSatsMcpDeps {
 
 /** Build the MCP Server exposing the PetaSats convert() capability over an injected SDK instance. */
 export function createPetaSatsMcpServer(deps: PetaSatsMcpDeps): Server {
-  const { petasats } = deps
+  const { petasats, hosted = isHostedCopy() } = deps
   const server = new Server(
     { name: deps.name ?? 'petasats-mcp', version: deps.version ?? VERSION },
     { capabilities: { tools: {}, resources: {} }, instructions: INSTRUCTIONS },
@@ -374,15 +376,19 @@ export function createPetaSatsMcpServer(deps: PetaSatsMcpDeps): Server {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (hosted && !HOSTED_ALLOWED_TOOLS.has(request.params.name)) return hostedToolRefusal()
     const token = request.params._meta?.progressToken
     const progress = token === undefined ? undefined : (step: number | null, total: number, message: string) =>
       server.notification({ method: 'notifications/progress', params: { progressToken: token, progress: step ?? 0, total, message } })
-    return handleToolCall(petasats, request.params.name, request.params.arguments as Record<string, unknown> | undefined, { doorIdentity: deps.doorIdentity, signal: extra.signal, progress })
+    const result = await handleToolCall(petasats, request.params.name, request.params.arguments as Record<string, unknown> | undefined, { doorIdentity: deps.doorIdentity, signal: extra.signal, progress })
+    return hosted ? addHostedQuoteOnlyNote(result) : result
   })
 
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: [{ uri: 'petasats://about', name: 'About PetaSats', description: 'The non-custodial model + supported pair', mimeType: 'text/markdown' }, { uri: 'petasats://instructions', name: 'Instructions', description: 'Buyer kit operating instructions', mimeType: 'text/plain' }],
   }))
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }))
 
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     if (request.params.uri === 'petasats://about') {
