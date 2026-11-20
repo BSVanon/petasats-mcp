@@ -1,6 +1,6 @@
 {
   "name": "petasats-mcp",
-  "version": "0.2.22",
+  "version": "0.2.23",
   "overrides": {
     "@bsv/sdk": "2.1.0",
     "@bsv/wallet-toolbox-client": "2.1.21"
@@ -60,6 +60,8 @@
     "test": "node --import tsx --test mcp/tests/*.test.ts && node --import tsx build/test.mjs",
     "build": "node build/bundle.mjs",
     "smoke": "node dist/petasats-mcp.mjs --smoke",
-    "verify": "node build/verify-package.mjs"
+    "verify": "node build/verify-package.mjs",
+    "mcpb": "node build/mcpb.mjs",
+    "verify:mcpb": "node build/verify-mcpb.mjs"
   }
 }

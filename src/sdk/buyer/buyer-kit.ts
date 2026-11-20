@@ -1,14 +1,16 @@
 import { randomBytes } from 'crypto'
-import { isAddress } from 'viem'
 import { isBsv, isErc20, type ConvertRequest, type Quote, type SwapResult } from '../convert'
-import { COOPERATIVE_REFUND_REASON, isCooperativeRefundReason, type BuyerBaseWallet, type BuyerKit, type BuyerKitConfig, type BuyerQuote, type BuyerSwapRecord, type BuyerSwapStage, type BuyerStore, type BuyerWallet, type DoorClient, type BuyerExecutor, type StartSwapRequest, type BuyerWithdrawalCancelResult, type BuyerWithdrawalIntents, type BuyerWithdrawalReconcileOutcome } from './types'
+import { COOPERATIVE_REFUND_REASON, isCooperativeRefundReason, type BuyerBaseWallet, type BuyerKit, type BuyerKitConfig, type BuyerQuote, type BuyerSwapRecord, type BuyerSwapStage, type BuyerStore, type BuyerWallet, type DoorClient, type BuyerExecutor, type StartSwapRequest, type BuyerWithdrawalCancelResult, type BuyerWithdrawalIntents, type BuyerWithdrawalReconcileOutcome, type BuyerGasTopUp } from './types'
 import { isBaseInsufficientFunds } from './withdrawal-intent'
 import { buyerClaimFeeBudgetSats, buyerStageForSettlement } from './engine'
 import { assertBuyerMainnetP2pkhAddress } from './runtime/address'
-import { assertBaseDestination, assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
+import { assertBsvDestination, assertDailySwapCap, type BuyerLimits } from './limits'
+import { assertBaseWithdrawDestination, assertBsvWithdrawDestination } from './withdraw-destination'
 import { makeBuyerDelivery } from './delivery'
 import { createInitialSettlementRecord, executeNegotiatedSettlement, makeSettlementAttachment, negotiateSettlementMode, requestedSettlementSpeed } from './settlement-mode'
 import { callDoorWithRetry, waitForDoorRetry, type DoorRetryOptions } from './door-retry'
+import { BUY_GAS_HINT } from './gas-topup-state'
+import { assertBuyGasMayStart } from './gas-topup-guard'
 const HARD_CAP_USD = 1000
 const DEFAULT_CAP_USD = 100
 const active = new Set<BuyerSwapStage>(['quoted', 'admitted', 'usdc_locked', 'waiting_bsv_lock', 'bsv_lock_confirming', 'claiming', 'sweeping', 'refund_waiting', 'needs_attention'])
@@ -49,7 +51,7 @@ function fastNegotiationFailureReason(record: BuyerSwapRecord, reason: string): 
  * Stateful USDC→BSV buyer façade.  It owns no transport and no RPC: those are injected by the local runtime, which
  * makes the same lifecycle safe to test on in-memory chains and to resume after process restart.
  */
-export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient; executor: BuyerExecutor; store: BuyerStore; wallet: BuyerWallet & BuyerBaseWallet; /** Checked immediately before the first door call for every new swap. */ beforeNewSwap?: () => void | Promise<void>; limits?: () => BuyerLimits | undefined; spendingStopped?: () => { at: number; reason?: string } | undefined; withdrawalIntents?: BuyerWithdrawalIntents; stopSpending?: (reason?: string) => { alreadyStopped: boolean; at?: number; reason?: string }; retryWait?: DoorRetryOptions['wait']; retrySignal?: AbortSignal; log?: (message: string) => void }): BuyerKit {
+export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient; executor: BuyerExecutor; store: BuyerStore; wallet: BuyerWallet & BuyerBaseWallet; /** Checked immediately before the first door call for every new swap. */ beforeNewSwap?: () => void | Promise<void>; limits?: () => BuyerLimits | undefined; spendingStopped?: () => { at: number; reason?: string } | undefined; withdrawalIntents?: BuyerWithdrawalIntents; stopSpending?: (reason?: string) => { alreadyStopped: boolean; at?: number; reason?: string }; retryWait?: DoorRetryOptions['wait']; retrySignal?: AbortSignal; log?: (message: string) => void; gasTopUp?: BuyerGasTopUp }): BuyerKit {
   const capUsdPerSwap = config.capUsdPerSwap ?? DEFAULT_CAP_USD
   if (!Number.isFinite(capUsdPerSwap) || capUsdPerSwap <= 0 || capUsdPerSwap > HARD_CAP_USD) throw new Error(`capUsdPerSwap must be > 0 and ≤ ${HARD_CAP_USD}`)
   const maxActive = config.maxActiveSwaps ?? 1
@@ -76,6 +78,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
     if (deps.spendingStopped?.()) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`')
   }
   const limits = (): BuyerLimits | undefined => deps.limits?.()
+  const destinationRules = { kitBaseAddress: deps.wallet.baseAddress, forbiddenBase: config.baseWithdrawalForbidden ?? [] }
   const prepareNewBaseSpend = async (): Promise<{ snapshot: BuyerLimits | undefined; reconciled?: BuyerWithdrawalReconcileOutcome }> => {
     assertNotStopped()
     const snapshot = limits() // Read once and fail closed before any balance, door, or chain I/O.
@@ -230,9 +233,10 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       if (existing.length >= maxActive) throw new Error(`a swap is already active (${existing[0].swapId}: ${nextEvent(existing[0].stage)})`)
       // Do all locally decidable checks before touching the door. ETH need only be non-zero here: exact gas is priced by
       // the signed lock path, but a zero balance can never submit an approval/lock transaction.
+      await deps.gasTopUp?.assertNoOpenOrder('swap')
       const balances = await deps.wallet.balances()
       if (balances.usdc < input.amountIn) throw new Error('insufficient USDC balance for this swap')
-      if (balances.eth < 1n) throw new Error('insufficient ETH balance for Base gas')
+      if (balances.eth < 1n) throw new Error(`insufficient ETH balance for Base gas; ${BUY_GAS_HINT}`)
       await deps.beforeNewSwap?.()
       const retained = input.quote ? issuedQuotes.get(input.quote.quoteId) : undefined
       if (input.quote && retained && Object.keys(input.quote).some((key) => (input.quote as any)[key] !== (retained as any)[key])) throw new Error('the quote was changed; pass quote_id')
@@ -308,30 +312,27 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       await delivery.recover({ deferNewEarlyBroadcast: all !== undefined })
       return deps.store.list()
     },
-    withdrawBsv: async (address) => serializeMoney(async () => {
-      assertNotStopped()
-      const activeLimits = limits()
-      assertAddress(address)
-      assertBsvDestination(activeLimits, address)
+    withdrawBsv: async (address, opts) => serializeMoney(async () => {
+      assertNotStopped(); assertBsvWithdrawDestination(limits(), address)
       const blocked = (await deps.store.list()).find((r) => !knownStage(r.stage) || active.has(r.stage) || (!!r.deliverTo && ['claimed', 'settled', 'sweeping'].includes(r.stage)) || (!!r.sweepOutbox && r.stage !== 'delivered'))
       if (blocked) throw new Error(`a swap blocks withdrawals (${blocked.swapId}: ${nextEvent(blocked.stage)})`)
       if (!deps.wallet.withdrawBsv) throw new Error('BSV sweeping is not configured')
       // STOP can arrive while the above reads are in flight.
       assertNotStopped()
-      return deps.wallet.withdrawBsv(address, { beforeBroadcast: assertNotStopped })
+      return deps.wallet.withdrawBsv(address, { beforeBroadcast: async (sweep) => { assertNotStopped(); await opts?.beforeBroadcast?.(sweep) } })
     }),
     withdrawBase: async ({ asset, to, amount }) => serializeMoney(async () => {
+      // The destination rules run before anything else, so a malformed or forbidden `to` never reaches reconciliation.
+      assertBaseWithdrawDestination(destinationRules, limits(), to)
       const { snapshot: activeLimits, reconciled } = await prepareNewBaseSpend()
       // Reconciliation belongs to the prior withdrawal. Never make its caller
       // look like it initiated a new transfer just because its receipt arrived.
       if (reconciled) throw new Error(priorWithdrawalMessage(reconciled))
-      if (!isAddress(to, { strict: true }) || /^0x0{40}$/i.test(to)) throw new Error('to must be a non-zero checksummed Base address')
-      assertBaseDestination(activeLimits, to)
-      if (to.toLowerCase() === deps.wallet.baseAddress.toLowerCase()) throw new Error('cannot withdraw to the kit address')
-      if ((config.baseWithdrawalForbidden ?? []).some((address) => address.toLowerCase() === to.toLowerCase())) throw new Error('cannot withdraw to a swap or token contract')
+      assertBaseWithdrawDestination(destinationRules, activeLimits, to)
       const blocked = (await deps.store.list()).find((r) => !knownStage(r.stage) || active.has(r.stage) || (!!r.deliverTo && ['claimed', 'settled', 'sweeping'].includes(r.stage)))
       if (blocked) throw new Error(`a swap blocks withdrawals (${blocked.swapId}: ${nextEvent(blocked.stage)})`)
       if (!/^(?:all|[1-9]\d*)$/.test(amount)) throw new Error('amount must be a positive atomic decimal string or all')
+      if (asset === 'USDC') await deps.gasTopUp?.assertNoOpenOrder('withdraw') // never race an open gas order for the USDC
       const balances = await deps.wallet.balances(); let value: bigint
       if (asset === 'USDC') {
         value = amount === 'all' ? balances.usdc : BigInt(amount)
@@ -365,7 +366,7 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         if (!deps.wallet.priceEthTransfer) throw new Error('Base ETH gas pricing is not configured')
         plan = await deps.wallet.priceEthTransfer(to as `0x${string}`)
         value = balances.eth - plan.reserveWei
-        if (value < 1n) throw new Error('the ETH balance does not cover the Base gas for a withdrawal; nothing was sent')
+        if (value < 1n) throw Object.assign(new Error('the ETH balance does not cover the Base gas for a withdrawal; nothing was sent'), { gasDustBalanceWei: balances.eth })
       } else value = BigInt(amount)
       if (value < 1n || value > balances.eth) throw new Error('amount exceeds ETH balance')
       if (!deps.wallet.transferEth) throw new Error('Base ETH withdrawals are not configured')
@@ -397,8 +398,10 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
       let limitsView: unknown = 'none'; try { const current = limits(); limitsView = current ?? 'none' } catch (error) { limitsView = `invalid: ${error instanceof Error ? error.message.replace(/^refused by your limits file: /, '').replace(/; fix limits\.json at the terminal; nothing was sent$/, '') : String(error)}` }
       let stopped: { at: number; reason?: string } | undefined
       try { stopped = deps.spendingStopped?.() } catch { stopped = { at: 0, reason: 'invalid STOP record; fix STOP at the terminal' } }
-      return { ...await deps.wallet.balances(), baseAddress: deps.wallet.baseAddress, bsvAddress: deps.wallet.bsvAddress, capUsdPerSwap, spending_stopped: !!stopped, ...(stopped ? { stopped_at: stopped.at, ...(stopped.reason ? { stop_reason: stopped.reason } : {}) } : {}), limits: limitsView,
-        ...(isNew ? { new_wallet: true, backup_note: `Back up ${config.keysPath ?? 'keys.json'}: it is the only copy of this kit's keys.` } : {}) }
+      const { unconfirmedBsvSats, ...balances } = await deps.wallet.balances(); if (typeof unconfirmedBsvSats !== 'bigint') throw new Error('unconfirmed BSV reporting is not configured')
+      const gasTopUp = deps.gasTopUp?.view()
+      return { ...balances, unconfirmedBsvSats, baseAddress: deps.wallet.baseAddress, bsvAddress: deps.wallet.bsvAddress, capUsdPerSwap, spending_stopped: !!stopped, ...(stopped ? { stopped_at: stopped.at, ...(stopped.reason ? { stop_reason: stopped.reason } : {}) } : {}), limits: limitsView,
+        ...(isNew ? { new_wallet: true, backup_note: `Back up ${config.keysPath ?? 'keys.json'}: it is the only copy of this kit's keys.` } : {}), ...(gasTopUp ? { gas_topup: gasTopUp } : {}) }
     },
     assertCanPlanSwap: async (address, amountIn) => {
       assertNotStopped()
@@ -409,9 +412,14 @@ export function createBuyerKit(config: BuyerKitConfig, deps: { door: DoorClient;
         assertDailySwapCap(activeLimits, records, amountIn, now())
       }
     },
+    // The same rules withdrawBase and withdrawBsv run above, both on every call; close_kit checks a pair with it before pinning it.
+    assertWithdrawDestinations: async (to) => { const activeLimits = limits(); assertBaseWithdrawDestination(destinationRules, activeLimits, to?.base); assertBsvWithdrawDestination(activeLimits, to?.bsv) },
     stopSpending: async (reason) => {
       if (!deps.stopSpending) throw new Error('spending stop is not configured')
       return deps.stopSpending(reason)
     },
+    reconcileWithdrawals: async () => serializeMoney(async () => { assertNotStopped(); return deps.withdrawalIntents?.reconcile() }),
+    buyGas: async () => serializeMoney(async () => { assertNotStopped(); if (!deps.gasTopUp) throw new Error('buy_gas is not configured in this kit'); return deps.gasTopUp.buy({ beforeNewOrder: () => assertBuyGasMayStart(deps), beforeSave: assertNotStopped }) }),
+    assertNoOpenGasOrder: async () => serializeMoney(async () => deps.gasTopUp?.assertNoOpenOrder('withdraw')),
   }
 }

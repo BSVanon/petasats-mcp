@@ -142,12 +142,19 @@ export interface BuyerStore {
   update?(swapId: string, derive: (current: BuyerSwapRecord | undefined) => BuyerSwapRecord): Promise<BuyerSwapRecord>
 }
 
+/** A signed BSV sweep, given to beforeBroadcast before it is broadcast: its txid, output sats and inputs ("txid.vout"). */
+export interface BuyerSweepPlan { txid: string; sats: bigint; inputs: string[] }
+
 export interface BuyerWallet {
   baseAddress: string
   bsvAddress: string
-  balances(): Promise<{ usdc: bigint; eth: bigint; claimedBsvSats: bigint }>
+  /**
+   * claimedBsvSats counts coins with at least one confirmation; unconfirmedBsvSats, from the same coin read, the rest.
+   * Optional here because the browser buyer's wallet does not report it; the kit's walletInfo refuses without it.
+   */
+  balances(): Promise<{ usdc: bigint; eth: bigint; claimedBsvSats: bigint; unconfirmedBsvSats?: bigint }>
   /** Optional sweep hook; implementation must reject dust before broadcast. */
-  withdrawBsv?(address: string, opts?: { onlyTxid?: string; beforeBroadcast?: () => void | Promise<void> }): Promise<{ txid?: string; sats: bigint; reason?: string }>
+  withdrawBsv?(address: string, opts?: { onlyTxid?: string; beforeBroadcast?: (sweep: BuyerSweepPlan) => void | Promise<void> }): Promise<{ txid?: string; sats: bigint; reason?: string }>
   buildSweep?(address: string, opts: { onlyTxid: string }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
   /** Build a child of a persisted, unconfirmed covenant claim without consulting the UTXO indexer. */
   buildEarlySweep?(address: string, opts: { claim: Transaction; claimTxid: string; settlementModeUsed: SettlementMode }): Promise<{ rawTx: string; atomicBeefHex?: string; txid: string; sats: bigint }>
@@ -218,15 +225,43 @@ export interface StartSwapRequest {
   speed?: SettlementSpeed
 }
 
+/** One buy_gas step. Field names are the MCP tool's wire names; amounts are display strings. */
+export type GasTopUpStep =
+  | { state: 'refused'; reason: string }
+  | { state: 'pending'; uid: string; order_url: string; sold: string; min_eth: string; call_again_after_seconds: number; note: string }
+  | { state: 'filled'; uid: string; order_url: string; sold: string; min_eth: string; eth_received?: string; note?: string }
+  | { state: 'expired' | 'rejected'; uid: string; order_url: string; sold: string; min_eth: string; reason: string; note?: string }
+export interface BuyerGasTopUp {
+  /**
+   * One buy_gas step. The kit calls it inside its money lock, after the STOP check. beforeNewOrder runs only when no
+   * earlier order can still fill, before the new order's first chain read; beforeSave runs right before a newly signed
+   * order is saved. A throw from either is the step's refusal; after a throw from beforeSave nothing is saved or posted.
+   */
+  buy(opts?: { beforeNewOrder?: () => Promise<void>; beforeSave?: () => void | Promise<void> }): Promise<GasTopUpStep>
+  /** Throws while a gas order may still spend the USDC, and when the gas record cannot be read. */
+  assertNoOpenOrder(purpose: 'withdraw' | 'swap'): Promise<void>
+  /** The record's last stored status for wallet_info, and whether it still blocks (open); never touches the network. */
+  view(): { status: string; uid?: string; open?: boolean } | undefined
+}
+
 export interface BuyerKit extends PetaSats {
   startSwap(request: StartSwapRequest): Promise<{ swapId: string; stage: BuyerSwapStage; expectedMinutes: number; requestedSpeed: SettlementSpeed; agreedSettlementMode: AgreedSettlementMode; settlementModeUsed: SettlementModeUsed }>
   status(swapId?: string): Promise<BuyerSwapRecord[]>
   recover(): Promise<BuyerSwapRecord[]>
-  withdrawBsv(address: string): Promise<{ txid?: string; sats: bigint; reason?: string }>
+  /** beforeBroadcast runs after the sweep is built and signed, and before it is broadcast; a throw there sends nothing. */
+  withdrawBsv(address: string, opts?: { beforeBroadcast?: (sweep: BuyerSweepPlan) => void | Promise<void> }): Promise<{ txid?: string; sats: bigint; reason?: string }>
   withdrawBase(request: { asset: 'USDC' | 'ETH'; to: string; amount: string }): Promise<{ asset: 'USDC' | 'ETH'; amount: bigint; to: string; txid: string; status: string }>
-  walletInfo(): Promise<{ baseAddress: string; bsvAddress: string; usdc: bigint; eth: bigint; claimedBsvSats: bigint; capUsdPerSwap: number; spending_stopped?: boolean; stopped_at?: number; stop_reason?: string; limits?: unknown; new_wallet?: boolean; backup_note?: string }>
+  walletInfo(): Promise<{ baseAddress: string; bsvAddress: string; usdc: bigint; eth: bigint; claimedBsvSats: bigint; unconfirmedBsvSats: bigint; capUsdPerSwap: number; spending_stopped?: boolean; stopped_at?: number; stop_reason?: string; limits?: unknown; new_wallet?: boolean; backup_note?: string; gas_topup?: { status: string; uid?: string; open?: boolean } }>
   assertCanPlanSwap?(deliverTo: string, amountIn?: bigint): Promise<void>
+  /** The destination checks withdrawBase and withdrawBsv run, for both addresses, without sending: throws the refusal a withdrawal would give. */
+  assertWithdrawDestinations(to: { base: string; bsv: string }): Promise<void>
   stopSpending?(reason?: string): Promise<{ alreadyStopped: boolean; at?: number; reason?: string }>
+  /** Re-sends/re-checks/cancels a previously-signed-but-unconfirmed Base withdrawal; sends nothing new. */
+  reconcileWithdrawals?(): Promise<BuyerWithdrawalReconcileOutcome | undefined>
+  /** buy_gas: sells exactly 0.50 USDC of the kit's own balance for ETH paid to the kit; one step per call. */
+  buyGas?(): Promise<GasTopUpStep>
+  /** close_kit: in the money lock, after any buy_gas call in flight, throws while a gas order could still fill. */
+  assertNoOpenGasOrder?(): Promise<void>
 }
 
 export type { ConvertRequest, PetaSats, Quote, SwapResult }

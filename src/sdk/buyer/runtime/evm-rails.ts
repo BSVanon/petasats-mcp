@@ -2,6 +2,7 @@ import { createPublicClient, type Address, type Hex } from 'viem'
 import { Erc20SwapEvmClient } from '../../../bridge/evm/client'
 import { BaseRpcFailoverPool, DEFAULT_BASE_MAINNET_PUBLIC_RPC_URLS, DEFAULT_BASE_RPC_PROBE_INTERVAL_MS, makeBaseRpcUnsafeForNewRisk } from '../../../bridge/evm/rpc'
 import { buyerBaseChain } from '../../../bridge/evm/tip-floor'
+import { BASE_DESTINATION_FORMAT_REFUSAL } from '../withdraw-destination'
 
 /** Provider-keyless Base endpoints, ordered by observed log span and then read-only fallback value. */
 export const DEFAULT_BUYER_BASE_RPC_URLS = DEFAULT_BASE_MAINNET_PUBLIC_RPC_URLS
@@ -28,6 +29,14 @@ export interface BuyerEvmRails {
 }
 
 /**
+ * Defense in depth behind the kit's own destination rules: a Base ETH or USDC transfer, and the ETH pricing, refuse a
+ * `to` that is not a 0x-prefixed 20-byte hex address before any pricing, signing or record.
+ */
+function assertBaseTo(to: unknown): void {
+  if (typeof to !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(to)) throw new Error(BASE_DESTINATION_FORMAT_REFUSAL)
+}
+
+/**
  * Make the risk-writing methods self-guarding.  A quote/admission exchange can
  * take long enough for a previously healthy pool to become split, so the
  * safety decision belongs at each write boundary rather than at its caller.
@@ -36,9 +45,13 @@ export function guardBuyerEvmWrites(client: Erc20SwapEvmClient, assertSafeForNew
   return new Proxy(client, {
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver)
+      // Pricing moves nothing, so it gets the destination check and not the pool check.
+      if (property === 'priceNativeTransfer' && typeof value === 'function') return async (...args: unknown[]) => { assertBaseTo(args[0]); return value.apply(target, args) }
       if (property !== 'approve' && property !== 'lock' && property !== 'transferErc20' && property !== 'transferNative' && property !== 'consumeNonce') return value
       if (typeof value !== 'function') return value
       return async (...args: unknown[]) => {
+        if (property === 'transferErc20') assertBaseTo(args[1]) // (token, to, amount, opts)
+        if (property === 'transferNative') assertBaseTo(args[0]) // (to, value, opts)
         await assertSafeForNewLock()
         return value.apply(target, args)
       }

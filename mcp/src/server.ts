@@ -5,11 +5,13 @@ import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSche
 import {
   assertBuyerMainnetP2pkhAddress, buyerStatusView,
   BUYER_BASE_CLAIM_BUDGET_HOURS, BUYER_BASE_REFUND_HOURS,
-  type Quote, type Route, type BuyerKit, type BuyerQuote,
+  type Quote, type Route, type BuyerKit, type BuyerQuote, type CloseKitRequest, type CloseKitStep,
 } from 'petasats/sdk'
 import { requireString, optionalString, optionalObject, requireAmount, success, toolError, toolErrorData, ToolInputError } from './validate.js'
 import { parseAsset, formatAsset, supportedPairs } from './assets.js'
 import { addHostedQuoteOnlyNote, HOSTED_ALLOWED_TOOLS, hostedToolRefusal, isHostedCopy } from './hosted.js'
+import { assertStopReason, CLOSE_KIT_TOOL, closeKitToolResult, parseCloseKitArgs } from './close-tool.js'
+import { BUY_GAS_TOOL, buyGasToolResult, closeStepWithGasHint, rethrowWithGasHint } from './gas-tool.js'
 import { VERSION } from './version.js'
 
 const MAX_BSV_SATS = 2_100_000_000_000_000n
@@ -17,12 +19,12 @@ export const INSTRUCTIONS = `PetaSats buyer kit. It buys BSV with USDC on Base t
 
 SCOPE: USDC on Base -> BSV only. About $5 to $100 per swap. Each buyer: at most 3 swaps and $200 per day. A shared daily total can make the service busy; a declined request can be retried later.
 
-UNITS: amounts are decimal strings in the smallest unit. USDC has 6 decimals ("25000000" = 25 USDC). BSV is in satoshis ("100000000" = 1 BSV). ETH is in wei.
+UNITS: amounts are decimal strings in the smallest unit. USDC has 6 decimals ("25000000" = 25 USDC). BSV is in satoshis ("100000000" = 1 BSV). ETH is in wei. A dollar amount the user names is the USDC to spend: "$10 of BSV" means amount_in "10000000".
 
 STEPS
-1. wallet_info. The kit needs USDC and a little ETH (for gas) on Base at its own Base address (baseAddress in wallet_info). If it has none, tell the user that address and what to send. Never move the user's funds from another wallet unless they ask.
+1. wallet_info. The kit needs USDC on Base at its own Base address (baseAddress in wallet_info); ETH for gas is optional. If it has no USDC, tell the user that address and what to send. If it has USDC but no ETH, ask the user whether the kit may use 0.50 USDC of its balance to buy ETH for gas, and say the 0.50 USDC comes out of their balance; otherwise tell them to send a little ETH to that address. Each yes covers one purchase. After a yes, call buy_gas, and call it again only while its result asks you to. Once state is 'filled' or 'expired', or 'rejected' with sold 'nothing', that purchase is over: ask again before another. Never move the user's funds from another wallet unless they ask.
 2. get_quote. It shows the exact BSV for an exact USDC amount, the rate and the costs. A quote lasts about 60 seconds.
-3. If a person is directing you, show them the quote and get a clear yes. This is the only time to ask. If they already gave you an amount and a limit, that is the yes.
+3. If a person is directing you, show them the quote and get a clear yes. This is the only time to ask about the swap. If they already gave you an amount and a limit, that is the yes.
 4. swap_asset_to_bsv with quote_id (or min_bsv_out). If the quote has expired, the kit gets a new one and goes ahead only if it pays at least min_bsv_out, or 99% of the old quote.
 5. wait_for_swap until done is true (each call waits up to about 50 seconds). A swap usually finishes within about an hour: the counterparty's BSV lock and the kit's claim each wait for a BSV block, and a delivery to another address goes out together with the claim.
 6. Results: delivered or settled = BSV received; refunded = the USDC came back to the kit; failed = nothing was locked.
@@ -38,6 +40,7 @@ SAFETY
 - The kit refuses a new swap or a withdrawal while a swap is in progress.
 - stop_spending stops new swaps and withdrawals until the user runs \`npx petasats-mcp resume\` in a terminal. Limits in limits.json can also refuse destinations and daily spending.
 - withdraw_bsv and withdraw_base send funds out of the kit. Use only an address the user gave you, and confirm it with them.
+- When the user asks to close, shut down or empty the kit, call close_kit with the Base and BSV addresses they gave and confirmed, and call it again until state is closed.
 - Never open, print or send the kit's keys file. Tell the user to keep a backup of it: it holds the only copy of the kit's keys.`
 
 const TOOLS = [
@@ -103,7 +106,7 @@ const TOOLS = [
   {
     name: 'wallet_info',
     title: 'Wallet information',
-    description: 'Show this kit\'s own wallets: the Base address that pays for swaps, the BSV address that receives them, their balances, and whether spending is stopped. Read-only; never returns key material. Call it first: if the kit has no USDC, or no ETH for Base gas, tell the user to send them to baseAddress. Returns baseAddress, bsvAddress, usdc and eth balances in atomic units, claimedBsvSats, capUsdPerSwap, spending_stopped (with stopped_at and stop_reason), the limits from limits.json, door_identity, and a backup_note when the wallet is new.',
+    description: 'Show this kit\'s own wallets: the Base address that pays for swaps, the BSV address that receives them, their balances, and whether spending is stopped. Read-only; never returns key material. Call it first: if the kit has no USDC, tell the user to send it to baseAddress. ETH for Base gas is optional: the user can send a little, or, after their yes, buy_gas buys it with 0.50 USDC. Returns baseAddress, bsvAddress, usdc and eth balances in atomic units, claimedBsvSats, unconfirmedBsvSats (BSV received but not confirmed yet), capUsdPerSwap, spending_stopped (with stopped_at and stop_reason), the limits from limits.json, door_identity, a backup_note when the wallet is new, and gas_topup (status, uid and open (true while the order could still fill; USDC withdrawals, swaps and close_kit wait until it is false)) when the kit has a gas purchase.',
     annotations: { readOnlyHint: true, openWorldHint: true },
     inputSchema: { type: 'object' as const, properties: {}, required: [] },
   },
@@ -170,6 +173,8 @@ const TOOLS = [
       required: [],
     },
   },
+  CLOSE_KIT_TOOL,
+  BUY_GAS_TOOL,
 ]
 
 const ABOUT = `# PetaSats buyer kit
@@ -182,7 +187,7 @@ The local buyer kit buys BSV with the operator’s own USDC on Base through the 
 PetaSats never holds your keys or funds. Identity, Base, and BSV keys are generated and retained locally. Swaps run in the background and recovery resumes durable records after restart.
 
 ## Tools
-- get_quote, swap_asset_to_bsv, wait_for_swap, swap_status, wallet_info, stop_spending, withdraw_bsv, withdraw_base, fund_wallet, list_liquidity.
+- get_quote, swap_asset_to_bsv, wait_for_swap, swap_status, wallet_info, stop_spending, withdraw_bsv, withdraw_base, fund_wallet, list_liquidity, close_kit, buy_gas.
 `
 
 /** The get_quote wire shape (bigints as strings; assets as agent-facing strings). */
@@ -245,7 +250,7 @@ const redact = (message: string): string => message
  * Pure tool dispatch over an injected PetaSats — the server handler and the tests both call this, so the
  * money-facing logic is exercised without transport plumbing. Every branch fails closed to a tool error.
  */
-export async function handleToolCall(petasats: BuyerKit, name: string, a: Record<string, unknown> | undefined, details: { doorIdentity?: string; signal?: AbortSignal; progress?: (step: number | null, total: number, message: string) => void | Promise<void> } = {}): Promise<ToolResult> {
+export async function handleToolCall(petasats: BuyerKit, name: string, a: Record<string, unknown> | undefined, details: { doorIdentity?: string; signal?: AbortSignal; progress?: (step: number | null, total: number, message: string) => void | Promise<void>; closeKit?: (request: CloseKitRequest) => Promise<CloseKitStep> } = {}): Promise<ToolResult> {
   try {
     switch (name) {
       case 'get_quote': {
@@ -310,7 +315,7 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
       case 'wallet_info': return success({ ...await petasats.walletInfo(), door_identity: details.doorIdentity ?? 'not configured' })
       case 'stop_spending': {
         const reason = optionalString(a, 'reason')
-        if (reason !== undefined && reason.length > 200) throw new ToolInputError('reason must be 200 characters or fewer')
+        assertStopReason(reason)
         if (!petasats.stopSpending) throw new Error('spending stop is not configured')
         const result = await petasats.stopSpending(reason)
         return success(result.alreadyStopped ? { stopped: true, already_stopped: true, at: result.at, reason: result.reason } : { stopped: true, at: result.at, reason: result.reason })
@@ -318,7 +323,7 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
       case 'withdraw_bsv': return success(await petasats.withdrawBsv(requireString(a, 'address')))
       case 'withdraw_base': {
         const asset = requireString(a, 'asset'); if (asset !== 'USDC' && asset !== 'ETH') throw new ToolInputError('asset must be USDC or ETH')
-        const result = await petasats.withdrawBase({ asset, to: requireString(a, 'to'), amount: requireString(a, 'amount') })
+        const result = await petasats.withdrawBase({ asset, to: requireString(a, 'to'), amount: requireString(a, 'amount') }).catch(rethrowWithGasHint)
         return success({ ...result, amount: { atomic: result.amount.toString(), display: atomicDisplay(result.amount, asset === 'USDC' ? 6 : 18, asset) }, url: `https://basescan.org/tx/${result.txid}` })
       }
 
@@ -348,6 +353,13 @@ export async function handleToolCall(petasats: BuyerKit, name: string, a: Record
         return success({ non_custodial: true, settlement: 'on-chain atomic USDC on Base to BSV; PetaSats never custodies', pairs, count: pairs.length })
       }
 
+      case 'close_kit':
+        if (!details.closeKit) throw new Error('close_kit is not available until the kit is set up')
+        return closeKitToolResult(closeStepWithGasHint(await details.closeKit(parseCloseKitArgs(a))))
+      case 'buy_gas':
+        if (!petasats.buyGas) throw new Error('buy_gas is not available until the kit is set up')
+        return buyGasToolResult(await petasats.buyGas())
+
       default:
         return toolError(`unknown tool: ${name}`)
     }
@@ -363,11 +375,12 @@ export interface PetaSatsMcpDeps {
   doorIdentity?: string
   name?: string
   version?: string
+  closeKit?: (request: CloseKitRequest) => Promise<CloseKitStep>
 }
 
 /** Build the MCP Server exposing the PetaSats convert() capability over an injected SDK instance. */
 export function createPetaSatsMcpServer(deps: PetaSatsMcpDeps): Server {
-  const { petasats, hosted = isHostedCopy() } = deps
+  const { petasats, hosted = isHostedCopy(), closeKit } = deps
   const server = new Server(
     { name: deps.name ?? 'petasats-mcp', version: deps.version ?? VERSION },
     { capabilities: { tools: {}, resources: {} }, instructions: INSTRUCTIONS },
@@ -380,7 +393,7 @@ export function createPetaSatsMcpServer(deps: PetaSatsMcpDeps): Server {
     const token = request.params._meta?.progressToken
     const progress = token === undefined ? undefined : (step: number | null, total: number, message: string) =>
       server.notification({ method: 'notifications/progress', params: { progressToken: token, progress: step ?? 0, total, message } })
-    const result = await handleToolCall(petasats, request.params.name, request.params.arguments as Record<string, unknown> | undefined, { doorIdentity: deps.doorIdentity, signal: extra.signal, progress })
+    const result = await handleToolCall(petasats, request.params.name, request.params.arguments as Record<string, unknown> | undefined, { doorIdentity: deps.doorIdentity, signal: extra.signal, progress, closeKit })
     return hosted ? addHostedQuoteOnlyNote(result) : result
   })
 

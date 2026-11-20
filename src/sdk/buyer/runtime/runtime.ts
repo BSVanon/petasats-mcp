@@ -8,7 +8,7 @@ import { createBuyerKit } from '../buyer-kit'
 import { makeMessageBoxDoorClient } from '../door-client'
 import { DOOR_IDENTITY_PLACEHOLDER, RELEASED_DOOR_IDENTITY, assertSecureBuyerHome, buyerAddresses, buyerHome, ensureBuyerRuntimeDirs, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, type BuyerDiskConfig, type BuyerHome } from '../local-state'
 import { makeBuyerEngine } from '../engine'
-import type { BuyerKit, BuyerWithdrawalRecorder, BuyerEthTransferFees } from '../types'
+import type { BuyerKit, BuyerSweepPlan, BuyerWithdrawalRecorder, BuyerEthTransferFees } from '../types'
 import { assertBuyerMainnetP2pkhAddress } from './address'
 import { makeBuyerBsvRails } from './bsv-rails'
 import { guardBuyerEvmWrites, makeBuyerEvmRails } from './evm-rails'
@@ -19,6 +19,7 @@ import { readBuyerLimits } from '../limits'
 import { readSpendingStop, stopSpending } from '../stop'
 import { makeBuyerWithdrawalIntents } from '../withdrawal-intent'
 import { makeThrottledLog } from './log-throttle'
+import { makeBuyerGasTopUpRails } from './gas-topup-rails'
 
 export interface BuyerRuntime {
   kit: BuyerKit
@@ -124,10 +125,11 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
     balances: async () => {
       const base = await evmRails.balances()
       const coins = await bsv.unspentFor(addresses.bsvAddress)
-      return { ...base, claimedBsvSats: coins.filter((coin) => coin.confirmations >= 1).reduce((total, coin) => total + BigInt(coin.value), 0n) }
+      const sats = (confirmed: boolean): bigint => coins.filter((coin) => (coin.confirmations >= 1) === confirmed).reduce((total, coin) => total + BigInt(coin.value), 0n)
+      return { ...base, claimedBsvSats: sats(true), unconfirmedBsvSats: sats(false) }
     },
     // `onlyTxid` limits a swap's deliver_to sweep to that swap's own claimed coin; withdraw_bsv sweeps everything.
-    withdrawBsv: async (address: string, opts?: { onlyTxid?: string; beforeBroadcast?: () => void | Promise<void> }) => {
+    withdrawBsv: async (address: string, opts?: { onlyTxid?: string; beforeBroadcast?: (sweep: BuyerSweepPlan) => void | Promise<void> }) => {
       assertBuyerMainnetP2pkhAddress(address, 'address')
       const unspent = (await bsv.unspentFor(addresses.bsvAddress)).filter((coin) => coin.confirmations >= 1 && (opts?.onlyTxid === undefined || coin.tx_hash === opts.onlyTxid))
       if (!unspent.length) return { sats: 0n, reason: opts?.onlyTxid ? 'this swap\'s claimed BSV is not confirmed yet' : 'no confirmed BSV is available to sweep' }
@@ -137,9 +139,9 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
         return { ...coin, sourceTx }
       }))
       const built = await f.buildSweepTx({ coins, toAddress: address, key: bsvKey, feeRate: DEFAULT_BSV_FEE_RATE_SAT_PER_KB })
-      await opts?.beforeBroadcast?.()
-      const submittedTxid = await bsv.broadcast(built.rawTx, built.atomicBeefHex)
       const txid = built.tx.id('hex') as string
+      await opts?.beforeBroadcast?.({ txid, sats: BigInt(built.outputSatoshis), inputs: coins.map((coin) => `${coin.tx_hash}.${coin.tx_pos}`) })
+      const submittedTxid = await bsv.broadcast(built.rawTx, built.atomicBeefHex)
       if (submittedTxid.toLowerCase() !== txid.toLowerCase()) log(`buyer sweep broadcaster reported ${submittedTxid.slice(0, 12)}… but submitted subject is ${txid.slice(0, 12)}…; retaining derived txid`)
       return { txid, sats: BigInt(built.outputSatoshis) }
     },
@@ -183,10 +185,11 @@ export async function createBuyerRuntime(options: CreateBuyerRuntimeOptions = {}
   }
   const withdrawalIntents = makeBuyerWithdrawalIntents(paths, evmRails.client, now, undefined, { assertSafeForNewLock: () => evmRails.assertSafeForNewLock(), beforeResend: () => { if (readSpendingStop(paths)) throw new Error('spending is stopped; the user removes the stop with `npx petasats-mcp resume`') }, log })
   const retryLifecycle = new AbortController()
+  const gasTopUp = makeBuyerGasTopUpRails({ home: paths.home, privateKey: keys.evmPrivateKey, baseAddress: addresses.baseAddress, transport: evmRails.pool.transport, assertSafeForNewLock: () => evmRails.assertSafeForNewLock() })
   const kit = createBuyerKit({ capUsdPerSwap: config.capUsdPerSwap, maxActiveSwaps: options.maxActiveSwaps, baseWithdrawalForbidden: [ERC20_SWAP.deployments.baseMainnet.address, BASE_USDC], newWallet: options.newWallet, keysPath: paths.keysPath, now }, {
     door, executor: engine, store: makeFileBuyerStore(paths), wallet,
     beforeNewSwap: async () => { await evmRails.assertSafeForNewLock() }, limits: () => readBuyerLimits(paths), spendingStopped: () => readSpendingStop(paths), withdrawalIntents,
-    stopSpending: (reason) => stopSpending(paths, reason), retrySignal: retryLifecycle.signal, log,
+    stopSpending: (reason) => stopSpending(paths, reason), retrySignal: retryLifecycle.signal, log, gasTopUp,
   })
   return { kit, paths, config, close: () => { retryLifecycle.abort(); engine.close?.() } }
 }

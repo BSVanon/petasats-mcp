@@ -2,11 +2,11 @@
 name: petasats-buy-bsv
 description: 'Use when the user or agent needs BSV and holds USDC on Base: "buy BSV", "buy BSV with USDC", "swap USDC for BSV", "get BSV for an agent", "fund a BSV address from Base", "send the BSV to this address". Buys BSV through the local, non-custodial petasats MCP server (npm petasats-mcp): a quote, a cross-chain atomic swap, and delivery to a BSV address.'
 license: MIT (see LICENSE)
-compatibility: Node.js 22+; the petasats MCP server (stdio, npm petasats-mcp@0.2.22); USDC and a little ETH on Base
+compatibility: Node.js 22+; the petasats MCP server (stdio, npm petasats-mcp@0.2.23); USDC on Base (ETH for gas is optional)
 metadata:
   author: BSVanon
-  version: "0.1.1"
-  facts-from: "petasats-mcp 0.2.22"
+  version: "0.1.2"
+  facts-from: "petasats-mcp 0.2.23"
 ---
 
 # petasats-buy-bsv
@@ -20,17 +20,18 @@ Use it when the user wants to:
 - buy BSV with USDC on Base, for themselves or for an agent;
 - get a price for USDC to BSV before buying;
 - have the bought BSV sent to a BSV address;
-- check on, or recover, a purchase already started.
+- check on, or recover, a purchase already started;
+- empty the kit into the user's own wallets and close it.
 
 It covers USDC on Base to BSV only.
 
 ## Set up
 
-1. Use Node.js 22 or newer. Pin one release everywhere, here `petasats-mcp@0.2.22`:
-   `claude mcp add petasats -- npx -y petasats-mcp@0.2.22`
-   Any client that starts local stdio servers can use command `npx` with args `-y petasats-mcp@0.2.22`.
+1. Use Node.js 22 or newer. Pin one release everywhere, here `petasats-mcp@0.2.23`:
+   `claude mcp add petasats -- npx -y petasats-mcp@0.2.23`
+   Any client that starts local stdio servers can use command `npx` with args `-y petasats-mcp@0.2.23`.
 2. The first start creates the kit's keys in `~/.petasats` (`PETASATS_HOME` changes that). Tell the user to back up `keys.json`: it is the only copy. Run one copy of a kit home at a time.
-3. To fund the kit, `wallet_info` shows its Base address. The user sends it USDC on Base and a little ETH for gas (0.0002 ETH covers many swaps).
+3. To fund the kit, `wallet_info` shows its Base address. The user sends it USDC on Base. ETH for gas is optional: the user can send a little (0.0002 ETH covers many swaps), or the kit can buy its own. If the kit has USDC but no ETH, ask the user whether the kit may use 0.50 USDC of its balance to buy ETH for gas, and say the 0.50 USDC comes out of their balance. Each yes covers one purchase. Only after a yes, call `buy_gas`; while `state` is `pending`, call it again after `call_again_after_seconds`, and call again whenever a result asks you to. Once `state` is `filled` or `expired`, or `rejected` with `sold` `nothing`, that purchase is over: ask again before another.
 
 ## Buy BSV
 
@@ -42,14 +43,22 @@ Standard speed is the default: the kit waits for one BSV confirmation, about 10 
 
 If the BSV goes to an address from BSV Desktop, the user keeps its Get paid screen open until the BSV arrives: BSV Desktop adds incoming funds only while that screen is open.
 
+## Close the kit
+
+When the user asks to close, shut down or empty the kit:
+
+1. Get the user's own Base address and BSV address, and confirm both with them.
+2. Call `close_kit` with them. Each call does one step. While `state` is `in_progress`, call again after `call_again_after_seconds`. On `refused`, tell the user the reason, and call again after `retry_after_seconds` when the result gives one.
+3. On `closed`, report every send with its transaction ID, the final balances and the `keys_note`. Never delete the kit's folder or `keys.json` yourself.
+
 ## Rules
 
 - Never ask for, print, copy or move the kit's keys. The kit signs on the user's machine.
-- `swap_asset_to_bsv`, `withdraw_bsv` and `withdraw_base` move funds. Call them only on the user's instruction. `get_quote`, `wait_for_swap`, `swap_status`, `wallet_info`, `list_liquidity` and `fund_wallet` (it only plans a USDC-to-BSV swap and returns a quote) move nothing.
+- `swap_asset_to_bsv`, `withdraw_bsv`, `withdraw_base`, `close_kit` and `buy_gas` move funds. Call them only on the user's instruction. `get_quote`, `wait_for_swap`, `swap_status`, `wallet_info`, `list_liquidity` and `fund_wallet` (it only plans a USDC-to-BSV swap and returns a quote) move nothing.
 - `busy`, `limit`, `rate_limited`, `unavailable` and `declined` mean nothing was locked. Tell the user, and do not retry in a loop.
 - A refusal by the user's limits file (`~/.petasats/limits.json`) is final. Never edit `limits.json` or `STOP` in the kit's folder: they are the user's controls.
-- `stop_spending` stops new swaps and withdrawals at once. Only the user can resume, with `npx petasats-mcp@0.2.22 resume`. Swaps already started keep recovering.
-- Run one swap at a time, and keep the server running during a swap. After an interruption, `npx petasats-mcp@0.2.22 recover` resumes it, and `npx petasats-mcp@0.2.22 status` shows where things stand.
+- `stop_spending` stops new swaps and withdrawals at once. Only the user can resume, with `npx petasats-mcp@0.2.23 resume`. Swaps already started keep recovering.
+- Run one swap at a time, and keep the server running during a swap. After an interruption, `npx petasats-mcp@0.2.23 recover` resumes it, and `npx petasats-mcp@0.2.23 status` shows where things stand.
 
 ## Trust model
 

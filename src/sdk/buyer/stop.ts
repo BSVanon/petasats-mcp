@@ -1,5 +1,6 @@
 import * as fs from 'fs'
 import { syncNewEntry, syncRemovedEntry } from '../../bridge/atomic-record-write'
+import { MAX_VALID_DATE_MS } from './close-record'
 import { secureFileText, type BuyerHome } from './local-state'
 
 export interface SpendingStop { at: number; reason?: string }
@@ -26,7 +27,9 @@ export function readSpendingStop(paths: BuyerHome): SpendingStop | undefined {
   try {
     const value = JSON.parse(secureFileText(paths.stopPath)) as Partial<SpendingStop>
     const at = value.at
-    if (!Number.isSafeInteger(at) || at === undefined || at < 0 || (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 200))) throw new Error('STOP has invalid contents')
+    // at feeds close.ts's closedAt, formatted with new Date(...).toISOString() (m2): refuse the same out-of-range
+    // values close.json's own startedAt/closedAt already refuse, before close.ts ever copies this value in.
+    if (!Number.isSafeInteger(at) || at === undefined || at < 0 || at > MAX_VALID_DATE_MS || (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 200))) throw new Error('STOP has invalid contents')
     return { at, ...(value.reason ? { reason: value.reason } : {}) }
   } catch (error) { throw new Error(`spending is stopped; fix STOP at the terminal (${error instanceof Error ? error.message : 'invalid stop record'})`) }
 }
