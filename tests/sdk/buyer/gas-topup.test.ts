@@ -313,9 +313,10 @@ describe('buy_gas step', () => {
   })
 
   it('F18 refuses with one fixed message for a corrupt, unsafe or altered record and never overwrites it', async () => {
+    const NOT_A_GAS_PURCHASE_RECORD = 'contents are not a gas purchase record'
     const corruptions: Array<[string, (path: string) => void]> = [
       ['not valid JSON', (path) => writeFileSync(path, '{"uid":', { mode: 0o600 })],
-      ['contents are not a gas purchase record', (path) => writeFileSync(path, JSON.stringify({ uid: 'x' }), { mode: 0o600 })],
+      [NOT_A_GAS_PURCHASE_RECORD, (path) => writeFileSync(path, JSON.stringify({ uid: 'x' }), { mode: 0o600 })],
       ['unsafe permissions', (path) => { writeFileSync(path, '{}'); chmodSync(path, 0o644) }],
     ]
     for (const [detail, corrupt] of corruptions) {
@@ -325,12 +326,15 @@ describe('buy_gas step', () => {
       const before = readFileSync(path)
       const step = await h.gas.buy() // buy_gas returns the refusal; it never throws
       expect(step.state, detail).eq('refused')
+      // Windows has no POSIX permission bits, so local-state.ts's secureFileText skips the mode check there: this
+      // chmod is inert, and the file is read as plain '{}', which fails the same shape check as the corruption above.
+      const expectedText = process.platform === 'win32' && detail === 'unsafe permissions' ? NOT_A_GAS_PURCHASE_RECORD : detail
       for (const call of [() => h.gas.assertNoOpenOrder('withdraw'), () => h.gas.assertNoOpenOrder('swap')]) {
         try { await call(); expect.fail(`${detail}: must refuse`) } catch (error) {
           if (step.state === 'refused') expect(step.reason, detail).eq((error as Error).message)
           expect((error as Error).message, detail).include(`gas-topup.json in ${h.paths.home} cannot be read`)
           expect((error as Error).message, detail).include('Inspect it')
-          expect((error as Error).message, detail).include(detail)
+          expect((error as Error).message, detail).include(expectedText)
         }
       }
       expect(h.gas.view()).deep.eq({ status: 'unreadable' })

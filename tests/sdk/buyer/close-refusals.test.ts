@@ -15,7 +15,11 @@ const refusal = (step: Awaited<ReturnType<typeof closeKitStep>>): { reason?: str
   step.state === 'refused' ? { reason: step.reason, retry: step.retry_after_seconds } : { reason: `not refused: ${step.state}` }
 
 describe('buyer kit close-down: refusals only the user can clear', () => {
-  it('S6 an invalid kit record, a coin that is not the kit\'s, a filesystem refusal or a reverted send carries no retry_after', async () => {
+  it('S6 an invalid kit record, a coin that is not the kit\'s, a filesystem refusal or a reverted send carries no retry_after', async function () {
+    // 48 real closeKitStep calls (16 errors x 3 "where" cases), each over its own fresh temp BuyerHome: mkdir+chmod+
+    // fsync per subfolder, two generated keys written, close.json written and reread. Well under a second here, but
+    // Windows CI's per-filesystem-call cost is far higher, so the public package's 2000ms mocha default is too tight.
+    this.timeout(15_000)
     const needsUser: Error[] = [
       new Error('invalid Base withdrawal record'), new Error(`buyer sweep: source output is not a kit P2PKH coin for ${'ab'.repeat(32)}:0`),
       new Error('Base USDC transfer reverted'), new Error('Base ETH transfer reverted'), new Error('invalid buyer swap quote field amountIn'),
@@ -66,7 +70,11 @@ describe('buyer kit close-down: refusals only the user can clear', () => {
     mkdirSync(join(paths.home, 'close-77.json'))
     const { kit, calls } = fakeKit(paths, { usdc: 1n, eth: 0n, claimedBsvSats: 0n, swaps: [] })
     const step = refusal(await closeKitStep({ kit, paths }, PAIR))
-    expect(step.reason).match(/^EISDIR/)
+    // rename(2) onto an existing directory is EISDIR on POSIX ("newpath is an existing directory, but oldpath is
+    // not a directory"); Windows cannot MoveFileEx a file over a directory and libuv surfaces that as EPERM instead.
+    // Both codes are in close.ts's NEEDS_THE_USER_CODES, so the kit's own behavior here — refuse, no retry, nothing
+    // sent — is identical on every platform; only the OS's own error code for this exact rename differs.
+    expect(step.reason).match(process.platform === 'win32' ? /^EPERM/ : /^EISDIR/)
     expect(step.retry).eq(undefined)
     expect(calls.withdrawBase).deep.eq([])
   })
