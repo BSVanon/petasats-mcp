@@ -3,12 +3,12 @@ import assert from 'node:assert/strict'
 import { DoorDeclineError, type BuyerKit, type ConvertRequest, type StartSwapRequest } from 'petasats/sdk'
 import { isAddress } from 'viem'
 import { handleToolCall, TOOLS } from '../src/server.js'
-import { initResult, isMainModule, limitsOutput, resumeOutput, startBackgroundRecovery, statusOutput, withdrawalOutput, withdrawalsOutput } from '../src/index.js'
+import { initResult, isMainModule, isNewKitFolder, limitsOutput, resumeOutput, startBackgroundRecovery, statusOutput, withdrawalOutput, withdrawalsOutput } from '../src/index.js'
 import { DOOR_IDENTITY_PLACEHOLDER, initialiseBuyerHome } from '../../src/sdk/buyer/local-state.js'
 import { makeBuyerWithdrawalIntents } from '../../src/sdk/buyer/withdrawal-intent.js'
 import { createBuyerKit } from '../../src/sdk/buyer/buyer-kit.js'
 import { readSpendingStop, stopSpending } from '../../src/sdk/buyer/stop.js'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -20,7 +20,8 @@ function fakePetasats(sink: { last?: StartSwapRequest } = {}): BuyerKit {
     convert: async (req) => ({ ok: true, route: 'bridge', status: 'pending', txids: { x: 'tx1' } }),
     startSwap: async (request) => { sink.last = request; return { swapId: 'a'.repeat(32), stage: 'quoted', expectedMinutes: 20, requestedSpeed: request.speed ?? 'standard', agreedSettlementMode: request.speed === 'fast' ? 'pending' : 'confirmed', settlementModeUsed: 'pending' } },
     status: async () => [], recover: async () => [], withdrawBsv: async () => ({ sats: 0n }), withdrawBase: async () => ({ asset: 'USDC', amount: 1n, to: '0x1111111111111111111111111111111111111111', txid: '0xtx', status: 'success' }),
-    walletInfo: async () => ({ baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, capUsdPerSwap: 100 }),
+    walletInfo: async () => ({ baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, unconfirmedBsvSats: 0n, capUsdPerSwap: 100 }),
+    assertWithdrawDestinations: async () => {},
   }
 }
 
@@ -84,7 +85,7 @@ test('buyer-kit adapter starts in background and exposes status without secrets'
     ...fakePetasats(),
     startSwap: async () => ({ swapId: 'a'.repeat(32), stage: 'quoted' as const, expectedMinutes: 20, requestedSpeed: 'standard' as const, agreedSettlementMode: 'confirmed' as const, settlementModeUsed: 'pending' as const }),
     status: async () => [{ swapId: 'a'.repeat(32), requestId: 'r1', stage: 'waiting_bsv_lock' as const, amountIn: '1000000', quote: {} as any, requestedSpeed: 'fast' as const, agreedSettlementMode: 'fast' as const, settlementModeUsed: 'confirmed' as const, settlementModeDowngradeReason: 'ARC quorum undecided', createdAtMs: 1, updatedAtMs: 1 }],
-    walletInfo: async () => ({ baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, capUsdPerSwap: 100 }),
+    walletInfo: async () => ({ baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, unconfirmedBsvSats: 0n, capUsdPerSwap: 100 }),
     withdrawBsv: async () => ({ sats: 1n }), withdrawBase: async () => ({ asset: 'USDC' as const, amount: 1n, to: '0x1111111111111111111111111111111111111111', txid: '0xtx', status: 'success' }), recover: async () => [],
   }
   const started = payload(await handleToolCall(fake, 'swap_asset_to_bsv', { from_asset: 'USDC', amount_in: '1000000', quote_id: 'q1' }))
@@ -232,6 +233,27 @@ test('the entry point runs when started through a symlinked bin (npm global inst
   assert.equal(isMainModule(undefined, pathToFileURL(real).href), false)
 })
 
+test('a missing or empty kit folder is new; a folder holding any kit file is not', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'petasats-new-folder-'))
+  assert.equal(isNewKitFolder(join(parent, 'missing')), true)
+  const empty = join(parent, 'empty'); mkdirSync(empty)
+  assert.equal(isNewKitFolder(empty), true)
+  const finder = join(parent, 'finder'); mkdirSync(finder); writeFileSync(join(finder, '.DS_Store'), '')
+  assert.equal(isNewKitFolder(finder), true)
+  // Swap records without keys.json must never get fresh keys: the old swaps would lose the keys that settle them.
+  const records = join(parent, 'records'); mkdirSync(join(records, 'swaps'), { recursive: true })
+  assert.equal(isNewKitFolder(records), false)
+  const keyed = initialiseBuyerHome(join(parent, 'keyed'))
+  assert.equal(isNewKitFolder(keyed.home), false)
+  const file = join(parent, 'file'); writeFileSync(file, '')
+  assert.equal(isNewKitFolder(file), false)
+  // First start in the existing empty folder creates the keys there, owner-only.
+  const home = initialiseBuyerHome(empty)
+  assert.equal(existsSync(home.keysPath), true)
+  if (process.platform !== 'win32') assert.equal(statSync(home.keysPath).mode & 0o777, 0o600)
+  assert.equal(isNewKitFolder(empty), false)
+})
+
 test('init prints absolute MCP launch paths', () => {
   const home = initialiseBuyerHome(mkdtempSync(join(tmpdir(), 'petasats-init-mcp-')))
   const mcp = initResult(home).mcp as { command: string; args: string[] }
@@ -298,7 +320,7 @@ function guardedCore(home: ReturnType<typeof initialiseBuyerHome>, limits: () =>
   return createBuyerKit({}, {
     limits, spendingStopped: () => readSpendingStop(home), stopSpending: (reason) => stopSpending(home, reason),
     store: { list: async () => [], get: async () => undefined, put: async () => {} },
-    wallet: { baseAddress: '0x2222222222222222222222222222222222222222', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', balances: async () => ({ usdc: 1n, eth: 1n, claimedBsvSats: 0n }), withdrawBsv: async () => ({ sats: 0n }), transferUsdc: async () => ({ hash: `0x${'a'.repeat(64)}`, status: 'success' }) },
+    wallet: { baseAddress: '0x2222222222222222222222222222222222222222', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', balances: async () => ({ usdc: 1n, eth: 1n, claimedBsvSats: 0n, unconfirmedBsvSats: 0n }), withdrawBsv: async () => ({ sats: 0n }), transferUsdc: async () => ({ hash: `0x${'a'.repeat(64)}`, status: 'success' }) },
     door: { quote: async () => ({ quoteId: 'q'.repeat(16), bsvSats: 1, usdcBaseUnits: '1', expiresAtMs: Date.now() + 60_000 }), admit: async () => ({ swapNamespace: 'a'.repeat(32), handshakeDeadlineMs: Date.now() + 60_000 }) }, executor: { execute: async () => ({ ok: true }) },
   })
 }

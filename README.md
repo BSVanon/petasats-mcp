@@ -19,39 +19,124 @@ Swaps are about $5 to $100. Each buyer may make three swaps and $200 per day; a 
 
 ## Install and connect
 
-Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.22`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
+Use Node.js 22 or newer. Every command here runs this release, `petasats-mcp@0.2.23`. Use one version in your client's entry and in terminal commands; to move to a later release, change it while no swap is running and restart the client.
+
+**One click.** Your app opens and asks you to confirm:
+
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=petasats&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInBldGFzYXRzLW1jcEAwLjIuMjMiXX0%3D) [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_PetaSats-0098FF?style=flat-square)](https://vscode.dev/redirect?url=vscode%3Amcp%2Finstall%3F%257B%2522name%2522%253A%2522petasats%2522%252C%2522command%2522%253A%2522npx%2522%252C%2522args%2522%253A%255B%2522-y%2522%252C%2522petasats-mcp%25400.2.23%2522%255D%257D) [![Add to Kiro](https://kiro.dev/images/add-to-kiro.svg)](https://kiro.dev/launch/mcp/add?name=petasats&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22petasats-mcp%400.2.23%22%5D%7D) [![Add to LM Studio](https://files.lmstudio.ai/deeplink/mcp-install-light.svg)](https://lmstudio.ai/install-mcp?name=petasats&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInBldGFzYXRzLW1jcEAwLjIuMjMiXX0%3D) [![Install in Goose](https://goose-docs.ai/img/extension-install-dark.svg)](https://goose-docs.ai/extension?cmd=npx&arg=-y&arg=petasats-mcp%400.2.23&id=petasats&name=PetaSats&description=Buy%20BSV%20with%20USDC%20on%20Base)
+
+**One command.** Claude Code:
 
 ```sh
-claude mcp add petasats -- npx -y petasats-mcp@0.2.22
-```
-
-Claude Desktop (`claude_desktop_config.json`), Cursor (`~/.cursor/mcp.json`):
-
-```json
-{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.22"]}}}
-```
-
-VS Code (`.vscode/mcp.json`):
-
-```json
-{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.22"]}}}
+claude mcp add petasats -- npx -y petasats-mcp@0.2.23
 ```
 
 Codex (CLI, IDE extension, or app):
 
 ```sh
-codex mcp add petasats -- npx -y petasats-mcp@0.2.22
+codex mcp add petasats -- npx -y petasats-mcp@0.2.23
 ```
 
-Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.22`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
+<details><summary>Gemini CLI, Qwen Code, Grok Build, Cline, Kiro CLI</summary>
+
+Gemini CLI:
+
+```sh
+gemini mcp add -s user petasats npx -- -y petasats-mcp@0.2.23
+```
+
+Qwen Code:
+
+```sh
+qwen mcp add petasats npx -y petasats-mcp@0.2.23
+```
+
+Grok Build:
+
+```sh
+grok mcp add petasats -- npx -y petasats-mcp@0.2.23
+```
+
+Cline:
+
+```sh
+cline mcp add petasats --yes -- npx -y petasats-mcp@0.2.23
+```
+
+Kiro CLI:
+
+```sh
+kiro-cli mcp add --name petasats --command npx --args "-y,petasats-mcp@0.2.23" --scope global
+```
+
+</details>
+
+**A settings file.** These apps take this entry in their MCP settings. If the file already has an `mcpServers` list, add the `petasats` entry inside it.
+
+```json
+{"mcpServers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.23"]}}}
+```
+
+| App | Where the entry goes |
+| --- | --- |
+| Cursor | `~/.cursor/mcp.json` |
+| Devin Desktop (formerly Windsurf) | `~/.config/devin/mcp_config.json`; on Windows `%APPDATA%\devin\mcp_config.json` |
+| Kiro | `~/.kiro/settings/mcp.json` |
+| Warp | `~/.warp/.mcp.json`, or Settings → MCP servers |
+| JetBrains AI Assistant | Settings → Tools → AI Assistant → Model Context Protocol (MCP) |
+| Junie | `~/.junie/mcp/mcp.json` |
+| LM Studio | Program tab → Install → Edit mcp.json |
+| Cline | MCP Servers → Configure → Configure MCP Servers |
+
+<details><summary>VS Code, Zed, OpenCode, Kilo Code, Cherry Studio</summary>
+
+VS Code (`.vscode/mcp.json`):
+
+```json
+{"servers":{"petasats":{"type":"stdio","command":"npx","args":["-y","petasats-mcp@0.2.23"]}}}
+```
+
+Zed (`~/.config/zed/settings.json`):
+
+```json
+{"context_servers":{"petasats":{"command":"npx","args":["-y","petasats-mcp@0.2.23"],"env":{}}}}
+```
+
+OpenCode (`~/.config/opencode/opencode.json`):
+
+```json
+{"mcp":{"petasats":{"type":"local","command":["npx","-y","petasats-mcp@0.2.23"]}}}
+```
+
+Kilo Code (`~/.config/kilo/kilo.jsonc`):
+
+```json
+{"mcp":{"petasats":{"type":"local","command":["npx","-y","petasats-mcp@0.2.23"],"enabled":true}}}
+```
+
+Cherry Studio: Settings → MCP Servers → Add Server. Choose type STDIO, command `npx`, arguments `-y petasats-mcp@0.2.23`.
+
+</details>
+
+**Any model.** Cline, Kilo Code, OpenCode, Goose, Cherry Studio, Zed, Warp, Qwen Code and Grok Build let you choose the model, including models from OpenRouter, DeepSeek and Qwen. The kit has been tested with Claude Code and Codex. Through OpenRouter, DeepSeek V4.1 Flash, DeepSeek V4 Pro, Qwen 4 Max, Qwen 3.8 27B, Kimi K3.1 Pro, GLM 5.3 and MiniMax M3.1 Flash each passed a check on an empty kit: set it up, get a $10 quote, accept a no, and close the kit. With any model, read the USDC amount in a quote before you say yes.
+
+**Browser apps cannot run it.** claude.ai, chatgpt.com, grok.com, Perplexity and the Gemini app run in a browser and cannot start a program on your computer. The kit has to run on your computer, because that is where its keys stay.
+
+Any client that starts local stdio servers can use command `npx` and args `-y petasats-mcp@0.2.23`. First start creates keys in `~/.petasats`; `PETASATS_HOME` changes that location. Back up `keys.json`: it is the only copy. Run only one copy of a kit home, because two copies of the same keys can each sign Base payments the other cannot see.
 
 ## Fund the kit
 
-`wallet_info` shows the Base address. Send it USDC on Base and a little ETH for gas; 0.0002 ETH covers many swaps.
+`wallet_info` shows the Base address. Send it USDC on Base. ETH for gas is optional: send a little (0.0002 ETH covers many swaps), or let the kit buy its own. With your yes, `buy_gas` sells 0.50 USDC of the kit's balance for ETH through one CoW Protocol order, paid to the kit's own address. A CoW Protocol solver settles the order and pays its network fee, so this works with no ETH in the kit. If no solver fills the order within about 20 minutes, it expires and nothing is sold. `buy_gas` refuses when the kit already has 0.00002 ETH or more.
 
 ## Use it
 
-Ask: “Buy $20 of BSV and send it to 1...”
+Ask in plain words, for example:
+
+- “Set up PetaSats and tell me what to send to fund it.”
+- “What would $20 of BSV cost right now?”
+- “Buy $20 of BSV and send it to 1….”
+- “How is my swap doing?”
+- “Close the kit and send everything to my wallets.”
 
 | Tool | Moves funds |
 | --- | --- |
@@ -65,6 +150,8 @@ Ask: “Buy $20 of BSV and send it to 1...”
 | withdraw_base | Yes |
 | fund_wallet | No — it only plans a USDC-to-BSV swap and returns a quote |
 | list_liquidity | No |
+| close_kit | Yes — it empties the kit into your wallets, then stops it |
+| buy_gas | Yes — it sells 0.50 USDC of the kit's balance for ETH for gas |
 
 ## Limits you control
 
@@ -80,13 +167,29 @@ You can create `~/.petasats/limits.json` to restrict where an AI may send funds 
 }
 ```
 
-Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.22 limits` to inspect it.
+Keep this file private to your user account: `chmod 600 ~/.petasats/limits.json`. The kit refuses a limits file that other users can read or write. It rereads the file before every money operation. A refusal says that it was refused by your limits file and that nothing was sent. Use `npx petasats-mcp@0.2.23 limits` to inspect it.
 
-`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.22 resume`; recovery for swaps already started keeps working.
+`stop_spending` stops new swaps and withdrawals immediately. Only you can resume with `npx petasats-mcp@0.2.23 resume`; recovery for swaps already started keeps working.
 
 `allowFastSettlement: false` forbids fast settlement for new swaps. If the field is missing, an explicitly requested fast swap is permitted to negotiate it; standard remains the default.
 
 These controls protect against an AI that can only use the kit's tools. An AI app that can run shell commands or edit files as you can also edit `limits.json` or `STOP`.
+
+## Close the kit
+
+Ask: “Send everything to my wallets and close the kit. My Base address is 0x… and my BSV address is 1….”
+
+`close_kit` empties the kit into your own wallets, then stops it. Each call does one step, and the AI calls again until the kit reports `closed`:
+
+1. While a Base withdrawal is pending, or a gas purchase (`buy_gas`) is finishing, it waits. While a swap is running, it refuses and says when to try again. While spending is stopped for another reason, it refuses.
+2. It sends the USDC first, then the BSV, then the ETH, one send per step. The USDC goes first because sending it costs ETH for gas. BSV that has not confirmed yet is waited for, then sent.
+3. It checks that the kit is empty, then stops it. The only thing left behind is ETH too small to pay its own gas, or occasionally a BSV amount too small to send.
+
+One close-down goes to one pair of addresses, and your limits file applies to them. In a terminal, quit your AI app first (only one copy of a kit runs at a time), then run `npx petasats-mcp@0.2.23 close <base_address> <bsv_address>`. It repeats the steps until the kit is closed. After a brief failure, such as a network error, or while a swap is still running, it tries again; if a step is refused for any other reason, it stops and gives the reason.
+
+Closing never deletes `keys.json`. Keep it, because anything sent to the kit's addresses later can only be recovered with it. To use the kit again, run `npx petasats-mcp@0.2.23 resume`.
+
+Each answer includes `sent`, every send made in this close-down so far. That list comes from the kit's own records; a block explorer shows your addresses' full history.
 
 ## Progress and reporting
 
@@ -104,7 +207,7 @@ You trust the npm package you run (see Verify what you run), the Base RPC and BS
 
 ## Costs
 
-`get_quote` shows the rate and comparison with market mid. You pay Base gas in ETH, the BSV claim fee, and a small extra BSV fee with `deliver_to`. See `get_quote` for protocol fees.
+`get_quote` shows the rate and comparison with market mid. You pay Base gas in ETH, the BSV claim fee, and a small extra BSV fee with `deliver_to`. If the kit buys its own gas, `buy_gas` spends 0.50 USDC of the kit's balance on that ETH, CoW Protocol's fee included. See `get_quote` for protocol fees.
 
 ## Verify what you run
 
@@ -112,9 +215,9 @@ The npm package is built by GitHub Actions from a tagged commit and published wi
 
 ## Files, status, and recovery
 
-The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.22 status` for status and `npx petasats-mcp@0.2.22 recover` after interruption.
+The kit uses `~/.petasats`. Run `npx petasats-mcp@0.2.23 status` for status and `npx petasats-mcp@0.2.23 recover` after interruption.
 
-A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.22 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.22 withdrawal <hash> sent` or `npx petasats-mcp@0.2.22 withdrawal <hash> not-sent`.
+A Base withdrawal left pending (for example after a fee rise) is re-sent unchanged; new swaps and Base withdrawals wait until it confirms. Run `npx petasats-mcp@0.2.23 withdrawals` to list pending withdrawals. If a finalized nonce was consumed but its receipt cannot be found, check the transaction in a Base explorer, then explicitly record the outcome with `npx petasats-mcp@0.2.23 withdrawal <hash> sent` or `npx petasats-mcp@0.2.23 withdrawal <hash> not-sent`.
 
 Repeating the same Base withdrawal (same asset, amount, and address) within an hour is refused as a likely retry. Do not run two AI apps using the kit on the same folder at the same time.
 
@@ -125,6 +228,14 @@ A swap started with version 0.2.0 or 0.2.1 whose USDC lock never landed can stay
 `busy`, `limit`, `rate_limited`, `unavailable`, and `declined` mean nothing was locked. If keys-file permissions are wrong, restore owner-only access. For RPC trouble, check your network connection and retry.
 
 ## Release notes
+
+0.2.23:
+
+- New `close_kit` tool and `npx petasats-mcp@0.2.23 close` command. They empty the kit into your own wallets, sending USDC first, then BSV, then ETH, and stop the kit once it is empty. They wait for running swaps and pending Base withdrawals, and they never delete the keys.
+- On first start the kit now sets up its wallet in a `PETASATS_HOME` folder that exists but is empty. Before, it did this only when the folder did not exist yet.
+- The README shows how to install the kit in more AI apps, with one-click buttons for Cursor, VS Code, Kiro, LM Studio and Goose, and gives example requests to start with.
+- The README shows the kit's score on the Glama MCP directory.
+- New `buy_gas` tool, so a kit funded with USDC alone can pay its own Base gas. With your yes, it sells exactly 0.50 USDC of the kit's balance for ETH through one CoW Protocol order, paid to the kit's own address. A CoW Protocol solver settles the order and pays its network fee, so the order itself needs no ETH. While an order could still fill, about 22 minutes after it was signed (longer if this computer's clock is off), USDC withdrawals and `close_kit` wait and new swaps are refused. `buy_gas` itself waits while a Base withdrawal or swap lock is still being confirmed.
 
 0.2.22:
 

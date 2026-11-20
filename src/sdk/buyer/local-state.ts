@@ -70,18 +70,70 @@ function assertReadableBuyerKeys(keys: unknown): asserts keys is BuyerKeys {
   PrivateKey.fromWif(candidate.bsvWif)
   privateKeyToAccount(candidate.evmPrivateKey)
 }
+/** The kit's own three state subfolders, created unconditionally by initialiseBuyerHome before keys.json. */
+const KIT_INIT_SUBFOLDERS = ['swaps', 'settlement', 'withdrawals'] as const
+
+/**
+ * A folder is new when it is missing, or when it holds nothing but `.DS_Store` and the kit's own three subfolders —
+ * swaps/, settlement/ and withdrawals/, all present together, each itself empty apart from `.DS_Store` — the shape
+ * left behind when an earlier init stopped after creating them but before writing keys.json. Any other entry,
+ * including a lone or non-empty subfolder, config.json, limits.json, STOP, close.json, or anything unknown, makes
+ * the folder not new. Shared by the explicit `init` command and the automatic first-start path, so they agree.
+ */
+export function isNewBuyerHome(home: string, fileSystem: BuyerHomeFs = fs): boolean {
+  if (!fileSystem.existsSync(home)) return true
+  // A `.DS_Store` entry counts as harmless only when it actually is a regular file (n2): a same-named directory, or
+  // a symlink, could hold real content, and lstat (never stat) judges the entry itself, not a symlink's target.
+  const isHarmlessDsStore = (path: string): boolean => {
+    try { return fileSystem.lstatSync(path).isFile() } catch { return false }
+  }
+  const isHarmless = (dir: string, name: string): boolean => name === '.DS_Store' && isHarmlessDsStore(join(dir, name))
+  const isEmptyAsideFromDsStore = (path: string): boolean => {
+    try { return fileSystem.readdirSync(path).every((name) => isHarmless(path, name)) } catch { return false }
+  }
+  let entries: string[]
+  try { entries = fileSystem.readdirSync(home) } catch { return false }
+  const other = entries.filter((name) => !isHarmless(home, name))
+  if (other.length === 0) return true
+  if (other.length !== KIT_INIT_SUBFOLDERS.length || !KIT_INIT_SUBFOLDERS.every((name) => other.includes(name))) return false
+  return KIT_INIT_SUBFOLDERS.every((name) => {
+    const full = join(home, name)
+    try { if (!fileSystem.lstatSync(full).isDirectory()) return false } catch { return false }
+    return isEmptyAsideFromDsStore(full)
+  })
+}
+
 /** Creates local keys once. No key is logged, returned by CLI output, or sent to a dependency. */
 export function initialiseBuyerHome(homePath?: string, fileSystem: BuyerHomeFs = fs): BuyerHome {
   const paths = buyerHome(homePath)
+  // n3: a home that exists but is not a directory (a plain file, a symlink) is left to safeMkdir's own
+  // "unsafe local directory" refusal just below, unchanged since FIX4 — not read as "not new" here.
+  const homeIsDirectory = (): boolean => { try { return fileSystem.lstatSync(paths.home).isDirectory() } catch { return true } }
+  // Every path, one rule: a folder that already holds kit files but lost keys.json never gets replacement keys.
+  // Read fresh right here, not from an earlier snapshot (n4): if another first start's keys.json appears in this
+  // same window (two racing first starts), it is used as the existing keys file below instead of a false refusal.
+  // keys.json is checked again after the folder read, since the other start may write it while that read runs.
+  if (!fileSystem.existsSync(paths.keysPath) && homeIsDirectory() && !isNewBuyerHome(paths.home, fileSystem) && !fileSystem.existsSync(paths.keysPath)) {
+    // safeToPrint (n1): the CLI's init catch shows this exact, pre-approved text unredacted; every other error
+    // there — an unreadable keys.json, an unsafe directory, a filesystem failure — still goes through its redactor.
+    throw Object.assign(new Error(`${paths.home} holds kit files but no keys.json, so no new keys were created. Restore keys.json from your backup, or use a new, empty folder for a new kit.`), { safeToPrint: true })
+  }
   safeMkdir(paths.home, fileSystem); safeMkdir(paths.swapsDir, fileSystem); safeMkdir(paths.settlementDir, fileSystem); safeMkdir(paths.withdrawalsDir, fileSystem)
+  // An existing partial/unreadable file is evidence of an interrupted or
+  // damaged initialization.  Regenerating would silently orphan its address.
+  const assertExistingKeys = (): void => assertReadableBuyerKeys(JSON.parse(fileSystem === fs ? secureFileText(paths.keysPath) : fileSystem.readFileSync(paths.keysPath, 'utf8')))
   if (!fileSystem.existsSync(paths.keysPath)) {
     const evmPrivateKey = generatePrivateKey()
     const keys: BuyerKeys = { identityWif: PrivateKey.fromRandom().toWif(), evmPrivateKey, bsvWif: PrivateKey.fromRandom().toWif() }
-    writeNew(paths.keysPath, keys, 0o600, fileSystem)
+    try {
+      writeNew(paths.keysPath, keys, 0o600, fileSystem)
+    } catch (error) {
+      // Another first start wrote keys.json after the check above: its keys are this kit's, never overwritten.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      assertExistingKeys()
+    }
   } else {
-    // An existing partial/unreadable file is evidence of an interrupted or
-    // damaged initialization.  Regenerating would silently orphan its address.
-    assertReadableBuyerKeys(JSON.parse(fileSystem === fs ? secureFileText(paths.keysPath) : fileSystem.readFileSync(paths.keysPath, 'utf8')))
+    assertExistingKeys()
   }
   if (!fileSystem.existsSync(paths.configPath)) writeNew(paths.configPath, {
     doorIdentity: RELEASED_DOOR_IDENTITY, baseRpcUrls: [...DEFAULT_BUYER_BASE_RPC_URLS],
@@ -129,7 +181,10 @@ export function buyerAddresses(keys: BuyerKeys): { baseAddress: string; bsvAddre
 }
 /** 0600 JSON store.  A replacement is durable only after its file and containing directory are fsynced. */
 export function makeFileBuyerStore(paths: BuyerHome): BuyerStore {
-  safeMkdir(paths.home); safeMkdir(paths.swapsDir); safeMkdir(paths.settlementDir)
+  // m1: a read-only caller (status, run before setup) must never create kit state in a folder with no keys.json —
+  // doing so left it holding 2 of the 3 kit subfolders, which isNewBuyerHome's one rule then read as "not new" and
+  // refused a later init. Once keys.json exists, these are created/repaired exactly as before.
+  if (fs.existsSync(paths.keysPath)) { safeMkdir(paths.home); safeMkdir(paths.swapsDir); safeMkdir(paths.settlementDir) }
   const file = (id: string): string => { if (!/^[0-9a-f]{32}$/.test(id)) throw new Error('invalid swap id'); return join(paths.swapsDir, `${id}.json`) }
   const decode = (source: string): BuyerSwapRecord => {
     const record = JSON.parse(source) as BuyerSwapRecord
@@ -186,7 +241,13 @@ export function makeFileBuyerStore(paths: BuyerHome): BuyerStore {
     return record
   }
   return {
-    async list() { return fs.readdirSync(paths.swapsDir).filter((x) => x.endsWith('.json')).map((x) => decode(secureFileText(join(paths.swapsDir, x)))) },
+    // m1: swapsDir may not exist yet (status, run before setup, no longer creates it) — nothing listed there yet,
+    // the same ENOENT-tolerant shape listBuyerWithdrawalIntents already uses for withdrawalsDir.
+    async list() {
+      let names: string[]
+      try { names = fs.readdirSync(paths.swapsDir) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
+      return names.filter((x) => x.endsWith('.json')).map((x) => decode(secureFileText(join(paths.swapsDir, x))))
+    },
     async get(id) { const path = file(id); return fs.existsSync(path) ? decode(secureFileText(path)) : undefined },
     async put(record) {
       const path = file(record.swapId)

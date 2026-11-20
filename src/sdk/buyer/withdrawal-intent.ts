@@ -143,7 +143,9 @@ export function makeBuyerWithdrawalIntents(paths: BuyerHome, rails: BuyerWithdra
     const text = [typeof value.shortMessage === 'string' ? ` shortMessage=${value.shortMessage}` : '', typeof value.details === 'string' ? ` details=${value.details}` : ''].join('')
     return (`${name}${code}${text}`).replace(/[\r\n]+/g, ' ').replace(/0x[0-9a-f]+/gi, (hex) => hex.length > 66 ? '0x…' : hex).slice(0, 300)
   }
-  const nonceWarning = (hash: string): Error => new Error(`a previous Base withdrawal (${hash}) used its nonce but its receipt was not found, so it may have been paid; check ${hash} on a Base block explorer, then run \`npx petasats-mcp withdrawal ${hash} sent\` or \`npx petasats-mcp withdrawal ${hash} not-sent\`; nothing new was sent`)
+  // Marked here, the one place this is thrown from, so every caller (startCancel, reconcile) carries the mark: only
+  // `npx petasats-mcp withdrawal <hash> sent|not-sent` can clear this, so close.ts must never brief-retry it.
+  const nonceWarning = (hash: string): Error => Object.assign(new Error(`a previous Base withdrawal (${hash}) used its nonce but its receipt was not found, so it may have been paid; check ${hash} on a Base block explorer, then run \`npx petasats-mcp withdrawal ${hash} sent\` or \`npx petasats-mcp withdrawal ${hash} not-sent\`; nothing new was sent`), { needsOperator: true })
   const latestCancel = (record: BuyerWithdrawalRecord): BuyerWithdrawalCancel | undefined => record.cancels?.[record.cancels.length - 1]
   const beingCancelled = (record: BuyerWithdrawalRecord, cancelHash = latestCancel(record)?.hash): Error => new Error(`the previous Base withdrawal ${record.hash} is being cancelled at its nonce (cancellation ${cancelHash ?? 'not yet confirmed'}). Try again after the cancellation is final on Base. Nothing new was sent.`)
   const cancelResultMessage = (record: BuyerWithdrawalRecord, result: BuyerWithdrawalCancelResult): Error => {

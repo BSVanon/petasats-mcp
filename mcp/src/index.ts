@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 /** PetaSats buyer-kit MCP entrypoint. Stdio stays available even before setup is complete. */
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { existsSync, realpathSync } from 'fs'
+import { realpathSync } from 'fs'
 import { fileURLToPath } from 'url'
-import { type BuyerHome, type BuyerKit, buyerAddresses, buyerHome, DOOR_IDENTITY_PLACEHOLDER, createBuyerRuntime, initialiseBuyerHome, listBuyerWithdrawalIntents, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, readBuyerLimits, resolveBuyerWithdrawalIntent, resumeSpending } from 'petasats/sdk'
+import { type BuyerHome, type BuyerKit, type CloseKitRequest, type CloseKitStep, buyerAddresses, buyerHome, closeKitStep, DOOR_IDENTITY_PLACEHOLDER, createBuyerRuntime, initialiseBuyerHome, isNewBuyerHome, listBuyerWithdrawalIntents, makeFileBuyerStore, readBuyerConfig, readBuyerKeys, readBuyerLimits, resolveBuyerWithdrawalIntent, resumeSpending } from 'petasats/sdk'
 import { createPetaSatsMcpServer, handleToolCall, TOOLS } from './server.js'
 import { supportedPairs, parseAsset } from './assets.js'
-import { isHostedCopy } from './hosted.js'
+import { HOSTED_TOOL_REFUSAL, isHostedCopy } from './hosted.js'
+import { closeStepWithGasHint } from './gas-tool.js'
 
 const terminal = new Set(['delivered', 'refunded', 'failed'])
 
 function unavailableKit(message: string): BuyerKit {
   const unavailable = async (): Promise<never> => { throw new Error(message) }
-  return { quote: unavailable, convert: unavailable, startSwap: unavailable, status: unavailable, recover: unavailable, withdrawBsv: unavailable, withdrawBase: unavailable, walletInfo: unavailable }
+  return { quote: unavailable, convert: unavailable, startSwap: unavailable, status: unavailable, recover: unavailable, withdrawBsv: unavailable, withdrawBase: unavailable, walletInfo: unavailable, assertWithdrawDestinations: unavailable, buyGas: unavailable }
 }
 
 function safeMessage(error: unknown): string {
@@ -44,7 +45,7 @@ function actionable(rows: Awaited<ReturnType<BuyerKit['status']>>): boolean {
 async function smoke(): Promise<void> {
   const unavailable = unavailableKit('buyer home is not initialised; run `petasats-mcp init` first')
   const checks: Array<{ name: string; ok: boolean; detail: string }> = []
-  checks.push({ name: 'tools_registered', ok: TOOLS.length === 10, detail: `${TOOLS.length} tools` })
+  checks.push({ name: 'tools_registered', ok: TOOLS.length === 12, detail: `${TOOLS.length} tools` })
   checks.push({ name: 'supported_pairs', ok: supportedPairs().length === 1, detail: 'one phase-1 pair' })
   let parseOk = false
   try { parseAsset('USDC'); parseAsset('BSV'); parseAsset(`bsv21:${'a'.repeat(64)}_0`); try { parseAsset('NOPE') } catch { parseOk = true } } catch { /* failed */ }
@@ -77,6 +78,41 @@ function timeoutArg(args: string[]): number {
   return value
 }
 
+/** Exactly base_address and bsv_address, in that order; any other count is a usage error, not a refusal. */
+export function closeArgs(args: string[]): CloseKitRequest | undefined {
+  return args.length === 2 ? { baseAddress: args[0], bsvAddress: args[1] } : undefined
+}
+
+/**
+ * The `close` CLI loop, factored so tests can inject a fake step function and a fast sleep. A refusal that carries
+ * retry_after_seconds (a brief failure) is tried again until the 3-hour deadline; any other refusal ends the loop, and
+ * its reason is printed once, as the output.
+ */
+export async function closeCommandLoop(
+  step: (request: CloseKitRequest) => Promise<CloseKitStep>,
+  request: CloseKitRequest,
+  opts: { sleep?: (ms: number) => Promise<void>; log?: (line: string) => void; now?: () => number } = {},
+): Promise<{ exitCode: number; output: string }> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const log = opts.log ?? ((line: string) => console.error(`[petasats-mcp] ${line}`))
+  const now = opts.now ?? Date.now
+  const deadline = now() + 3 * 60 * 60 * 1000
+  for (;;) {
+    const result = closeStepWithGasHint(await step(request))
+    if (result.state === 'closed') return { exitCode: 0, output: JSON.stringify(result, null, 2) }
+    if (result.state === 'refused') {
+      if (result.retry_after_seconds === undefined || now() >= deadline) return { exitCode: 1, output: result.reason }
+      const wait = Math.min(300, result.retry_after_seconds)
+      log(`refused for now: ${result.reason}; trying again in ${wait} seconds`)
+      await sleep(wait * 1000)
+      continue
+    }
+    log(`in_progress: ${result.did}; next: ${result.next}`)
+    if (now() >= deadline) return { exitCode: 2, output: 'still closing; run the same command again' }
+    await sleep(Math.min(300, result.call_again_after_seconds) * 1000)
+  }
+}
+
 /** Public-only setup result. Keep this small: CLI output must never expose local keys. */
 export function initResult(home: BuyerHome): Record<string, unknown> {
   const addresses = buyerAddresses(readBuyerKeys(home))
@@ -89,7 +125,7 @@ export function initResult(home: BuyerHome): Record<string, unknown> {
     // Absolute paths: desktop AI apps often start servers without the shell's PATH.
     mcp: { command: process.execPath, args: [fileURLToPath(import.meta.url)] },
     next: configured
-      ? 'fund the Base address with USDC plus a little ETH for gas, then connect your AI app'
+      ? 'fund the Base address with USDC (ETH for gas is optional; the kit can buy its own with 0.50 USDC), then connect your AI app'
       : 'set config.json doorIdentity before using money tools',
   }
 }
@@ -131,7 +167,17 @@ async function main(): Promise<void> {
   const command = process.argv[2]
   if (process.argv.includes('--smoke')) return smoke()
   if (command === 'init') {
-    const home = initialiseBuyerHome()
+    let home: BuyerHome
+    try { home = initialiseBuyerHome() } catch (error) {
+      // Reported the way any other error is: the same prefix and exit code as the catch-all below. Only the one
+      // approved not-new-folder refusal (marked safeToPrint at its single throw site) is safe to show verbatim; an
+      // unreadable or invalid keys.json, an unsafe directory, or a filesystem failure here still goes through the
+      // same redacting catch-all every other fatal error does (n1).
+      const approved = typeof error === 'object' && error !== null && (error as { safeToPrint?: unknown }).safeToPrint === true
+      console.error(`[petasats-mcp] Fatal: ${approved ? (error as Error).message : safeMessage(error)}`)
+      process.exitCode = 1
+      return
+    }
     console.log(JSON.stringify(initResult(home)))
     return
   }
@@ -155,10 +201,18 @@ async function main(): Promise<void> {
     console.log(await withdrawalOutput(process.argv[3] ?? '', process.argv[4] ?? ''))
     return
   }
+  // Checked here, before createBuyerRuntime, so a shared-server copy or a wrong argument count never creates a new
+  // wallet on a fresh machine. A shared-server copy refuses close as the close_kit tool does.
+  let closeRequest: CloseKitRequest | undefined
+  if (command === 'close') {
+    if (isHostedCopy()) { console.log(HOSTED_TOOL_REFUSAL); process.exitCode = 1; return }
+    closeRequest = closeArgs(process.argv.slice(3))
+    if (!closeRequest) { console.error('usage: npx petasats-mcp close <base_address> <bsv_address>'); process.exitCode = 2; return }
+  }
   let runtime: Awaited<ReturnType<typeof createBuyerRuntime>> | undefined
   let unavailable: string | undefined
   const defaultHome = buyerHome()
-  const newWallet = !existsSync(defaultHome.home)
+  const newWallet = isNewKitFolder(defaultHome.home)
   if (newWallet) {
     initialiseBuyerHome(defaultHome.home)
     console.error(`[petasats-mcp] created new buyer home at ${defaultHome.home}`)
@@ -171,12 +225,33 @@ async function main(): Promise<void> {
     process.exitCode = result.timedOut ? 2 : 0
     return
   }
+  if (command === 'close') {
+    if (!closeRequest) throw new Error('unreachable: usage was already checked above')
+    if (!runtime) throw new Error(unavailable)
+    const session = runtime
+    const result = await closeCommandLoop((req) => closeKitStep({ kit: session.kit, paths: session.paths }, req), closeRequest)
+    console.log(result.output)
+    process.exitCode = result.exitCode
+    return
+  }
   const kit = runtime?.kit ?? unavailableKit(unavailable ?? 'buyer runtime is unavailable')
   const hosted = isHostedCopy()
-  const server = createPetaSatsMcpServer({ petasats: kit, doorIdentity: runtime?.config.doorIdentity, hosted })
+  const session = runtime
+  const closeKit = session ? (request: CloseKitRequest) => closeKitStep({ kit: session.kit, paths: session.paths }, request) : undefined
+  const server = createPetaSatsMcpServer({ petasats: kit, doorIdentity: runtime?.config.doorIdentity, hosted, closeKit })
   if (!hosted) startBackgroundRecovery(kit)
   await server.connect(new StdioServerTransport())
   console.error(hosted ? '[petasats-mcp] running on stdio in quote-only mode (shared server); key and money tools are refused' : runtime ? '[petasats-mcp] running on stdio' : `[petasats-mcp] running on stdio; money tools unavailable: ${unavailable}`)
+}
+
+/**
+ * A thin wrapper over the SDK's one shared rule (local-state.ts's isNewBuyerHome), so the automatic first start and
+ * the explicit `init` command agree: a kit folder that is missing, or exists but is empty (.DS_Store and the kit's
+ * own empty subfolders aside), gets a new wallet. A folder with any other entry is never treated as new, so a
+ * folder that lost its keys.json but keeps swap records is not given fresh keys.
+ */
+export function isNewKitFolder(home: string): boolean {
+  return isNewBuyerHome(home)
 }
 
 /** npm installs the bin as a symlink (POSIX) while import.meta.url is the real path; compare real paths. */

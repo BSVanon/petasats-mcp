@@ -16,7 +16,8 @@ function recordingKit(calls: string[]): BuyerKit {
     recover: async () => { calls.push('recover'); return [] },
     withdrawBsv: async () => { calls.push('withdrawBsv'); return { sats: 0n } },
     withdrawBase: async () => { calls.push('withdrawBase'); return { asset: 'USDC', amount: 1n, to: '0x1111111111111111111111111111111111111111', txid: '0xtx', status: 'success' } },
-    walletInfo: async () => { calls.push('walletInfo'); return { baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, capUsdPerSwap: 100 } },
+    walletInfo: async () => { calls.push('walletInfo'); return { baseAddress: '0xabc', bsvAddress: '1BoatSLRHtKNngkdXEeobR76b53LETtpyT', usdc: 1n, eth: 1n, claimedBsvSats: 0n, unconfirmedBsvSats: 0n, capUsdPerSwap: 100 } },
+    assertWithdrawDestinations: async () => {},
   }
 }
 

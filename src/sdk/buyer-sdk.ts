@@ -4,7 +4,7 @@ export * from './buyer/types'
 export { createBuyerKit } from './buyer/buyer-kit'
 export {
   DOOR_IDENTITY_PLACEHOLDER, RELEASED_DOOR_IDENTITY, buyerAddresses, buyerHome, type BuyerHome,
-  initialiseBuyerHome, makeFileBuyerStore, readBuyerConfig, readBuyerKeys,
+  initialiseBuyerHome, isNewBuyerHome, makeFileBuyerStore, readBuyerConfig, readBuyerKeys,
 } from './buyer/local-state'
 export { createBuyerRuntime } from './buyer/runtime/runtime'
 export { assertBuyerMainnetP2pkhAddress } from './buyer/runtime/address'
@@ -19,3 +19,5 @@ export { mapDoorDecline, DoorDeclineError } from './buyer/door-client'
 export { readBuyerLimits } from './buyer/limits'
 export { resumeSpending } from './buyer/stop'
 export { listBuyerWithdrawalIntents, resolveBuyerWithdrawalIntent } from './buyer/withdrawal-intent'
+export { CLOSED_STOP_REASON, closeKitStep, type CloseKitRequest, type CloseKitStep, type CloseSend } from './buyer/close'
+export { BUY_GAS_HINT } from './buyer/gas-topup-state'

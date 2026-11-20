@@ -1801,12 +1801,28 @@
       "format": "esm"
     },
     "src/sdk/buyer/types.ts": {
-      "bytes": 11810,
+      "bytes": 14764,
       "imports": [
         {
           "path": "src/bridge/initiator-outcomes.ts",
           "kind": "import-statement",
           "original": "../../bridge/initiator-outcomes"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/bridge/atomic-record-write.ts": {
+      "bytes": 7057,
+      "imports": [
+        {
+          "path": "fs",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "path",
+          "kind": "import-statement",
+          "external": true
         }
       ],
       "format": "esm"
@@ -12522,22 +12538,6 @@
           "path": "node_modules/viem/_esm/utils/unit/parseUnits.js",
           "kind": "import-statement",
           "original": "./utils/unit/parseUnits.js"
-        }
-      ],
-      "format": "esm"
-    },
-    "src/bridge/atomic-record-write.ts": {
-      "bytes": 7057,
-      "imports": [
-        {
-          "path": "fs",
-          "kind": "import-statement",
-          "external": true
-        },
-        {
-          "path": "path",
-          "kind": "import-statement",
-          "external": true
         }
       ],
       "format": "esm"
@@ -39236,8 +39236,66 @@
       ],
       "format": "esm"
     },
+    "src/sdk/buyer/runtime/address.ts": {
+      "bytes": 1350,
+      "imports": [
+        {
+          "path": "crypto",
+          "kind": "import-statement",
+          "external": true
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/limits.ts": {
+      "bytes": 4418,
+      "imports": [
+        {
+          "path": "fs",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "node_modules/viem/_esm/index.js",
+          "kind": "import-statement",
+          "original": "viem"
+        },
+        {
+          "path": "src/sdk/buyer/runtime/address.ts",
+          "kind": "import-statement",
+          "original": "./runtime/address"
+        },
+        {
+          "path": "src/sdk/buyer/local-state.ts",
+          "kind": "import-statement",
+          "original": "./local-state"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/withdraw-destination.ts": {
+      "bytes": 1979,
+      "imports": [
+        {
+          "path": "node_modules/viem/_esm/index.js",
+          "kind": "import-statement",
+          "original": "viem"
+        },
+        {
+          "path": "src/sdk/buyer/runtime/address.ts",
+          "kind": "import-statement",
+          "original": "./runtime/address"
+        },
+        {
+          "path": "src/sdk/buyer/limits.ts",
+          "kind": "import-statement",
+          "original": "./limits"
+        }
+      ],
+      "format": "esm"
+    },
     "src/sdk/buyer/runtime/evm-rails.ts": {
-      "bytes": 3950,
+      "bytes": 4846,
       "imports": [
         {
           "path": "node_modules/viem/_esm/index.js",
@@ -39258,12 +39316,17 @@
           "path": "src/bridge/evm/tip-floor.ts",
           "kind": "import-statement",
           "original": "../../../bridge/evm/tip-floor"
+        },
+        {
+          "path": "src/sdk/buyer/withdraw-destination.ts",
+          "kind": "import-statement",
+          "original": "../withdraw-destination"
         }
       ],
       "format": "esm"
     },
     "src/sdk/buyer/local-state.ts": {
-      "bytes": 14413,
+      "bytes": 18987,
       "imports": [
         {
           "path": "fs",
@@ -39304,7 +39367,7 @@
       "format": "esm"
     },
     "src/sdk/buyer/withdrawal-intent.ts": {
-      "bytes": 22229,
+      "bytes": 22497,
       "imports": [
         {
           "path": "fs",
@@ -40195,43 +40258,6 @@
       ],
       "format": "esm"
     },
-    "src/sdk/buyer/runtime/address.ts": {
-      "bytes": 1350,
-      "imports": [
-        {
-          "path": "crypto",
-          "kind": "import-statement",
-          "external": true
-        }
-      ],
-      "format": "esm"
-    },
-    "src/sdk/buyer/limits.ts": {
-      "bytes": 4418,
-      "imports": [
-        {
-          "path": "fs",
-          "kind": "import-statement",
-          "external": true
-        },
-        {
-          "path": "node_modules/viem/_esm/index.js",
-          "kind": "import-statement",
-          "original": "viem"
-        },
-        {
-          "path": "src/sdk/buyer/runtime/address.ts",
-          "kind": "import-statement",
-          "original": "./runtime/address"
-        },
-        {
-          "path": "src/sdk/buyer/local-state.ts",
-          "kind": "import-statement",
-          "original": "./local-state"
-        }
-      ],
-      "format": "esm"
-    },
     "src/sdk/buyer/delivery.ts": {
       "bytes": 11373,
       "imports": [
@@ -40332,18 +40358,76 @@
       ],
       "format": "esm"
     },
+    "src/bridge/evm/base-tokens.ts": {
+      "bytes": 213,
+      "imports": [],
+      "format": "esm"
+    },
+    "src/sdk/buyer/gas-topup-order.ts": {
+      "bytes": 13428,
+      "imports": [
+        {
+          "path": "node_modules/viem/_esm/index.js",
+          "kind": "import-statement",
+          "original": "viem"
+        },
+        {
+          "path": "src/bridge/evm/base-tokens.ts",
+          "kind": "import-statement",
+          "original": "../../bridge/evm/base-tokens"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/gas-topup-state.ts": {
+      "bytes": 8922,
+      "imports": [
+        {
+          "path": "fs",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "path",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "src/bridge/atomic-record-write.ts",
+          "kind": "import-statement",
+          "original": "../../bridge/atomic-record-write"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-order.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-order"
+        },
+        {
+          "path": "src/sdk/buyer/local-state.ts",
+          "kind": "import-statement",
+          "original": "./local-state"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/gas-topup-guard.ts": {
+      "bytes": 3236,
+      "imports": [
+        {
+          "path": "src/sdk/buyer/withdrawal-intent.ts",
+          "kind": "import-statement",
+          "original": "./withdrawal-intent"
+        }
+      ],
+      "format": "esm"
+    },
     "src/sdk/buyer/buyer-kit.ts": {
-      "bytes": 34419,
+      "bytes": 35895,
       "imports": [
         {
           "path": "crypto",
           "kind": "import-statement",
           "external": true
-        },
-        {
-          "path": "node_modules/viem/_esm/index.js",
-          "kind": "import-statement",
-          "original": "viem"
         },
         {
           "path": "src/sdk/convert.ts",
@@ -40376,6 +40460,11 @@
           "original": "./limits"
         },
         {
+          "path": "src/sdk/buyer/withdraw-destination.ts",
+          "kind": "import-statement",
+          "original": "./withdraw-destination"
+        },
+        {
           "path": "src/sdk/buyer/delivery.ts",
           "kind": "import-statement",
           "original": "./delivery"
@@ -40389,13 +40478,18 @@
           "path": "src/sdk/buyer/door-retry.ts",
           "kind": "import-statement",
           "original": "./door-retry"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-state.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-state"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-guard.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-guard"
         }
       ],
-      "format": "esm"
-    },
-    "src/bridge/evm/base-tokens.ts": {
-      "bytes": 213,
-      "imports": [],
       "format": "esm"
     },
     "src/transport/anvil-messagebox-comms.ts": {
@@ -40645,8 +40739,39 @@
       ],
       "format": "esm"
     },
+    "src/sdk/buyer/close-record.ts": {
+      "bytes": 9265,
+      "imports": [
+        {
+          "path": "fs",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "path",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "src/bridge/atomic-record-write.ts",
+          "kind": "import-statement",
+          "original": "../../bridge/atomic-record-write"
+        },
+        {
+          "path": "src/sdk/buyer/local-state.ts",
+          "kind": "import-statement",
+          "original": "./local-state"
+        },
+        {
+          "path": "src/sdk/buyer/withdrawal-intent.ts",
+          "kind": "import-statement",
+          "original": "./withdrawal-intent"
+        }
+      ],
+      "format": "esm"
+    },
     "src/sdk/buyer/stop.ts": {
-      "bytes": 3154,
+      "bytes": 3455,
       "imports": [
         {
           "path": "fs",
@@ -40657,6 +40782,11 @@
           "path": "src/bridge/atomic-record-write.ts",
           "kind": "import-statement",
           "original": "../../bridge/atomic-record-write"
+        },
+        {
+          "path": "src/sdk/buyer/close-record.ts",
+          "kind": "import-statement",
+          "original": "./close-record"
         },
         {
           "path": "src/sdk/buyer/local-state.ts",
@@ -40671,8 +40801,81 @@
       "imports": [],
       "format": "esm"
     },
+    "src/sdk/buyer/gas-topup-api.ts": {
+      "bytes": 6912,
+      "imports": [
+        {
+          "path": "src/sdk/buyer/gas-topup-order.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-order"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/gas-topup.ts": {
+      "bytes": 19844,
+      "imports": [
+        {
+          "path": "src/sdk/buyer/gas-topup-api.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-api"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-order.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-order"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-state.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-state"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/runtime/gas-topup-rails.ts": {
+      "bytes": 3435,
+      "imports": [
+        {
+          "path": "node_modules/viem/_esm/index.js",
+          "kind": "import-statement",
+          "original": "viem"
+        },
+        {
+          "path": "node_modules/viem/_esm/accounts/index.js",
+          "kind": "import-statement",
+          "original": "viem/accounts"
+        },
+        {
+          "path": "src/bridge/evm/base-tokens.ts",
+          "kind": "import-statement",
+          "original": "../../../bridge/evm/base-tokens"
+        },
+        {
+          "path": "src/bridge/evm/tip-floor.ts",
+          "kind": "import-statement",
+          "original": "../../../bridge/evm/tip-floor"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-api.ts",
+          "kind": "import-statement",
+          "original": "../gas-topup-api"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-order.ts",
+          "kind": "import-statement",
+          "original": "../gas-topup-order"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup.ts",
+          "kind": "import-statement",
+          "original": "../gas-topup"
+        }
+      ],
+      "format": "esm"
+    },
     "src/sdk/buyer/runtime/runtime.ts": {
-      "bytes": 12660,
+      "bytes": 13213,
       "imports": [
         {
           "path": "fs",
@@ -40773,6 +40976,11 @@
           "path": "src/sdk/buyer/runtime/log-throttle.ts",
           "kind": "import-statement",
           "original": "./log-throttle"
+        },
+        {
+          "path": "src/sdk/buyer/runtime/gas-topup-rails.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-rails"
         }
       ],
       "format": "esm"
@@ -40803,8 +41011,55 @@
       ],
       "format": "esm"
     },
+    "src/sdk/buyer/close-gas.ts": {
+      "bytes": 1917,
+      "imports": [
+        {
+          "path": "src/sdk/buyer/gas-topup-state.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-state"
+        }
+      ],
+      "format": "esm"
+    },
+    "src/sdk/buyer/close.ts": {
+      "bytes": 25300,
+      "imports": [
+        {
+          "path": "node_modules/viem/_esm/index.js",
+          "kind": "import-statement",
+          "original": "viem"
+        },
+        {
+          "path": "src/sdk/buyer/runtime/address.ts",
+          "kind": "import-statement",
+          "original": "./runtime/address"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-state.ts",
+          "kind": "import-statement",
+          "original": "./gas-topup-state"
+        },
+        {
+          "path": "src/sdk/buyer/close-gas.ts",
+          "kind": "import-statement",
+          "original": "./close-gas"
+        },
+        {
+          "path": "src/sdk/buyer/stop.ts",
+          "kind": "import-statement",
+          "original": "./stop"
+        },
+        {
+          "path": "src/sdk/buyer/close-record.ts",
+          "kind": "import-statement",
+          "original": "./close-record"
+        }
+      ],
+      "format": "esm"
+    },
     "src/sdk/buyer-sdk.ts": {
-      "bytes": 1188,
+      "bytes": 1381,
       "imports": [
         {
           "path": "src/sdk/convert.ts",
@@ -40870,6 +41125,16 @@
           "path": "src/sdk/buyer/withdrawal-intent.ts",
           "kind": "import-statement",
           "original": "./buyer/withdrawal-intent"
+        },
+        {
+          "path": "src/sdk/buyer/close.ts",
+          "kind": "import-statement",
+          "original": "./buyer/close"
+        },
+        {
+          "path": "src/sdk/buyer/gas-topup-state.ts",
+          "kind": "import-statement",
+          "original": "./buyer/gas-topup-state"
         }
       ],
       "format": "esm"
@@ -43542,8 +43807,56 @@
       "imports": [],
       "format": "esm"
     },
+    "mcp/src/hosted.ts": {
+      "bytes": 1175,
+      "imports": [
+        {
+          "path": "mcp/src/validate.ts",
+          "kind": "import-statement",
+          "original": "./validate.js"
+        },
+        {
+          "path": "mcp/src/version.ts",
+          "kind": "import-statement",
+          "original": "./version.js"
+        }
+      ],
+      "format": "esm"
+    },
+    "mcp/src/close-tool.ts": {
+      "bytes": 2944,
+      "imports": [
+        {
+          "path": "src/sdk/buyer-sdk.ts",
+          "kind": "import-statement",
+          "original": "petasats/sdk"
+        },
+        {
+          "path": "mcp/src/validate.ts",
+          "kind": "import-statement",
+          "original": "./validate.js"
+        }
+      ],
+      "format": "esm"
+    },
+    "mcp/src/gas-tool.ts": {
+      "bytes": 3121,
+      "imports": [
+        {
+          "path": "src/sdk/buyer-sdk.ts",
+          "kind": "import-statement",
+          "original": "petasats/sdk"
+        },
+        {
+          "path": "mcp/src/validate.ts",
+          "kind": "import-statement",
+          "original": "./validate.js"
+        }
+      ],
+      "format": "esm"
+    },
     "mcp/src/server.ts": {
-      "bytes": 31546,
+      "bytes": 33841,
       "imports": [
         {
           "path": "node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js",
@@ -43571,6 +43884,21 @@
           "original": "./assets.js"
         },
         {
+          "path": "mcp/src/hosted.ts",
+          "kind": "import-statement",
+          "original": "./hosted.js"
+        },
+        {
+          "path": "mcp/src/close-tool.ts",
+          "kind": "import-statement",
+          "original": "./close-tool.js"
+        },
+        {
+          "path": "mcp/src/gas-tool.ts",
+          "kind": "import-statement",
+          "original": "./gas-tool.js"
+        },
+        {
           "path": "mcp/src/version.ts",
           "kind": "import-statement",
           "original": "./version.js"
@@ -43579,7 +43907,7 @@
       "format": "esm"
     },
     "mcp/src/index.ts": {
-      "bytes": 9914,
+      "bytes": 14646,
       "imports": [
         {
           "path": "node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js",
@@ -43610,6 +43938,16 @@
           "path": "mcp/src/assets.ts",
           "kind": "import-statement",
           "original": "./assets.js"
+        },
+        {
+          "path": "mcp/src/hosted.ts",
+          "kind": "import-statement",
+          "original": "./hosted.js"
+        },
+        {
+          "path": "mcp/src/gas-tool.ts",
+          "kind": "import-statement",
+          "original": "./gas-tool.js"
         }
       ],
       "format": "esm"
@@ -43724,6 +44062,16 @@
           "external": true
         },
         {
+          "path": "crypto",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "fs",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
           "path": "node:crypto",
           "kind": "import-statement",
           "external": true
@@ -43769,7 +44117,7 @@
           "external": true
         },
         {
-          "path": "crypto",
+          "path": "path",
           "kind": "import-statement",
           "external": true
         },
@@ -43797,11 +44145,24 @@
           "path": "fs",
           "kind": "import-statement",
           "external": true
+        },
+        {
+          "path": "fs",
+          "kind": "import-statement",
+          "external": true
+        },
+        {
+          "path": "path",
+          "kind": "import-statement",
+          "external": true
         }
       ],
       "exports": [
+        "closeArgs",
+        "closeCommandLoop",
         "initResult",
         "isMainModule",
+        "isNewKitFolder",
         "limitsOutput",
         "resumeOutput",
         "startBackgroundRecovery",
@@ -44754,13 +45115,13 @@
           "bytesInOutput": 1382
         },
         "node_modules/@bsv/wallet-toolbox-client/out/src/signer/methods/buildSignableTransaction.js": {
-          "bytesInOutput": 5731
+          "bytesInOutput": 5741
         },
         "node_modules/@bsv/wallet-toolbox-client/out/src/signer/methods/completeSignedTransaction.js": {
           "bytesInOutput": 4551
         },
         "node_modules/@bsv/wallet-toolbox-client/out/src/signer/methods/createAction.js": {
-          "bytesInOutput": 5128
+          "bytesInOutput": 5146
         },
         "node_modules/@bsv/wallet-toolbox-client/out/src/signer/methods/signAction.js": {
           "bytesInOutput": 2188
@@ -45132,7 +45493,7 @@
           "bytesInOutput": 6012
         },
         "node_modules/@bsv/wallet-toolbox-client/out/src/WalletPermissionsManager.js": {
-          "bytesInOutput": 158825
+          "bytesInOutput": 158833
         },
         "node_modules/@bsv/wallet-toolbox-client/out/src/index.client.js": {
           "bytesInOutput": 3147
@@ -45426,7 +45787,7 @@
           "bytesInOutput": 1074
         },
         "mcp/src/index.ts": {
-          "bytesInOutput": 8361
+          "bytesInOutput": 11103
         },
         "src/sdk/convert.ts": {
           "bytesInOutput": 290
@@ -45441,10 +45802,16 @@
           "bytesInOutput": 0
         },
         "src/sdk/buyer/buyer-kit.ts": {
-          "bytesInOutput": 28264
+          "bytesInOutput": 29510
+        },
+        "src/sdk/buyer/withdrawal-intent.ts": {
+          "bytesInOutput": 18822
+        },
+        "src/bridge/atomic-record-write.ts": {
+          "bytesInOutput": 3883
         },
         "node_modules/viem/_esm/index.js": {
-          "bytesInOutput": 200
+          "bytesInOutput": 216
         },
         "node_modules/viem/_esm/utils/getAction.js": {
           "bytesInOutput": 329
@@ -45957,10 +46324,10 @@
           "bytesInOutput": 628
         },
         "node_modules/viem/_esm/actions/token/approve.js": {
-          "bytesInOutput": 1512
+          "bytesInOutput": 1522
         },
         "node_modules/viem/_esm/actions/token/internal.js": {
-          "bytesInOutput": 3432
+          "bytesInOutput": 3451
         },
         "node_modules/viem/_esm/actions/token/index.js": {
           "bytesInOutput": 0
@@ -45975,25 +46342,25 @@
           "bytesInOutput": 154
         },
         "node_modules/viem/_esm/actions/token/approveSync.js": {
-          "bytesInOutput": 553
+          "bytesInOutput": 563
         },
         "node_modules/viem/_esm/actions/token/getAllowance.js": {
-          "bytesInOutput": 741
+          "bytesInOutput": 743
         },
         "node_modules/viem/_esm/actions/token/getBalance.js": {
-          "bytesInOutput": 1013
+          "bytesInOutput": 1015
         },
         "node_modules/viem/_esm/actions/token/getMetadata.js": {
           "bytesInOutput": 781
         },
         "node_modules/viem/_esm/actions/token/getTotalSupply.js": {
-          "bytesInOutput": 693
+          "bytesInOutput": 695
         },
         "node_modules/viem/_esm/actions/token/transfer.js": {
-          "bytesInOutput": 1703
+          "bytesInOutput": 1713
         },
         "node_modules/viem/_esm/actions/token/transferSync.js": {
-          "bytesInOutput": 556
+          "bytesInOutput": 566
         },
         "node_modules/viem/_esm/clients/createPublicClient.js": {
           "bytesInOutput": 249
@@ -46070,17 +46437,11 @@
         "node_modules/viem/_esm/utils/signature/recoverTransactionAddress.js": {
           "bytesInOutput": 591
         },
-        "src/sdk/buyer/withdrawal-intent.ts": {
-          "bytesInOutput": 18782
-        },
-        "src/bridge/atomic-record-write.ts": {
-          "bytesInOutput": 3883
-        },
         "src/bridge/evm/lookup-refusal.ts": {
           "bytesInOutput": 2860
         },
         "src/sdk/buyer/local-state.ts": {
-          "bytesInOutput": 10652
+          "bytesInOutput": 12944
         },
         "node_modules/@bsv/sdk/dist/esm/src/primitives/BigNumber.js": {
           "bytesInOutput": 47799
@@ -46461,7 +46822,7 @@
           "bytesInOutput": 0
         },
         "src/bridge/evm/erc20swap.ts": {
-          "bytesInOutput": 3770
+          "bytesInOutput": 3772
         },
         "src/bridge/evm/resolution-event.ts": {
           "bytesInOutput": 6829
@@ -46473,13 +46834,22 @@
           "bytesInOutput": 3965
         },
         "src/bridge/evm/client.ts": {
-          "bytesInOutput": 51931
+          "bytesInOutput": 51935
         },
         "src/bridge/evm/tip-floor.ts": {
           "bytesInOutput": 1870
         },
+        "src/sdk/buyer/runtime/address.ts": {
+          "bytesInOutput": 1175
+        },
+        "src/sdk/buyer/limits.ts": {
+          "bytesInOutput": 3731
+        },
+        "src/sdk/buyer/withdraw-destination.ts": {
+          "bytesInOutput": 821
+        },
         "src/sdk/buyer/runtime/evm-rails.ts": {
-          "bytesInOutput": 2082
+          "bytesInOutput": 2545
         },
         "src/settlement/covenant/pushtx.ts": {
           "bytesInOutput": 4219
@@ -46604,12 +46974,6 @@
         "src/sdk/buyer/engine.ts": {
           "bytesInOutput": 25322
         },
-        "src/sdk/buyer/runtime/address.ts": {
-          "bytesInOutput": 1175
-        },
-        "src/sdk/buyer/limits.ts": {
-          "bytesInOutput": 3729
-        },
         "src/sdk/buyer/delivery.ts": {
           "bytesInOutput": 8857
         },
@@ -46617,7 +46981,7 @@
           "bytesInOutput": 210
         },
         "src/sdk/buyer/door-client.ts": {
-          "bytesInOutput": 8151
+          "bytesInOutput": 8160
         },
         "src/transport/door-protocol-v2.ts": {
           "bytesInOutput": 5831
@@ -46634,11 +46998,20 @@
         "src/sdk/buyer/settlement-mode.ts": {
           "bytesInOutput": 5784
         },
-        "src/sdk/buyer/runtime/runtime.ts": {
-          "bytesInOutput": 9265
+        "src/sdk/buyer/gas-topup-state.ts": {
+          "bytesInOutput": 5602
         },
         "src/bridge/evm/base-tokens.ts": {
           "bytesInOutput": 62
+        },
+        "src/sdk/buyer/gas-topup-order.ts": {
+          "bytesInOutput": 8896
+        },
+        "src/sdk/buyer/gas-topup-guard.ts": {
+          "bytesInOutput": 1812
+        },
+        "src/sdk/buyer/runtime/runtime.ts": {
+          "bytesInOutput": 9720
         },
         "src/transport/anvil-messagebox-comms.ts": {
           "bytesInOutput": 4042
@@ -46665,7 +47038,7 @@
           "bytesInOutput": 3920
         },
         "src/bridge/bsv-script-history.ts": {
-          "bytesInOutput": 2168
+          "bytesInOutput": 2171
         },
         "src/sdk/buyer/runtime/bsv-rails.ts": {
           "bytesInOutput": 6698
@@ -46680,13 +47053,31 @@
           "bytesInOutput": 3493
         },
         "src/sdk/buyer/stop.ts": {
-          "bytesInOutput": 2416
+          "bytesInOutput": 2442
+        },
+        "src/sdk/buyer/close-record.ts": {
+          "bytesInOutput": 4973
         },
         "src/sdk/buyer/runtime/log-throttle.ts": {
           "bytesInOutput": 1266
         },
+        "src/sdk/buyer/gas-topup-api.ts": {
+          "bytesInOutput": 4909
+        },
+        "src/sdk/buyer/gas-topup.ts": {
+          "bytesInOutput": 12202
+        },
+        "src/sdk/buyer/runtime/gas-topup-rails.ts": {
+          "bytesInOutput": 2165
+        },
         "src/sdk/buyer/status-view.ts": {
           "bytesInOutput": 4810
+        },
+        "src/sdk/buyer/close-gas.ts": {
+          "bytesInOutput": 761
+        },
+        "src/sdk/buyer/close.ts": {
+          "bytesInOutput": 15739
         },
         "node_modules/zod/v4/mini/parse.js": {
           "bytesInOutput": 0
@@ -46730,11 +47121,20 @@
         "mcp/src/version.ts": {
           "bytesInOutput": 24
         },
+        "mcp/src/hosted.ts": {
+          "bytesInOutput": 908
+        },
+        "mcp/src/close-tool.ts": {
+          "bytesInOutput": 2180
+        },
+        "mcp/src/gas-tool.ts": {
+          "bytesInOutput": 2359
+        },
         "mcp/src/server.ts": {
-          "bytesInOutput": 29512
+          "bytesInOutput": 31273
         }
       },
-      "bytes": 5547920
+      "bytes": 5620943
     }
   }
 }
